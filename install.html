@@ -39,7 +39,12 @@
             4. Done! Scripts auto-activate on their target pages.
         </div>
 
-        <button class="btn-all" onclick="installAll()">Install All Scripts</button>
+        <button class="btn-all" onclick="installAll()">Install All Scripts (click links below one by one)</button>
+        <div class="status" id="status"></div>
+        <div id="install-queue" style="display:none;background:#fff;border:1px solid #ddd;border-radius:10px;padding:16px 20px;margin-bottom:20px">
+            <div style="font-size:13px;color:#555;margin-bottom:12px"><b>Click each link below</b> — Tampermonkey will open for each one:</div>
+            <div id="queue-list"></div>
+        </div>
 
         <div class="card">
             <div class="card-icon">🏷️</div>
@@ -121,12 +126,10 @@
             <a class="btn-install" onclick="install('Multi-container%20%26%20Multi-ASIN%20EditItems%20Auto%20Expiration%20Date.user.js')">Install</a>
         </div>
 
-        <div class="status" id="status"></div>
         <div class="footer">AFT Toolkit by joyhjoe | Open this file in your browser to install scripts</div>
     </div>
 
     <script>
-        // GitHub raw content base URL
         const basePath = 'https://raw.githubusercontent.com/joyhjoe1997-alt/tampermonkey-scripts/main/';
 
         function install(filename) {
@@ -135,23 +138,37 @@
 
         function installAll() {
             const scripts = [
-                'FC%20Badge%20Manager.user.js',
-                'FC%20Research%20Print.user.js',
-                'FC%20Research%20Enhanced%20Tooltips%20%26%20Quick%20History.user.js',
-                'FCresearch%20%2B%2B%2B.user.js',
-                'FCResearch%20AdjacentBins.user.js',
-                'Move%20Items%20Buttons.user.js',
-                'Autofill%20Move%20Items%20Quantity.user.js',
-                'Multi-container%20%26%20Multi-ASIN%20EditItems%20Auto%20Expiration%20Date.user.js',
+                { file: 'FC%20Badge%20Manager.user.js', name: 'FC Badge Manager' },
+                { file: 'FC%20Research%20Print.user.js', name: 'FC Research Print' },
+                { file: 'FC%20Research%20Enhanced%20Tooltips%20%26%20Quick%20History.user.js', name: 'Enhanced Tooltips & Quick History' },
+                { file: 'FCresearch%20%2B%2B%2B.user.js', name: 'FCresearch +++' },
+                { file: 'FCResearch%20AdjacentBins.user.js', name: 'FCResearch AdjacentBins' },
+                { file: 'Move%20Items%20Buttons.user.js', name: 'Move Items Buttons' },
+                { file: 'Autofill%20Move%20Items%20Quantity.user.js', name: 'Autofill Move Items Quantity' },
+                { file: 'Multi-container%20%26%20Multi-ASIN%20EditItems%20Auto%20Expiration%20Date.user.js', name: 'Multi-container EditItems' },
             ];
+
+            const queue = document.getElementById('install-queue');
+            const list = document.getElementById('queue-list');
+            queue.style.display = 'block';
+            list.innerHTML = '';
+
+            scripts.forEach((s, i) => {
+                const row = document.createElement('div');
+                row.style.cssText = 'display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid #f0f0f0';
+                row.innerHTML = `
+                    <span id="check-${i}" style="font-size:16px;width:20px">&#9744;</span>
+                    <a href="${basePath + s.file}" target="_blank" rel="noopener" 
+                       style="color:#0b3948;font-weight:600;font-size:13px;text-decoration:none;flex:1"
+                       onclick="document.getElementById('check-${i}').innerHTML='&#9745;';this.style.color='#27ae60'">${i + 1}. ${s.name}</a>
+                    <span style="font-size:11px;color:#aaa">click to install</span>
+                `;
+                list.appendChild(row);
+            });
 
             const status = document.getElementById('status');
             status.style.display = 'block';
-            status.textContent = 'Opening scripts... Accept each install in Tampermonkey.';
-
-            scripts.forEach((file, i) => {
-                setTimeout(() => install(file), i * 800);
-            });
+            status.textContent = 'Click each script link above — Tampermonkey will prompt for each one.';
         }
     </script>
 </body>
