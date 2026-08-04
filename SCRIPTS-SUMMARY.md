@@ -1,5 +1,5 @@
 # Tampermonkey Scripts Summary
-
+/**
 ## 1. Sideline v6.0 (`sideline-6.0.user.js`)
 **Author:** joyhjoe | **Domain:** AFT Poirot  
 **Purpose:** Automated multi-tote deletion with price verification  
@@ -11,7 +11,7 @@
 - High-value (>1000) and high-qty (>100) warnings
 - Skips vt/pa/numeric totes
 - Persists progress across page reloads
-
+*/
 ---
 
 ## 2. FC Badge Manager (`FC Badge Manager.user.js`)
