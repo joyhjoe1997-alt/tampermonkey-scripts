@@ -1,18 +1,5 @@
 # Tampermonkey Scripts Summary
-/**
-## 1. Sideline v6.0 (`sideline-6.0.user.js`)
-**Author:** joyhjoe | **Domain:** AFT Poirot  
-**Purpose:** Automated multi-tote deletion with price verification  
-- Paste tote IDs, processes them sequentially
-- Reads all items (FNSKU/ASIN + qty) from Change Container page
-- Resolves X0 FNSKUs to ASINs via FC Research `/results/product` API
-- Fetches live Amazon.co.uk prices (parallel batches of 3)
-- Shows confirmation dialog with item table + grand total
-- High-value (>1000) and high-qty (>100) warnings
-- Skips vt/pa/numeric totes
-- Persists progress across page reloads
-*/
----
+
 
 ## 2. FC Badge Manager (`FC Badge Manager.user.js`)
 **Author:** joyhjoe | **Domain:** FC Research + localhost:5965  
