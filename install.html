@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>AFT Toolkit - Script Installer</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: 'Segoe UI', system-ui, sans-serif; background: #f0f2f5; color: #2c3e50; min-height: 100vh; padding: 40px 20px; }
+        .container { max-width: 800px; margin: 0 auto; }
+        h1 { text-align: center; font-size: 28px; margin-bottom: 8px; color: #0b3948; }
+        .subtitle { text-align: center; color: #7f8c8d; margin-bottom: 30px; font-size: 14px; }
+        .instructions { background: #fff3cd; border: 1px solid #ffc107; border-radius: 10px; padding: 16px 20px; margin-bottom: 24px; font-size: 13px; line-height: 1.7; }
+        .instructions b { color: #856404; }
+        .card { background: #fff; border-radius: 12px; border: 1px solid #e0e0e0; margin-bottom: 12px; padding: 16px 20px; display: flex; align-items: center; gap: 16px; transition: box-shadow .2s; }
+        .card:hover { box-shadow: 0 4px 12px rgba(0,0,0,.08); }
+        .card-icon { font-size: 28px; flex-shrink: 0; }
+        .card-info { flex: 1; }
+        .card-title { font-weight: 700; font-size: 14px; color: #0b3948; margin-bottom: 4px; }
+        .card-desc { font-size: 12px; color: #7f8c8d; line-height: 1.4; }
+        .card-domain { display: inline-block; margin-top: 4px; font-size: 10px; background: #e8f5e9; color: #2e7d32; padding: 2px 8px; border-radius: 4px; }
+        .btn-install { padding: 8px 18px; border: none; border-radius: 8px; font: 600 12px 'Segoe UI'; cursor: pointer; background: #0b3948; color: #fff; white-space: nowrap; transition: background .15s; text-decoration: none; }
+        .btn-install:hover { background: #1abc9c; }
+        .btn-all { display: block; width: 100%; padding: 14px; border: none; border-radius: 12px; font: 700 15px 'Segoe UI'; cursor: pointer; background: linear-gradient(135deg, #0b3948, #1abc9c); color: #fff; margin: 24px 0; transition: transform .1s; }
+        .btn-all:hover { transform: translateY(-2px); }
+        .footer { text-align: center; color: #aaa; font-size: 11px; margin-top: 30px; }
+        .status { display: none; text-align: center; padding: 12px; background: #d4edda; border-radius: 8px; margin-top: 12px; color: #155724; font-weight: 600; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>AFT Toolkit - Script Installer</h1>
+        <p class="subtitle">One-click install for all Tampermonkey scripts by joyhjoe</p>
+
+        <div class="instructions">
+            <b>How to install:</b><br>
+            1. Make sure <a href="https://www.tampermonkey.net/" target="_blank">Tampermonkey</a> is installed in your browser<br>
+            2. Click <b>"Install"</b> on each script you want (or "Install All" for everything)<br>
+            3. Tampermonkey will open a confirmation tab for each script - click "Install" there<br>
+            4. Done! Scripts auto-activate on their target pages.
+        </div>
+
+        <button class="btn-all" onclick="installAll()">Install All Scripts</button>
+
+        <div class="card">
+            <div class="card-icon">🎯</div>
+            <div class="card-info">
+                <div class="card-title">Sideline v6.0 - Multi-Tote Deletion Automation</div>
+                <div class="card-desc">Auto-processes totes with multi-item price lookup via FC Research + Amazon. Confirmation dialog with grand total.</div>
+                <span class="card-domain">AFT Poirot</span>
+            </div>
+            <a class="btn-install" onclick="install('sideline-6.0.user.js')">Install</a>
+        </div>
+
+        <div class="card">
+            <div class="card-icon">🏷️</div>
+            <div class="card-info">
+                <div class="card-title">FC Badge Manager v2.0</div>
+                <div class="card-desc">Auto-captures badge ID from FC Research and populates the barcode generator. Silent on refresh.</div>
+                <span class="card-domain">FC Research + Barcode Gen</span>
+            </div>
+            <a class="btn-install" onclick="install('FC%20Badge%20Manager.user.js')">Install</a>
+        </div>
+
+        <div class="card">
+            <div class="card-icon">🖨️</div>
+            <div class="card-info">
+                <div class="card-title">FC Research Print v1.3</div>
+                <div class="card-desc">Print ASIN/FNSKU/FCSku barcodes directly from FC Research. Alt+Click quick-print.</div>
+                <span class="card-domain">FC Research</span>
+            </div>
+            <a class="btn-install" onclick="install('FC%20Research%20Print.user.js')">Install</a>
+        </div>
+
+        <div class="card">
+            <div class="card-icon">🔍</div>
+            <div class="card-info">
+                <div class="card-title">FC Research Enhanced Tooltips & Quick History v3.0</div>
+                <div class="card-desc">Hover tooltips with product images, employee details. Quick 6-Month History button.</div>
+                <span class="card-domain">FC Research</span>
+            </div>
+            <a class="btn-install" onclick="install('FC%20Research%20Enhanced%20Tooltips%20%26%20Quick%20History.user.js')">Install</a>
+        </div>
+
+        <div class="card">
+            <div class="card-icon">⚡</div>
+            <div class="card-info">
+                <div class="card-title">FCresearch +++ v0.1</div>
+                <div class="card-desc">Quick-action buttons: Defect, Prep, Hazmat, TSI, SIM TT, Cubiscan, Rodeo links.</div>
+                <span class="card-domain">FC Research + Amazon Tools</span>
+            </div>
+            <a class="btn-install" onclick="install('FCresearch%20%2B%2B%2B.user.js')">Install</a>
+        </div>
+
+        <div class="card">
+            <div class="card-icon">📍</div>
+            <div class="card-info">
+                <div class="card-title">FCResearch AdjacentBins v1.02</div>
+                <div class="card-desc">Shows floor level for inventory bins via Roboscout API.</div>
+                <span class="card-domain">FC Research</span>
+            </div>
+            <a class="btn-install" onclick="install('FCResearch%20AdjacentBins.user.js')">Install</a>
+        </div>
+
+        <div class="card">
+            <div class="card-icon">🔀</div>
+            <div class="card-info">
+                <div class="card-title">Move Items Buttons v2025</div>
+                <div class="card-desc">EACH/MULTI/CONTAINER/LPN mode buttons. Cage-scan as Enter. Auto-fill qty.</div>
+                <span class="card-domain">AFT Move Items</span>
+            </div>
+            <a class="btn-install" onclick="install('Move%20Items%20Buttons.user.js')">Install</a>
+        </div>
+
+        <div class="card">
+            <div class="card-icon">🔢</div>
+            <div class="card-info">
+                <div class="card-title">Autofill Move Items Quantity v0.1</div>
+                <div class="card-desc">Auto-fills the quantity field on Move Items destination page.</div>
+                <span class="card-domain">AFT Move Items</span>
+            </div>
+            <a class="btn-install" onclick="install('Autofill%20Move%20Items%20Quantity.user.js')">Install</a>
+        </div>
+
+        <div class="card">
+            <div class="card-icon">📅</div>
+            <div class="card-info">
+                <div class="card-title">Multi-container EditItems Auto Expiration Date v3.3</div>
+                <div class="card-desc">Bulk expiration date processing. Multi-ASIN mode. Progress tracking.</div>
+                <span class="card-domain">AFT Edit Items</span>
+            </div>
+            <a class="btn-install" onclick="install('Multi-container%20%26%20Multi-ASIN%20EditItems%20Auto%20Expiration%20Date.user.js')">Install</a>
+        </div>
+
+        <div class="status" id="status"></div>
+        <div class="footer">AFT Toolkit by joyhjoe | Open this file in your browser to install scripts</div>
+    </div>
+
+    <script>
+        // GitHub raw content base URL
+        const basePath = 'https://raw.githubusercontent.com/joyhjoe1997-alt/tampermonkey-scripts/main/';
+
+        function install(filename) {
+            window.open(basePath + filename, '_blank');
+        }
+
+        function installAll() {
+            const scripts = [
+                'sideline-6.0.user.js',
+                'FC%20Badge%20Manager.user.js',
+                'FC%20Research%20Print.user.js',
+                'FC%20Research%20Enhanced%20Tooltips%20%26%20Quick%20History.user.js',
+                'FCresearch%20%2B%2B%2B.user.js',
+                'FCResearch%20AdjacentBins.user.js',
+                'Move%20Items%20Buttons.user.js',
+                'Autofill%20Move%20Items%20Quantity.user.js',
+                'Multi-container%20%26%20Multi-ASIN%20EditItems%20Auto%20Expiration%20Date.user.js',
+            ];
+
+            const status = document.getElementById('status');
+            status.style.display = 'block';
+            status.textContent = 'Opening scripts... Accept each install in Tampermonkey.';
+
+            scripts.forEach((file, i) => {
+                setTimeout(() => install(file), i * 800);
+            });
+        }
+    </script>
+</body>
+</html>
