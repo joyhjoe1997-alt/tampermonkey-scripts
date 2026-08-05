@@ -59,7 +59,7 @@
         changeTimeout:  10000, // max wait for Change Container button
         yesTimeout:     12000, // max wait for Yes popup
         pageTimeout:    12000, // max wait for page transitions
-        itemsTimeout:   15000, // max wait for items to render
+        itemsTimeout:   60000, // max wait for items to render (60s for large totes)
     };
 
     const HIGH_QTY_THRESHOLD = 100;   // warn if total items exceed this
@@ -368,11 +368,13 @@
             const start = Date.now();
             const expected = getExpectedRowCount();
             const iv = setInterval(() => {
+                const elapsed = Math.round((Date.now() - start) / 1000);
                 const count = [...document.querySelectorAll('alchemy-tag')]
                     .filter(t => !t.closest('#pvt-panel,#pvt-cc-dialog,#pvt-hq-dialog'))
                     .filter(t => /^\d+\s*qty$/i.test((t.innerText || t.textContent || '').trim()))
                     .length;
                 const ready = (expected > 0 && count >= expected) || (expected <= 0 && count > 0);
+                setStatus(`Loading items... ${count}/${expected > 0 ? expected : '?'} rows (${elapsed}s)`, '#8e44ad');
                 if (ready || Date.now() - start > TIMING.itemsTimeout) { clearInterval(iv); resolve(); }
             }, TIMING.pollInterval);
         });
