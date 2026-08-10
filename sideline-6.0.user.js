@@ -1,4 +1,4 @@
-// ==UserScript==
+﻿// ==UserScript==
 // @name         Sideline - Multi-Tote Deletion Automation
 // @author       joyhjoe
 // @version      6.0
@@ -94,6 +94,12 @@
         get: (k, d = '') => localStorage.getItem(k) ?? d,
         set: (k, v) => localStorage.setItem(k, String(v)),
     };
+
+    // =========================================================================
+    // =========================================================================
+// =========================================================================
+    //  UTILITIES
+    // =========================================================================
 
     /** Sets a React-compatible input value and fires synthetic events */
     function setNativeValue(el, val) {
@@ -266,6 +272,53 @@
     }
 
     /**
+     * Checks FC Research inventory history for PROBLEM_SOLVE entries.
+     * Fetches /results/inventory-history?s={asin} and looks for rows where:
+     *   - OP = "A" (Created inventory)
+     *   - Old Owner column contains "PROBLEM_SOLVE"
+     * Returns { hasProblemSolve: bool, count: number, lastDate: string }
+     */
+    function checkProblemSolve(asin) {
+        const url = `${FCR_BASE}/${getWarehouseId()}/results/inventory-history?s=${encodeURIComponent(asin)}`;
+        return new Promise(resolve => {
+            GM_xmlhttpRequest({
+                method: 'GET', url,
+                headers: { 'Accept': 'text/html', 'Accept-Language': 'en-GB,en;q=0.9' },
+                onload(resp) {
+                    try {
+                        const doc = new DOMParser().parseFromString(resp.responseText || '', 'text/html');
+                        const rows = doc.querySelectorAll('#table-inventory-history tbody tr');
+                        let count = 0;
+                        let totalQty = 0;
+                        let lastDate = '';
+
+                        for (const row of rows) {
+                            const cells = row.querySelectorAll('td');
+                            if (cells.length < 13) continue;
+                            // Column layout: Date, OP, RS, ASIN, FNSku, FCSku, LPN, Quantity, Person, Old Bin, New Bin, Old Owner, New Owner, Tool
+                            const op = (cells[1]?.textContent || '').trim();
+                            const qty = parseInt((cells[7]?.textContent || '').trim(), 10) || 0;
+                            const oldOwner = (cells[11]?.textContent || '').trim();
+
+                            if (op === 'A' && oldOwner.includes('PROBLEM_SOLVE')) {
+                                count++;
+                                totalQty += qty;
+                                if (!lastDate) lastDate = (cells[0]?.textContent || '').trim();
+                            }
+                        }
+
+                        resolve({ hasProblemSolve: count > 0, count, totalQty, lastDate });
+                    } catch (e) {
+                        resolve({ hasProblemSolve: false, count: 0, totalQty: 0, lastDate: '' });
+                    }
+                },
+                onerror() { resolve({ hasProblemSolve: false, count: 0, totalQty: 0, lastDate: '' }); },
+                ontimeout() { resolve({ hasProblemSolve: false, count: 0, totalQty: 0, lastDate: '' }); },
+            });
+        });
+    }
+
+    /**
      * Fetches the live price from Amazon.co.uk for a given ASIN.
      * Tries 17 different price selectors, then regex fallback.
      * Auto-retries once on N/A (handles temporary throttling).
@@ -362,21 +415,59 @@
         });
     }
 
-    /** Waits until all item rows have rendered on the Change Container page */
+    /** Waits until all item rows have rendered on the Change Container page.
+     *  Uses MutationObserver for instant detection (no polling delay).
+     *  Resolves when rendered count matches expected, or stabilizes for 500ms.
+     */
     function waitForItemsRendered() {
         return new Promise(resolve => {
             const start = Date.now();
             const expected = getExpectedRowCount();
-            const iv = setInterval(() => {
-                const elapsed = Math.round((Date.now() - start) / 1000);
-                const count = [...document.querySelectorAll('alchemy-tag')]
+            let lastCount = 0;
+            let stableTimer = null;
+
+            function countItems() {
+                return [...document.querySelectorAll('alchemy-tag')]
                     .filter(t => !t.closest('#pvt-panel,#pvt-cc-dialog,#pvt-hq-dialog'))
                     .filter(t => /^\d+\s*qty$/i.test((t.innerText || t.textContent || '').trim()))
                     .length;
-                const ready = (expected > 0 && count >= expected) || (expected <= 0 && count > 0);
+            }
+
+            function check() {
+                const count = countItems();
+                const elapsed = Math.round((Date.now() - start) / 1000);
                 setStatus(`Loading items... ${count}/${expected > 0 ? expected : '?'} rows (${elapsed}s)`, '#8e44ad');
-                if (ready || Date.now() - start > TIMING.itemsTimeout) { clearInterval(iv); resolve(); }
-            }, TIMING.pollInterval);
+
+                // Exact match with expected row count — done immediately
+                if (expected > 0 && count >= expected) { done(); return; }
+
+                // Count changed — reset stability timer
+                if (count !== lastCount) {
+                    lastCount = count;
+                    if (stableTimer) clearTimeout(stableTimer);
+                    // Wait 500ms of no changes to confirm all loaded
+                    if (count > 0) {
+                        stableTimer = setTimeout(done, 500);
+                    }
+                }
+            }
+
+            function done() {
+                observer.disconnect();
+                if (stableTimer) clearTimeout(stableTimer);
+                if (safetyTimeout) clearTimeout(safetyTimeout);
+                resolve();
+            }
+
+            // Observe DOM mutations — fires instantly when new elements are added
+            const observer = new MutationObserver(check);
+            observer.observe(document.body, { childList: true, subtree: true });
+
+            // Safety timeout
+            const safetyTimeout = setTimeout(done, TIMING.itemsTimeout);
+
+            // Initial check (items might already be there)
+            check();
         });
     }
 
@@ -481,8 +572,11 @@
                     : `<input type="text" class="pvt-asin-in" data-idx="${i}" placeholder="Paste ASIN" maxlength="10" style="font:700 10px monospace;width:85px;border:1.5px solid #ddd;border-radius:4px;padding:2px 4px;text-transform:uppercase">`;
             const num = hasPrice ? parseFloat(item.price.replace(/[^0-9.]/g, '')) : NaN;
             const lineTotal = isNaN(num) ? '-' : '\u00A3' + (num * item.qty).toFixed(2);
-            const id = `<a href="${FCR_BASE}/${getWarehouseId()}/results?s=${item.fnsku}" target="_blank" rel="noopener" style="color:#8e44ad;text-decoration:none" title="Open in FC Research">${item.fnsku}</a>` + (item.resolvedAsin ? ` <span style="color:#27ae60;font-size:9px">\u2192 <a href="${FCR_BASE}/${getWarehouseId()}/results?s=${item.resolvedAsin}" target="_blank" rel="noopener" style="color:#27ae60;text-decoration:none" title="Open in FC Research">${item.resolvedAsin}</a></span>` : '');
-            return `<tr><td style="font:600 10px monospace">${id}</td><td style="text-align:center;font-weight:700">${item.qty}</td><td style="white-space:nowrap" id="pvt-p-${i}">${priceHtml}</td><td style="white-space:nowrap;font-weight:600" id="pvt-lt-${i}">${lineTotal}</td><td style="font-size:10px;color:#666;max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${(item.title || '').substring(0, 45)}</td></tr>`;
+            const id = `<a href="${FCR_BASE}/${getWarehouseId()}/results?s=${item.fnsku}" target="_blank" rel="noopener" style="color:#8e44ad;text-decoration:none" title="Open in FC Research">${item.fnsku}</a>` + (item.resolvedAsin ? ` <span style="color:#27ae60;font-size:15px">\u2192 <a href="${FCR_BASE}/${getWarehouseId()}/results?s=${item.resolvedAsin}" target="_blank" rel="noopener" style="color:#27ae60;text-decoration:none" title="Open in FC Research">${item.resolvedAsin}</a></span>` : '');
+            const psCount = item.problemSolve?.totalQty || 0;
+            const psEntries = item.problemSolve?.count || 0;
+            const psBadge = psCount > 0 ? `<span style="background:#e74c3c;color:#fff;font:700 15px Segoe UI;padding:2px 8px;border-radius:3px" title="${psEntries} Problem Solve entries, total qty: ${psCount}, last: ${item.problemSolve.lastDate}">${psCount} PS</span>` : '<span style="color:#ccc;font-size:15px">0</span>';
+            return `<tr><td style="font:600 16px monospace">${id}</td><td style="text-align:center;font-weight:700">${item.qty}</td><td style="white-space:nowrap" id="pvt-p-${i}">${priceHtml}</td><td style="white-space:nowrap;font-weight:600" id="pvt-lt-${i}">${lineTotal}</td><td style="text-align:center">${psBadge}</td><td style="font-size:16px;color:#666;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${(item.title || '').substring(0, 50)}</td></tr>`;
         }).join('');
 
         // Calculate grand total
@@ -491,24 +585,24 @@
         const highValue = gt > 1000;
 
         const overlay = createDialog('pvt-cc-dialog', `
-            <div id="pvt-cc-box" style="background:${highValue ? '#fff5f5' : '#fff'};border-radius:14px;width:680px;max-width:95vw;max-height:85vh;display:flex;flex-direction:column;box-shadow:0 16px 50px rgba(0,0,0,.35);overflow:hidden;${highValue ? 'border:3px solid #e74c3c' : ''}">
-                <div style="background:${highValue ? 'linear-gradient(135deg,#c0392b,#e74c3c)' : 'linear-gradient(135deg,#0b3948,#1abc9c)'};color:#fff;padding:14px 18px;font:700 14px Segoe UI">Change Container - Tote ${toteNum}/${total}</div>
-                ${highValue ? '<div id="pvt-hv-warn" style="background:#e74c3c;color:#fff;padding:10px 18px;font:700 13px Segoe UI;text-align:center;animation:pvt-blink 1s infinite">&#9888; HIGH VALUE TOTE - Grand Total exceeds \u00A31,000! Verify before proceeding.</div>' : ''}
-                <div style="padding:14px 18px;overflow-y:auto;flex:1">
-                    <div style="display:flex;justify-content:space-between;font-size:12px;color:#555;margin-bottom:10px;padding-bottom:8px;border-bottom:1px solid #eee">
+            <div id="pvt-cc-box" style="background:${highValue ? '#fff5f5' : '#fff'};border-radius:14px;width:800px;max-width:95vw;max-height:90vh;display:flex;flex-direction:column;box-shadow:0 16px 50px rgba(0,0,0,.35);overflow:hidden;${highValue ? 'border:3px solid #e74c3c' : ''}">
+                <div style="background:${highValue ? 'linear-gradient(135deg,#c0392b,#e74c3c)' : 'linear-gradient(135deg,#0b3948,#1abc9c)'};color:#fff;padding:16px 20px;font:700 20px Segoe UI">Change Container - Tote ${toteNum}/${total}</div>
+                ${highValue ? '<div id="pvt-hv-warn" style="background:#e74c3c;color:#fff;padding:12px 20px;font:700 19px Segoe UI;text-align:center;animation:pvt-blink 1s infinite">&#9888; HIGH VALUE TOTE - Grand Total exceeds \u00A31,000! Verify before proceeding.</div>' : ''}
+                <div style="padding:16px 20px;overflow-y:auto;flex:1">
+                    <div style="display:flex;justify-content:space-between;font-size:18px;color:#555;margin-bottom:12px;padding-bottom:10px;border-bottom:1px solid #eee">
                         <span><b>Tote:</b> <a href="${FCR_BASE}/${getWarehouseId()}/results?s=${toteId}" target="_blank" rel="noopener" style="color:#8e44ad;text-decoration:none;font-weight:700" title="Open in FC Research">${toteId}</a></span><span><b>Items:</b> ${items.length} rows, ${totalQty} units</span>
                     </div>
-                    <table style="width:100%;border-collapse:collapse;font-size:11px">
-                        <thead><tr style="background:#f4f6f8"><th style="padding:6px 8px;text-align:left;font-size:10px;text-transform:uppercase;border-bottom:2px solid #ddd">FNSKU/ASIN</th><th style="padding:6px;text-align:center;font-size:10px;text-transform:uppercase;border-bottom:2px solid #ddd">Qty</th><th style="padding:6px 8px;font-size:10px;text-transform:uppercase;border-bottom:2px solid #ddd">Price</th><th style="padding:6px 8px;font-size:10px;text-transform:uppercase;border-bottom:2px solid #ddd">Total</th><th style="padding:6px 8px;font-size:10px;text-transform:uppercase;border-bottom:2px solid #ddd">Title</th></tr></thead>
+                    <table style="width:100%;border-collapse:collapse;font-size:17px">
+                        <thead><tr style="background:#f4f6f8"><th style="padding:8px 10px;text-align:left;font-size:16px;text-transform:uppercase;border-bottom:2px solid #ddd">FNSKU/ASIN</th><th style="padding:8px;text-align:center;font-size:16px;text-transform:uppercase;border-bottom:2px solid #ddd">Qty</th><th style="padding:8px 10px;font-size:16px;text-transform:uppercase;border-bottom:2px solid #ddd">Price</th><th style="padding:8px 10px;font-size:16px;text-transform:uppercase;border-bottom:2px solid #ddd">Total</th><th style="padding:8px 10px;font-size:16px;text-transform:uppercase;border-bottom:2px solid #ddd;text-align:center">PS</th><th style="padding:8px 10px;font-size:16px;text-transform:uppercase;border-bottom:2px solid #ddd">Title</th></tr></thead>
                         <tbody>${rows}</tbody>
-                        <tfoot><tr><td colspan="3" style="text-align:right;font-weight:700;padding:8px;border-top:2px solid #ddd">Grand Total:</td><td id="pvt-gt" style="font-weight:700;color:${highValue ? '#e74c3c' : '#27ae60'};padding:8px;border-top:2px solid #ddd;font-size:13px">\u00A3${gt.toFixed(2)}</td><td style="border-top:2px solid #ddd"></td></tr></tfoot>
+                        <tfoot><tr><td colspan="4" style="text-align:right;font-weight:700;padding:10px;border-top:2px solid #ddd;font-size:17px">Grand Total:</td><td id="pvt-gt" style="font-weight:700;color:${highValue ? '#e74c3c' : '#27ae60'};padding:10px;border-top:2px solid #ddd;font-size:19px">\u00A3${gt.toFixed(2)}</td><td style="border-top:2px solid #ddd"></td></tr></tfoot>
                     </table>
                     <div style="font-size:10px;color:#888;margin-top:6px;font-style:italic">${items.some(i => !i.price) ? 'Paste ASIN for unresolved items - auto-fetches on paste' : 'All prices fetched'}</div>
                 </div>
                 <div style="display:flex;gap:8px;padding:14px 18px;background:#f8f9fa;border-top:1px solid #eee">
-                    <button id="pvt-cc-yes" style="flex:1;padding:10px;border:none;border-radius:8px;font:600 12px Segoe UI;cursor:pointer;background:#2ecc71;color:#fff">Yes, change it</button>
-                    <button id="pvt-cc-skip" style="flex:1;padding:10px;border:none;border-radius:8px;font:600 12px Segoe UI;cursor:pointer;background:#f39c12;color:#fff">Skip tote</button>
-                    <button id="pvt-cc-no" style="flex:1;padding:10px;border:none;border-radius:8px;font:600 12px Segoe UI;cursor:pointer;background:#e74c3c;color:#fff">Stop</button>
+                    <button id="pvt-cc-yes" style="flex:1;padding:12px;border:none;border-radius:8px;font:600 18px Segoe UI;cursor:pointer;background:#2ecc71;color:#fff">Yes, change it</button>
+                    <button id="pvt-cc-skip" style="flex:1;padding:12px;border:none;border-radius:8px;font:600 18px Segoe UI;cursor:pointer;background:#f39c12;color:#fff">Skip tote</button>
+                    <button id="pvt-cc-no" style="flex:1;padding:12px;border:none;border-radius:8px;font:600 18px Segoe UI;cursor:pointer;background:#e74c3c;color:#fff">Stop</button>
                 </div>
             </div>`);
 
@@ -614,16 +708,30 @@
             // --- Step 4: Wait for Change Container button ---
             setStatus('Waiting for Change Container...', '#3498db');
             const changeBtn = await waitFor(SEL.changeContainer);
-            if (!changeBtn || !autoRunning) continue;
+            if (!changeBtn || !autoRunning) { continue; }
 
-            // Wait for item quantity element to appear (polls, no fixed delay)
-            await waitFor(SEL.itemQuantity, 5000);
-            const qty = getItemQuantity();
+            // Wait for item quantity to be readable (no timeout - wait until loaded)
+            let qty = -1;
+            const qtyStart = Date.now();
+            setStatus('Waiting for inventory to load...', '#3498db');
+            while (qty === -1) {
+                await waitFor(SEL.itemQuantity, 2000);
+                qty = getItemQuantity();
+                // Also check for "No items found" text - means empty tote
+                if (qty === -1 && document.body.innerText.includes('No items found in this container')) {
+                    qty = 0;
+                    break;
+                }
+                if (qty === -1) {
+                    const elapsed = Math.round((Date.now() - qtyStart) / 1000);
+                    setStatus(`Waiting for inventory to load... (${elapsed}s)`, '#3498db');
+                    await new Promise(r => setTimeout(r, 300));
+                }
+            }
 
             // --- Handle empty totes - skip without processing ---
-            // qty === 0 means explicitly empty; qty === -1 means element not found (also likely empty)
-            if (qty === 0 || (qty === -1 && !document.querySelector('alchemy-tag'))) {
-                setStatus(`Tote ${idx + 1} is empty (${qty} items) - skipping to next`, 'orange');
+            if (qty === 0) {
+                setStatus(`Tote ${idx + 1} is empty - skipping to next`, 'orange');
                 doneSet.add(idx);
                 currentIdx++;
                 saveState();
@@ -680,6 +788,16 @@
                     }
                 }
 
+                // --- Step 7.5: Check inventory history for PROBLEM_SOLVE ---
+                setStatus('Checking inventory history...', '#8e44ad');
+                for (const item of items) {
+                    const asin = item.isAsin ? item.fnsku : item.resolvedAsin;
+                    if (asin) {
+                        const ps = await checkProblemSolve(asin);
+                        item.problemSolve = ps;
+                    }
+                }
+
                 // --- Step 8: Show confirmation dialog ---
                 const decision = await confirmChangeContainer(toteId, idx + 1, toteList.length, items, qty);
 
@@ -687,7 +805,7 @@
                     currentIdx++;
                     saveState();
                     renderList();
-                    location.reload(); // refresh returns to scan page, auto-resumes
+                    location.reload();
                     return;
                 }
                 if (decision === 'no') { autoRunning = false; clearState(); break; }
@@ -697,7 +815,8 @@
                 changeBtn.click();
 
                 const yesBtn = await waitForYesButton();
-                if (yesBtn) yesBtn.click();
+                if (yesBtn) { yesBtn.click(); }
+                else { }
             }
 
             // --- Step 10: Mark done and wait for next scan page ---
@@ -835,9 +954,11 @@
         renderList();
 
         if (toteList.length && shouldResume && currentIdx < toteList.length) {
-            setStatus(`Resuming from tote ${currentIdx + 1}...`, '#3498db');
+            setStatus(`Resuming from tote ${currentIdx + 1} in 3s... (click Stop to cancel)`, '#3498db');
             ls.set(LS.auto, '0'); // prevent double-resume on subsequent reloads
-            setTimeout(autoRun, 1000);
+            document.getElementById('pvt-btn-stop').style.display = '';
+            document.getElementById('pvt-btn-auto').style.display = 'none';
+            setTimeout(() => { if (!autoRunning) autoRun(); }, 3000);
         } else if (toteList.length) {
             setStatus(`${toteList.length} tote(s) restored`, '#3498db');
         }
