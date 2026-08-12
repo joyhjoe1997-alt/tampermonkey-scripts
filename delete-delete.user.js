@@ -28,6 +28,7 @@
     let doneSet = new Set();
     let currentIdx = 0;
     let polling = null;
+    let lastClickTime = 0;
 
     // === LOG ===
     function log(action, details) {
@@ -50,17 +51,31 @@
     }
 
     function getPrimaryBtn() {
-        // Find visible primary button input
-        const btn = document.querySelector('.a-button-primary input.a-button-input');
-        if (btn && btn.offsetParent !== null) return btn;
-        // Fallback: any visible submit
-        for (const b of document.querySelectorAll('input[type="submit"], button[type="submit"]')) {
-            if (b.offsetParent !== null) {
-                const text = (b.value || b.textContent || '').toLowerCase();
-                if (text.includes('continue') || text.includes('delete') || text.includes('confirm')) return b;
-            }
+        // Method 1: Exact selector from old working script
+        const btn1 = document.querySelector('.a-button-primary button, .a-button-primary input');
+        if (btn1 && btn1.offsetParent !== null) return btn1;
+        // Method 2: Any visible button/input with action text
+        for (const b of document.querySelectorAll('button, input[type="submit"]')) {
+            if (!b.offsetParent) continue;
+            const text = (b.innerText || b.value || '').toLowerCase();
+            if (text.includes('delete items') || text.includes('continue') || text.includes('confirm')) return b;
         }
         return null;
+    }
+
+    function clickBtn(btn) {
+        if (!btn) return;
+        // Prevent double-click within 1 second
+        if (Date.now() - lastClickTime < 1000) return;
+        lastClickTime = Date.now();
+        // Click the input itself
+        btn.click();
+        // Also click the parent span.a-button (Amazon's framework listens here)
+        const parentSpan = btn.closest('.a-button');
+        if (parentSpan) parentSpan.click();
+        // Also try the span.a-button-inner
+        const inner = btn.closest('.a-button-inner');
+        if (inner) inner.click();
     }
 
     function getTextInput() {
@@ -126,7 +141,7 @@
             }
             // Click continue
             const btn = getPrimaryBtn();
-            if (btn && inp && inp.value === containerId) btn.click();
+            if (btn && inp && inp.value === containerId) clickBtn(btn);
             return;
         }
 
@@ -136,7 +151,7 @@
             const radio = document.querySelector(`input[type="radio"][value="${delType}"]`);
             if (radio && !radio.checked) { radio.checked = true; radio.dispatchEvent(new Event('change', { bubbles: true })); }
             const btn = getPrimaryBtn();
-            if (btn) btn.click();
+            if (btn) clickBtn(btn);
             return;
         }
 
@@ -147,7 +162,7 @@
             const radio = document.querySelector('#workflow input[type="radio"]');
             if (radio && !radio.checked) radio.checked = true;
             const btn = getPrimaryBtn();
-            if (btn) btn.click();
+            if (btn) clickBtn(btn);
             return;
         }
 
@@ -156,10 +171,10 @@
             setStatus(`[${currentIdx + 1}] Confirming...`, '#c0392b');
             // Click "Delete items" (the Confirm action button)
             const btn = document.querySelector('[data-click-action*="Confirm"] input.a-button-input');
-            if (btn) { btn.click(); return; }
+            if (btn) { clickBtn(btn); return; }
             // Fallback to primary
             const primaryBtn = getPrimaryBtn();
-            if (primaryBtn) primaryBtn.click();
+            if (primaryBtn) clickBtn(primaryBtn);
             return;
         }
 
