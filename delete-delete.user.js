@@ -130,35 +130,29 @@
     //  PAGE DETECTION
     // =========================================================================
 
-    /** Returns true if on "Scan container" page */
-    function isOnScanPage() {
+    function getPageTitle() {
         const h1 = document.querySelector('#workflow h1');
-        return h1 && h1.textContent.includes('Scan container');
+        return h1 ? h1.textContent.trim() : '';
     }
 
-    /** Returns true if on "Select Item to Delete" page */
-    function isOnSelectPage() {
-        const h1 = document.querySelector('#workflow h1');
-        return h1 && h1.textContent.includes('Select Item to Delete');
-    }
+    function isOnScanPage() { return getPageTitle().includes('Scan container'); }
+    function isOnSelectItemPage() { return getPageTitle().includes('Select Item to Delete'); }
+    function isOnSelectTypePage() { return getPageTitle().includes('Select deletion type'); }
+    function isOnConfirmPage() { return getPageTitle().includes('Confirm the deletion'); }
 
-    /** Returns the error message if container is empty */
     function getError() {
         const err = document.querySelector('.a-alert-inline-error .a-alert-content');
         return err ? err.textContent.trim() : '';
     }
 
-    /** Returns the text input on the scan page */
     function getScanInput() {
         return document.querySelector('#workflow form input[type="text"]');
     }
 
-    /** Returns the submit button */
     function getSubmitBtn() {
-        return document.querySelector('#workflow form input[type="submit"]');
+        return document.querySelector('#workflow form .a-button-primary input[type="submit"]');
     }
 
-    /** Returns the "Change Container (d)" button */
     function getChangeContainerBtn() {
         return document.querySelector('[data-click-action*="Done"] input[type="submit"]');
     }
@@ -226,6 +220,13 @@
             </div>
             <div id="dd-body" style="padding:12px 14px">
                 <textarea id="dd-ta" placeholder="Paste container IDs (one per line)" style="width:100%;height:90px;padding:8px;box-sizing:border-box;border:2px solid #e0e0e0;border-radius:8px;font:12px monospace;resize:vertical"></textarea>
+                <div style="margin:8px 0">
+                    <label style="font:600 12px Segoe UI;color:#555">Deletion Type:</label>
+                    <select id="dd-del-type" style="width:100%;padding:6px 8px;border:2px solid #e0e0e0;border-radius:6px;font:12px Segoe UI;margin-top:4px">
+                        <option value="MISSING">Sweeping out (Missing)</option>
+                        <option value="THEFT">Known theft</option>
+                    </select>
+                </div>
                 <div style="font-size:11px;color:#95a5a6;margin:5px 0 10px">Auto-deletes ALL items in each container</div>
                 <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:10px">
                     <button id="dd-btn-load" style="padding:8px;border:none;border-radius:8px;cursor:pointer;font:600 12px Segoe UI;background:#c0392b;color:#fff">Load List</button>
@@ -263,14 +264,16 @@
         autoRunning = true;
         saveState();
 
+        const deletionType = document.getElementById('dd-del-type')?.value || 'MISSING';
+
         while (autoRunning && currentIdx < containerList.length) {
             const containerId = containerList[currentIdx];
             const idx = currentIdx;
 
             // --- Step 1: Wait for Scan container page ---
             setStatus(`[${idx + 1}/${containerList.length}] Waiting for scan page...`, '#3498db');
-            const scanReady = await waitUntil(isOnScanPage);
-            if (!scanReady || !autoRunning) continue;
+            await waitUntil(isOnScanPage);
+            if (!autoRunning) break;
 
             // --- Step 2: Enter container ID and submit ---
             const input = getScanInput();
@@ -283,10 +286,10 @@
             const submitBtn = getSubmitBtn();
             if (submitBtn) submitBtn.click();
 
-            // --- Step 3: Wait for response (either item page, error, or same page) ---
-            await waitUntil(() => isOnSelectPage() || getError().includes('is empty') || (getError().length > 0 && !isOnScanPage()), 15000);
+            // --- Step 3: Wait for next page ---
+            await waitUntil(() => isOnSelectItemPage() || isOnSelectTypePage() || getError().length > 0, 15000);
 
-            // Also check if error appeared inline on the same scan page
+            // Check for empty/error
             const error = getError();
             if (error.includes('is empty')) {
                 setStatus(`[${idx + 1}] Empty - skipping`, 'orange');
@@ -295,14 +298,11 @@
                 currentIdx++;
                 saveState();
                 renderList();
-                // Clear the input for next container
                 const inp = getScanInput();
                 if (inp) setNativeValue(inp, '');
                 continue;
             }
-
-            // --- Step 3b: If other error, skip ---
-            if (error && !isOnSelectPage()) {
+            if (error && !isOnSelectItemPage() && !isOnSelectTypePage()) {
                 setStatus(`[${idx + 1}] Error: ${error.substring(0, 40)}`, '#e74c3c');
                 log('ERROR', `${containerId}: ${error}`);
                 doneSet.add(idx);
@@ -312,35 +312,51 @@
                 continue;
             }
 
-            // --- Step 4: Delete all items one by one ---
+            // --- Step 4: Delete all items loop ---
             let itemCount = 0;
-            while (autoRunning && isOnSelectPage()) {
-                itemCount++;
-                setStatus(`[${idx + 1}] Deleting item ${itemCount}...`, '#c0392b');
+            while (autoRunning) {
+                // Page A: "Select Item to Delete" - select first radio, click Continue
+                if (isOnSelectItemPage()) {
+                    itemCount++;
+                    setStatus(`[${idx + 1}] Selecting item ${itemCount}...`, '#c0392b');
+                    const radio = document.querySelector('#workflow input[type="radio"]');
+                    if (radio) radio.checked = true;
+                    const btn = getSubmitBtn();
+                    if (btn) btn.click();
+                    await waitUntil(() => !isOnSelectItemPage() || isOnSelectTypePage() || isOnConfirmPage(), 15000);
+                    continue;
+                }
 
-                // Select first radio button (should already be selected by default)
-                const radio = document.querySelector('#workflow input[type="radio"]');
-                if (radio) radio.checked = true;
+                // Page B: "Select deletion type" - select the configured type, click Continue
+                if (isOnSelectTypePage()) {
+                    setStatus(`[${idx + 1}] Selecting deletion type...`, '#c0392b');
+                    const radio = document.querySelector(`#workflow input[type="radio"][value="${deletionType}"]`);
+                    if (radio) { radio.checked = true; radio.click(); }
+                    const btn = getSubmitBtn();
+                    if (btn) btn.click();
+                    await waitUntil(() => !isOnSelectTypePage() || isOnConfirmPage(), 15000);
+                    continue;
+                }
 
-                // Click Continue
-                const continueBtn = getSubmitBtn();
-                if (continueBtn) continueBtn.click();
+                // Page C: "Confirm the deletion" - click "Delete items [Enter]"
+                if (isOnConfirmPage()) {
+                    setStatus(`[${idx + 1}] Confirming deletion ${itemCount}...`, '#c0392b');
+                    const btn = document.querySelector('[data-click-action*="Confirm"] input[type="submit"]');
+                    if (btn) btn.click();
+                    await waitUntil(() => !isOnConfirmPage() || isOnSelectItemPage() || isOnScanPage(), 15000);
+                    continue;
+                }
 
-                // Wait for page to transition (either more items, or back to scan)
-                await waitUntil(() => {
-                    // Still on select page (more items) or back to scan page
-                    const h1 = document.querySelector('#workflow h1');
-                    if (!h1) return false;
-                    const text = h1.textContent;
-                    return text.includes('Scan container') || text.includes('Select Item');
-                }, 15000);
+                // If back on scan page, this container is done
+                if (isOnScanPage()) break;
 
-                // Small check: if we're back on scan page, container is done
+                // Safety: wait for any page change
+                await waitUntil(() => isOnSelectItemPage() || isOnSelectTypePage() || isOnConfirmPage() || isOnScanPage(), 10000);
                 if (isOnScanPage()) break;
             }
 
-            // --- Step 5: If still on select page with no more items, click Change Container ---
-            if (isOnSelectPage()) {
+            // --- Step 5: If still on item page, click Change Container ---
+            if (isOnSelectItemPage() || isOnSelectTypePage() || isOnConfirmPage()) {
                 const changeBtn = getChangeContainerBtn();
                 if (changeBtn) {
                     changeBtn.click();
