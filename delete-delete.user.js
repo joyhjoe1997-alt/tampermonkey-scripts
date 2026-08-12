@@ -48,6 +48,63 @@
     };
 
     // =========================================================================
+    //  ACTION LOG
+    // =========================================================================
+
+    const LOG_KEY = 'dd_action_log';
+
+    function log(action, details = '') {
+        const entries = getLog();
+        entries.unshift({
+            time: new Date().toLocaleString('en-GB', { hour12: false }),
+            action,
+            details: typeof details === 'object' ? JSON.stringify(details) : String(details),
+        });
+        if (entries.length > 200) entries.length = 200;
+        ls.set(LOG_KEY, JSON.stringify(entries));
+    }
+
+    function getLog() {
+        try { return JSON.parse(ls.get(LOG_KEY, '[]')); } catch { return []; }
+    }
+
+    function clearLog() { ls.set(LOG_KEY, '[]'); }
+
+    function showLog() {
+        const entries = getLog();
+        const rows = entries.length ? entries.map(e => {
+            const color = e.action.includes('SKIP') || e.action.includes('EMPTY') ? '#f39c12'
+                : e.action.includes('STOP') || e.action.includes('ERROR') ? '#e74c3c'
+                : e.action.includes('DONE') || e.action.includes('DELETED') ? '#27ae60' : '#2c3e50';
+            return `<tr><td style="font-size:11px;color:#888;white-space:nowrap;padding:4px 8px">${e.time}</td><td style="font:700 12px Segoe UI;color:${color};padding:4px 8px">${e.action}</td><td style="font-size:12px;color:#555;padding:4px 8px">${e.details}</td></tr>`;
+        }).join('') : '<tr><td colspan="3" style="text-align:center;padding:20px;color:#aaa">No log entries</td></tr>';
+
+        document.getElementById('dd-log-dialog')?.remove();
+        const overlay = document.createElement('div');
+        overlay.id = 'dd-log-dialog';
+        overlay.style.cssText = 'position:fixed;inset:0;z-index:1000003;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;font-family:Segoe UI,sans-serif';
+        overlay.innerHTML = `
+            <div style="background:#fff;border-radius:14px;width:700px;max-width:95vw;max-height:80vh;display:flex;flex-direction:column;box-shadow:0 16px 50px rgba(0,0,0,.35);overflow:hidden">
+                <div style="background:linear-gradient(135deg,#c0392b,#2c3e50);color:#fff;padding:14px 18px;font:700 16px Segoe UI;display:flex;justify-content:space-between;align-items:center">
+                    <span>Delete Log (${entries.length})</span>
+                    <span style="display:flex;gap:8px">
+                        <button id="dd-log-clear" style="padding:5px 12px;border:none;border-radius:6px;font:600 11px Segoe UI;cursor:pointer;background:rgba(255,255,255,.2);color:#fff">Clear</button>
+                        <button id="dd-log-close" style="padding:5px 12px;border:none;border-radius:6px;font:600 11px Segoe UI;cursor:pointer;background:rgba(255,255,255,.2);color:#fff">Close</button>
+                    </span>
+                </div>
+                <div style="overflow-y:auto;flex:1;padding:8px">
+                    <table style="width:100%;border-collapse:collapse">
+                        <thead><tr style="background:#f4f6f8"><th style="padding:6px 8px;text-align:left;font-size:11px;border-bottom:1px solid #ddd">Time</th><th style="padding:6px 8px;text-align:left;font-size:11px;border-bottom:1px solid #ddd">Action</th><th style="padding:6px 8px;text-align:left;font-size:11px;border-bottom:1px solid #ddd">Details</th></tr></thead>
+                        <tbody>${rows}</tbody>
+                    </table>
+                </div>
+            </div>`;
+        document.body.appendChild(overlay);
+        document.getElementById('dd-log-close').onclick = () => overlay.remove();
+        document.getElementById('dd-log-clear').onclick = () => { clearLog(); overlay.remove(); showLog(); };
+    }
+
+    // =========================================================================
     //  STATE PERSISTENCE
     // =========================================================================
 
@@ -175,6 +232,7 @@
                     <button id="dd-btn-clear" style="padding:8px;border:none;border-radius:8px;cursor:pointer;font:600 12px Segoe UI;background:#f0f0f0;color:#555">Clear</button>
                     <button id="dd-btn-auto" style="padding:8px;border:none;border-radius:8px;cursor:pointer;font:600 12px Segoe UI;background:#27ae60;color:#fff">Auto-Run</button>
                     <button id="dd-btn-stop" style="padding:8px;border:none;border-radius:8px;cursor:pointer;font:600 12px Segoe UI;background:#e74c3c;color:#fff;display:none">Stop</button>
+                    <button id="dd-btn-log" style="padding:8px;border:none;border-radius:8px;cursor:pointer;font:600 12px Segoe UI;background:#8e44ad;color:#fff;grid-column:span 2">View Log</button>
                 </div>
                 <div id="dd-list-wrap" style="max-height:180px;overflow-y:auto;border:1px solid #eee;border-radius:8px"></div>
                 <div id="dd-status" style="margin-top:8px;padding:6px 10px;border-radius:7px;font:600 11px Segoe UI;text-align:center;background:#f8f9fa;color:#7f8c8d;min-height:26px;display:flex;align-items:center;justify-content:center">Ready</div>
@@ -218,6 +276,7 @@
             const input = getScanInput();
             if (!input) continue;
             setStatus(`[${idx + 1}/${containerList.length}] Scanning: ${containerId}`, '#c0392b');
+            log('SCAN', `Container ${idx + 1}/${containerList.length}: ${containerId}`);
             setNativeValue(input, containerId);
             renderList();
 
@@ -225,22 +284,27 @@
             if (submitBtn) submitBtn.click();
 
             // --- Step 3: Wait for response (either item page, error, or same page) ---
-            await waitUntil(() => isOnSelectPage() || getError().includes('is empty') || getError().length > 0, 15000);
+            await waitUntil(() => isOnSelectPage() || getError().includes('is empty') || (getError().length > 0 && !isOnScanPage()), 15000);
 
-            // --- Step 3a: If empty container error, skip to next ---
+            // Also check if error appeared inline on the same scan page
             const error = getError();
             if (error.includes('is empty')) {
                 setStatus(`[${idx + 1}] Empty - skipping`, 'orange');
+                log('EMPTY', `${containerId} is empty - skipped`);
                 doneSet.add(idx);
                 currentIdx++;
                 saveState();
                 renderList();
+                // Clear the input for next container
+                const inp = getScanInput();
+                if (inp) setNativeValue(inp, '');
                 continue;
             }
 
             // --- Step 3b: If other error, skip ---
             if (error && !isOnSelectPage()) {
                 setStatus(`[${idx + 1}] Error: ${error.substring(0, 40)}`, '#e74c3c');
+                log('ERROR', `${containerId}: ${error}`);
                 doneSet.add(idx);
                 currentIdx++;
                 saveState();
@@ -286,6 +350,7 @@
 
             // --- Step 6: Mark done ---
             setStatus(`[${idx + 1}] Done - ${itemCount} item(s) deleted`, '#27ae60');
+            log('DELETED', `${containerId}: ${itemCount} item(s) deleted`);
             doneSet.add(idx);
             currentIdx++;
             saveState();
@@ -295,6 +360,7 @@
         // --- Finished ---
         if (autoRunning && currentIdx >= containerList.length) {
             setStatus(`All ${containerList.length} containers processed!`, '#27ae60');
+            log('ALL_DONE', `All ${containerList.length} containers processed`);
             clearState();
         }
         autoRunning = false;
@@ -350,6 +416,7 @@
             document.getElementById('dd-btn-stop').style.display = 'none';
         };
         document.getElementById('dd-btn-auto').onclick = () => { if (!autoRunning) autoRun(); };
+        document.getElementById('dd-btn-log').onclick = () => showLog();
         document.getElementById('dd-btn-stop').onclick = () => {
             autoRunning = false; clearState(); setStatus('Stopped', '#e74c3c');
             document.getElementById('dd-btn-auto').style.display = '';
