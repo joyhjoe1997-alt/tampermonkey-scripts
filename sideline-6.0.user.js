@@ -1,4 +1,4 @@
-﻿// ==UserScript==
+// ==UserScript==
 // @name         Sideline - Multi-Tote Deletion Automation
 // @author       joyhjoe
 // @version      6.0
@@ -764,9 +764,9 @@
                     fnskus.forEach(f => items.push({ fnsku: f, qty: 1, title: '', isAsin: false, price: null, resolvedAsin: null, fcPrice: null }));
                 }
 
-                // --- Step 7: Resolve FNSKUs and fetch prices ---
+                // --- Step 7: Resolve FNSKUs, fetch prices + PS count in parallel ---
                 if (items.length) {
-                    // Phase 1: Resolve X0 FNSKUs via FC Research (sequential)
+                    // Phase 1: Resolve X0 FNSKUs via FC Research (sequential - same domain)
                     let resolved = 0;
                     for (const item of items.filter(i => !i.isAsin)) {
                         resolved++;
@@ -775,26 +775,24 @@
                         if (fcr?.asin) { item.resolvedAsin = fcr.asin; item.fcPrice = fcr.fcPrice; item.title = item.title || fcr.title; }
                     }
 
-                    // Phase 2: Fetch Amazon prices in parallel batches
+                    // Phase 2: Fetch Amazon prices + PS count in parallel batches
                     let done = 0;
                     const jobs = items.map(item => async () => {
                         const asin = item.isAsin ? item.fnsku : item.resolvedAsin;
-                        if (asin) item.price = await fetchAmazonPrice(asin);
+                        if (asin) {
+                            // Fetch price and PS count simultaneously
+                            const [price, ps] = await Promise.all([
+                                fetchAmazonPrice(asin),
+                                checkProblemSolve(asin),
+                            ]);
+                            item.price = price;
+                            item.problemSolve = ps;
+                        }
                         done++;
                         setStatus(`Fetching prices: ${done}/${items.length}`, '#8e44ad');
                     });
                     for (let i = 0; i < jobs.length; i += BATCH_SIZE) {
                         await Promise.all(jobs.slice(i, i + BATCH_SIZE).map(fn => fn()));
-                    }
-                }
-
-                // --- Step 7.5: Check inventory history for PROBLEM_SOLVE ---
-                setStatus('Checking inventory history...', '#8e44ad');
-                for (const item of items) {
-                    const asin = item.isAsin ? item.fnsku : item.resolvedAsin;
-                    if (asin) {
-                        const ps = await checkProblemSolve(asin);
-                        item.problemSolve = ps;
                     }
                 }
 
@@ -954,11 +952,9 @@
         renderList();
 
         if (toteList.length && shouldResume && currentIdx < toteList.length) {
-            setStatus(`Resuming from tote ${currentIdx + 1} in 3s... (click Stop to cancel)`, '#3498db');
-            ls.set(LS.auto, '0'); // prevent double-resume on subsequent reloads
-            document.getElementById('pvt-btn-stop').style.display = '';
-            document.getElementById('pvt-btn-auto').style.display = 'none';
-            setTimeout(() => { if (!autoRunning) autoRun(); }, 3000);
+            setStatus(`Resuming from tote ${currentIdx + 1}...`, '#3498db');
+            ls.set(LS.auto, '0');
+            autoRun();
         } else if (toteList.length) {
             setStatus(`${toteList.length} tote(s) restored`, '#3498db');
         }
