@@ -150,7 +150,8 @@
     }
 
     function getSubmitBtn() {
-        return document.querySelector('#workflow form .a-button-primary input[type="submit"]');
+        // Primary button: "Continue [Enter]" or "Delete items [Enter]"
+        return document.querySelector('#workflow .a-button-primary input.a-button-input');
     }
 
     function getChangeContainerBtn() {
