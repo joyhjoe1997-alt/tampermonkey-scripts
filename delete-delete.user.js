@@ -101,6 +101,9 @@
         try { doneSet = new Set(JSON.parse(get(LS.done, '[]'))); } catch { doneSet = new Set(); }
     }
 
+    // Track state for "Start over" flow
+    let needsRestart = false;
+
     // === CORE: Polling tick (runs every 500ms) ===
     function tick() {
         if (!isRunning()) { stopPolling(); return; }
@@ -117,6 +120,20 @@
         const containerId = containerList[currentIdx];
         const delType = get(LS.type, 'MISSING');
 
+        // --- If we need to restart (press 'r') before next container ---
+        if (needsRestart) {
+            setStatus(`[${currentIdx + 1}] Restarting...`, '#3498db');
+            // Simulate pressing 'r' key for "Start over"
+            document.dispatchEvent(new KeyboardEvent('keydown', { key: 'r', code: 'KeyR', keyCode: 82, bubbles: true }));
+            document.dispatchEvent(new KeyboardEvent('keypress', { key: 'r', code: 'KeyR', keyCode: 82, bubbles: true }));
+            document.dispatchEvent(new KeyboardEvent('keyup', { key: 'r', code: 'KeyR', keyCode: 82, bubbles: true }));
+            // Also try clicking the "Start over" link directly
+            const startOverLink = document.querySelector('[data-action="click-restart"] a, [data-click-restart] a');
+            if (startOverLink) startOverLink.click();
+            needsRestart = false;
+            return;
+        }
+
         // --- On "Scan container" page ---
         if (title.includes('Scan container')) {
             // Check if error says empty
@@ -127,9 +144,7 @@
                 currentIdx++;
                 saveState();
                 renderList();
-                // Clear input for next
-                const inp = getTextInput();
-                if (inp) fillInput(inp, containerList[currentIdx] || '');
+                needsRestart = true;
                 return;
             }
             // Fill and submit
@@ -185,6 +200,7 @@
             currentIdx++;
             saveState();
             renderList();
+            needsRestart = true;
         }
     }
 
@@ -303,6 +319,7 @@
         document.getElementById('dd-start').onclick = () => {
             if (!containerList.length) { setStatus('Load list first', 'orange'); return; }
             set(LS.type, document.getElementById('dd-type').value);
+            needsRestart = true; // Start fresh for first container
             saveState();
             startPolling();
             setStatus('Running...', '#c0392b');
