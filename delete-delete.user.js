@@ -287,10 +287,10 @@
             const submitBtn = getSubmitBtn();
             if (submitBtn) submitBtn.click();
 
-            // --- Step 3: Wait for next page ---
-            await waitUntil(() => isOnSelectItemPage() || isOnSelectTypePage() || getError().length > 0, 15000);
+            // --- Step 3: Wait for page change ---
+            await waitUntil(() => !isOnScanPage() || getError().length > 0, 15000);
 
-            // Check for empty/error
+            // Check for empty/error on scan page
             const error = getError();
             if (error.includes('is empty')) {
                 setStatus(`[${idx + 1}] Empty - skipping`, 'orange');
@@ -303,7 +303,7 @@
                 if (inp) setNativeValue(inp, '');
                 continue;
             }
-            if (error && !isOnSelectItemPage() && !isOnSelectTypePage()) {
+            if (error && isOnScanPage()) {
                 setStatus(`[${idx + 1}] Error: ${error.substring(0, 40)}`, '#e74c3c');
                 log('ERROR', `${containerId}: ${error}`);
                 doneSet.add(idx);
@@ -313,59 +313,38 @@
                 continue;
             }
 
-            // --- Step 4: Delete all items loop ---
+            // --- Step 4: Keep clicking primary button until back on scan page ---
             let itemCount = 0;
-            while (autoRunning) {
-                // Page A: "Select Item to Delete" - select first radio, click Continue
+            while (autoRunning && !isOnScanPage()) {
+                // On "Select deletion type" page - pick the right radio
+                if (isOnSelectTypePage()) {
+                    const radio = document.querySelector(`#workflow input[type="radio"][value="${deletionType}"]`);
+                    if (radio && !radio.checked) { radio.checked = true; radio.click(); }
+                }
+
+                // On "Select Item to Delete" - count items
                 if (isOnSelectItemPage()) {
                     itemCount++;
-                    setStatus(`[${idx + 1}] Selecting item ${itemCount}...`, '#c0392b');
-                    const radio = document.querySelector('#workflow input[type="radio"]');
-                    if (radio) radio.checked = true;
-                    const btn = getSubmitBtn();
-                    if (btn) btn.click();
-                    await waitUntil(() => !isOnSelectItemPage() || isOnSelectTypePage() || isOnConfirmPage(), 15000);
-                    continue;
+                    setStatus(`[${idx + 1}] Processing item ${itemCount}...`, '#c0392b');
+                } else if (isOnConfirmPage()) {
+                    setStatus(`[${idx + 1}] Confirming deletion...`, '#c0392b');
+                } else if (isOnSelectTypePage()) {
+                    setStatus(`[${idx + 1}] Selecting type...`, '#c0392b');
                 }
 
-                // Page B: "Select deletion type" - select the configured type, click Continue
-                if (isOnSelectTypePage()) {
-                    setStatus(`[${idx + 1}] Selecting deletion type...`, '#c0392b');
-                    const radio = document.querySelector(`#workflow input[type="radio"][value="${deletionType}"]`);
-                    if (radio) { radio.checked = true; radio.click(); }
-                    const btn = getSubmitBtn();
-                    if (btn) btn.click();
-                    await waitUntil(() => !isOnSelectTypePage() || isOnConfirmPage(), 15000);
-                    continue;
-                }
+                // Click the primary button (Continue / Delete items / etc.)
+                const btn = getSubmitBtn();
+                if (btn) btn.click();
 
-                // Page C: "Confirm the deletion" - click "Delete items [Enter]"
-                if (isOnConfirmPage()) {
-                    setStatus(`[${idx + 1}] Confirming deletion ${itemCount}...`, '#c0392b');
-                    const btn = document.querySelector('[data-click-action*="Confirm"] input[type="submit"]');
-                    if (btn) btn.click();
-                    await waitUntil(() => !isOnConfirmPage() || isOnSelectItemPage() || isOnScanPage(), 15000);
-                    continue;
-                }
+                // Wait for any page change
+                const currentTitle = getPageTitle();
+                await waitUntil(() => getPageTitle() !== currentTitle || isOnScanPage() || getError().length > 0, 15000);
 
-                // If back on scan page, this container is done
-                if (isOnScanPage()) break;
-
-                // Safety: wait for any page change
-                await waitUntil(() => isOnSelectItemPage() || isOnSelectTypePage() || isOnConfirmPage() || isOnScanPage(), 10000);
-                if (isOnScanPage()) break;
+                // If error appeared (e.g. empty after partial delete), break
+                if (getError().length > 0) break;
             }
 
-            // --- Step 5: If still on item page, click Change Container ---
-            if (isOnSelectItemPage() || isOnSelectTypePage() || isOnConfirmPage()) {
-                const changeBtn = getChangeContainerBtn();
-                if (changeBtn) {
-                    changeBtn.click();
-                    await waitUntil(isOnScanPage, 10000);
-                }
-            }
-
-            // --- Step 6: Mark done ---
+            // --- Step 5: Mark done ---
             setStatus(`[${idx + 1}] Done - ${itemCount} item(s) deleted`, '#27ae60');
             log('DELETED', `${containerId}: ${itemCount} item(s) deleted`);
             doneSet.add(idx);
