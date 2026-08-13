@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Delete Delete - Auto Delete Items
 // @author       joyhjoe
-// @version      4.0
-// @description  Automated multi-container item deletion with price lookup
+// @version      4.1
+// @description  Automated multi-container item deletion with price lookup (optimized)
 // @match        https://aft-qt-eu.aka.amazon.com/app/deleteitems*
 // @icon         https://cdn-icons-png.flaticon.com/512/3687/3687412.png
 // @run-at       document-idle
@@ -14,36 +14,26 @@
 (function () {
     'use strict';
 
-    // --- Config ---
     const FCR_BASE = 'https://qi-fcresearch-eu.corp.amazon.com';
+    const WAREHOUSE = location.pathname.match(/^\/([A-Z]{3}\d)\//)?.[1] || 'EMA4';
     const LS = { list: 'dd_list', idx: 'dd_idx', running: 'dd_running', done: 'dd_done', type: 'dd_type' };
     const get = (k, d = '') => localStorage.getItem(k) ?? d;
     const set = (k, v) => localStorage.setItem(k, String(v));
 
-    let containerList = [];
-    let doneSet = new Set();
-    let currentIdx = 0;
-    let polling = null;
-    let lastClick = 0;
-    let needsRestart = false;
-    let waitingForPrice = false;
+    let containerList = [], doneSet = new Set(), currentIdx = 0;
+    let polling = null, lastClick = 0, needsRestart = false, waitingForPrice = false;
 
-    function isRunning() { return get(LS.running) === '1'; }
-    function saveState() { set(LS.idx, currentIdx); set(LS.done, JSON.stringify([...doneSet])); }
+    const isRunning = () => get(LS.running) === '1';
+    const saveState = () => { set(LS.idx, currentIdx); set(LS.done, JSON.stringify([...doneSet])); };
+
     function restoreState() {
         currentIdx = parseInt(get(LS.idx, '0'), 10) || 0;
         try { doneSet = new Set(JSON.parse(get(LS.done, '[]'))); } catch { doneSet = new Set(); }
     }
 
-    // --- Warehouse ID from URL ---
-    function getWarehouseId() {
-        return location.pathname.match(/^\/([A-Z]{3}\d)\//)?.[1] || 'EMA4';
-    }
-
-    // --- Page helpers ---
-    function getTitle() { return document.querySelector('#workflow h1')?.textContent.trim() || ''; }
-    function getError() { return document.querySelector('.a-alert-inline-error .a-alert-content')?.textContent.trim() || ''; }
-    function getInput() { return document.querySelector('#workflow form input[type="text"]'); }
+    // --- Lightweight DOM reads (no heavy queries) ---
+    const getTitle = () => document.querySelector('#workflow h1')?.textContent.trim() || '';
+    const getError = () => document.querySelector('.a-alert-inline-error .a-alert-content')?.textContent.trim() || '';
 
     function fillInput(el, val) {
         const s = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
@@ -53,7 +43,7 @@
     }
 
     function clickPrimary() {
-        if (Date.now() - lastClick < 800) return false;
+        if (Date.now() - lastClick < 400) return false;
         const btn = document.querySelector('.a-button-primary input.a-button-input');
         if (!btn || !btn.offsetParent) return false;
         lastClick = Date.now();
@@ -63,7 +53,7 @@
     }
 
     function clickConfirm() {
-        if (Date.now() - lastClick < 800) return false;
+        if (Date.now() - lastClick < 400) return false;
         const btn = document.querySelector('[data-click-action*="Confirm"] input.a-button-input');
         if (btn) { lastClick = Date.now(); btn.click(); btn.closest('.a-button')?.click(); return true; }
         return clickPrimary();
@@ -75,33 +65,36 @@
         document.dispatchEvent(new KeyboardEvent('keydown', { key: 'r', code: 'KeyR', keyCode: 82, bubbles: true }));
     }
 
-    // --- Price fetching (FC Research + Amazon) ---
-    function fetchFCResearch(fnsku) {
-        const url = `${FCR_BASE}/${getWarehouseId()}/results/product?s=${encodeURIComponent(fnsku)}`;
+    // --- Price fetch (FC Research) - lightweight parse ---
+    function fetchFCResearch(sku) {
         return new Promise(resolve => {
             GM_xmlhttpRequest({
-                method: 'GET', url,
-                headers: { 'Accept': 'text/html', 'Accept-Language': 'en-GB,en;q=0.9' },
-                onload(resp) {
+                method: 'GET',
+                url: `${FCR_BASE}/${WAREHOUSE}/results/product?s=${encodeURIComponent(sku)}`,
+                headers: { Accept: 'text/html' },
+                timeout: 8000,
+                onload(r) {
                     try {
-                        const html = resp.responseText || '';
-                        const doc = new DOMParser().parseFromString(html, 'text/html');
-                        let asin = null, fcPrice = 'N/A', title = '';
+                        const html = r.responseText;
+                        // Fast regex extraction first (avoids full DOM parse)
+                        let asin = (html.match(/data-row-id="(B[A-Z0-9]{9})"/) || html.match(/results\?s=(B[A-Z0-9]{9})/))?.[1] || null;
+                        let fcPrice = html.match(/<th>List Price<\/th>\s*<td>([^<]+)<\/td>/)?.[1]?.replace(/^[A-Z]{3}\s+/, '').trim() || 'N/A';
+                        let title = html.match(/<th>Title<\/th>\s*<td>([^<]+)<\/td>/)?.[1]?.trim() || '';
 
-                        const table = doc.querySelector('table.a-keyvalue[data-row-id]');
-                        if (table) {
-                            asin = table.getAttribute('data-row-id');
-                            for (const row of table.querySelectorAll('tr')) {
-                                const th = row.querySelector('th')?.textContent.trim();
-                                const td = row.querySelector('td')?.textContent.trim();
-                                if (th === 'List Price' && td) fcPrice = td.replace(/^[A-Z]{3}\s+/, '');
-                                if (th === 'Title' && td) title = td;
+                        // Fallback: DOM parse only if regex missed
+                        if (!asin || (fcPrice === 'N/A' && !title)) {
+                            const doc = new DOMParser().parseFromString(html, 'text/html');
+                            const table = doc.querySelector('table.a-keyvalue[data-row-id]');
+                            if (table) {
+                                if (!asin) asin = table.getAttribute('data-row-id');
+                                for (const row of table.querySelectorAll('tr')) {
+                                    const th = row.querySelector('th')?.textContent.trim();
+                                    const td = row.querySelector('td')?.textContent.trim();
+                                    if (th === 'List Price' && td && fcPrice === 'N/A') fcPrice = td.replace(/^[A-Z]{3}\s+/, '');
+                                    if (th === 'Title' && td && !title) title = td;
+                                }
                             }
                         }
-                        if (!asin) asin = doc.querySelector('.a-span7 > table > tbody > tr:nth-child(1) > td:nth-child(2) > a')?.textContent.trim() || null;
-                        if (!asin) asin = (html.match(/data-row-id="(B[A-Z0-9]{9})"/) || html.match(/results\?s=(B[A-Z0-9]{9})/))?.[1] || null;
-                        if (fcPrice === 'N/A') fcPrice = html.match(/<th>List Price<\/th>\s*<td>([^<]+)<\/td>/)?.[1]?.replace(/^[A-Z]{3}\s+/, '').trim() || 'N/A';
-
                         resolve({ asin, fcPrice, title });
                     } catch { resolve({ asin: null, fcPrice: 'Error', title: '' }); }
                 },
@@ -111,38 +104,28 @@
         });
     }
 
+    // --- Amazon price - fast selectors, early exit ---
     function fetchAmazonPrice(asin) {
         return new Promise(resolve => {
             GM_xmlhttpRequest({
                 method: 'GET',
-                url: `https://www.amazon.co.uk/gp/product/${encodeURIComponent(asin)}?th=1`,
-                headers: { 'Accept': 'text/html', 'Accept-Language': 'en-GB,en;q=0.9' },
-                onload(resp) {
+                url: `https://www.amazon.co.uk/gp/product/${asin}?th=1`,
+                headers: { Accept: 'text/html' },
+                timeout: 8000,
+                onload(r) {
                     try {
-                        const html = resp.responseText || '';
+                        const html = r.responseText;
+                        // Fast regex first - covers 90% of cases
+                        const m = html.match(/"priceAmount":([\d.]+)/) || html.match(/class="a-offscreen">\s*(£[\d,.]+)/) || html.match(/£\s*(\d+[.,]\d{2})/);
+                        if (m) { resolve(m[1].startsWith('£') ? m[1] : `£${m[1]}`); return; }
+                        // Fallback: DOM parse with limited selectors
                         const doc = new DOMParser().parseFromString(html, 'text/html');
-                        const selectors = [
-                            '#corePrice_feature_div .a-price .a-offscreen',
-                            '#apex_desktop .a-price .a-offscreen',
-                            '#price_inside_buybox', '#priceblock_ourprice',
-                            '#priceblock_dealprice', '#priceblock_saleprice',
-                            '#newBuyBoxPrice .a-price .a-offscreen',
-                            '#tmmSwatches .a-color-price .a-offscreen',
-                            '.swatchElement.selected .a-color-price .a-offscreen',
-                            '#buyNewSection .a-price .a-offscreen',
-                            '.a-price[data-a-color="price"] .a-offscreen',
-                            '#kindle-price .a-color-price', '#tmm-grid-swatch-PAPERBACK .a-color-price',
-                            '.a-section.a-spacing-micro .a-price .a-offscreen',
-                            '#usedBuySection .a-price .a-offscreen',
-                            '.offer-price', '#tp_price_block_total_price_ww .a-offscreen'
-                        ];
-                        for (const sel of selectors) {
-                            const el = doc.querySelector(sel);
-                            const t = el?.textContent.trim();
+                        const sels = ['#corePrice_feature_div .a-offscreen', '#apex_desktop .a-offscreen', '#price_inside_buybox', '#priceblock_ourprice', '#newBuyBoxPrice .a-offscreen', '.a-price[data-a-color="price"] .a-offscreen'];
+                        for (const s of sels) {
+                            const t = doc.querySelector(s)?.textContent.trim();
                             if (t && /£\d/.test(t)) { resolve(t); return; }
                         }
-                        const m = html.match(/£\s*(\d+[.,]\d{2})/);
-                        resolve(m ? `£${m[1]}` : 'N/A');
+                        resolve('N/A');
                     } catch { resolve('N/A'); }
                 },
                 onerror() { resolve('N/A'); },
@@ -151,304 +134,224 @@
         });
     }
 
-    // --- Extract FcSku and Quantity from confirm page ---
-    function getFieldFromPage(label) {
-        const allDts = document.querySelectorAll('dt.a-list-item');
-        for (const dt of allDts) {
-            if (dt.textContent.trim().startsWith(label)) {
-                const dd = dt.nextElementSibling;
-                if (dd) return dd.textContent.trim();
-            }
+    // --- Page field extraction ---
+    function getField(label) {
+        const dts = document.querySelectorAll('dt.a-list-item');
+        for (let i = 0; i < dts.length; i++) {
+            if (dts[i].textContent.indexOf(label) === 0) return dts[i].nextElementSibling?.textContent.trim() || null;
         }
         return null;
     }
-    function getFcSkuFromPage() { return getFieldFromPage('FcSku'); }
-    function getQuantityFromPage() { return parseInt(getFieldFromPage('Quantity to delete') || getFieldFromPage('Quantity') || '1', 10); }
 
-    // --- Show price overlay on confirm page ---
-    function showPriceInfo(fcSku, data, qty) {
+    // --- Price overlay ---
+    function showPrice(fcSku, data, qty) {
         let box = document.getElementById('dd-price-box');
         if (!box) {
             box = document.createElement('div');
             box.id = 'dd-price-box';
-            box.style.cssText = 'position:fixed;bottom:20px;right:20px;z-index:999998;background:#fff;border:2px solid #3498db;border-radius:10px;padding:12px 16px;box-shadow:0 4px 16px rgba(0,0,0,.15);font:13px Segoe UI,sans-serif;max-width:340px';
+            box.style.cssText = 'position:fixed;bottom:20px;right:20px;z-index:999998;background:#fff;border:2px solid #3498db;border-radius:10px;padding:12px 16px;box-shadow:0 4px 16px rgba(0,0,0,.15);font:13px Segoe UI,sans-serif;max-width:320px';
             document.body.appendChild(box);
         }
         const price = data.amazonPrice || data.fcPrice || 'N/A';
-        const priceNum = parseFloat((price).replace(/[^0-9.]/g, '')) || 0;
-        const isCritical = priceNum >= 1000;
-        const isHigh = priceNum >= 100;
-        const qtyAlert = qty >= 99;
-        const blocked = isCritical || qtyAlert;
-        const bgColor = blocked ? '#fde' : isHigh ? '#fee' : '#f0f9ff';
-        const borderColor = blocked ? '#c0392b' : isHigh ? '#e74c3c' : '#3498db';
-        box.style.background = bgColor;
-        box.style.borderColor = borderColor;
+        const priceNum = parseFloat(price.replace(/[^0-9.]/g, '')) || 0;
+        const critical = priceNum >= 1000, high = priceNum >= 100, qtyHigh = qty >= 99;
+        const blocked = critical || qtyHigh;
 
-        let alertHtml = '';
-        if (isCritical) alertHtml += `<div style="margin-top:6px;padding:6px 8px;background:#c0392b;color:#fff;border-radius:4px;font:700 12px Segoe UI;text-align:center">🚨 PRICE OVER £1000 - STOPPED</div>`;
-        if (qtyAlert) alertHtml += `<div style="margin-top:6px;padding:6px 8px;background:#e67e22;color:#fff;border-radius:4px;font:700 12px Segoe UI;text-align:center">⚠️ QTY ${qty} (99+) - STOPPED</div>`;
+        box.style.background = blocked ? '#fde' : high ? '#fee' : '#f0f9ff';
+        box.style.borderColor = blocked ? '#c0392b' : high ? '#e74c3c' : '#3498db';
 
-        let btnHtml = '';
-        if (blocked && data.amazonPrice && data.amazonPrice !== 'Loading...' && data.amazonPrice !== 'Fetching...') {
-            btnHtml = `<div style="display:flex;gap:6px;margin-top:8px">
-                <button id="dd-alert-continue" style="flex:1;padding:8px;border:none;border-radius:6px;cursor:pointer;font:700 11px Segoe UI;background:#27ae60;color:#fff">✓ Continue Delete</button>
-                <button id="dd-alert-skip" style="flex:1;padding:8px;border:none;border-radius:6px;cursor:pointer;font:700 11px Segoe UI;background:#e74c3c;color:#fff">✗ Skip & Next</button>
-            </div>`;
-        }
+        const alert = (critical ? '<div style="margin-top:6px;padding:5px;background:#c0392b;color:#fff;border-radius:4px;font:700 11px Segoe UI;text-align:center">🚨 £1000+ STOPPED</div>' : '') +
+                      (qtyHigh ? `<div style="margin-top:4px;padding:5px;background:#e67e22;color:#fff;border-radius:4px;font:700 11px Segoe UI;text-align:center">⚠️ QTY ${qty} STOPPED</div>` : '');
 
-        box.innerHTML = `
-            <div style="font:700 13px Segoe UI;margin-bottom:6px;color:${blocked ? '#c0392b' : isHigh ? '#e74c3c' : '#2c3e50'}">
-                ${blocked ? '🚨 ALERT - REVIEW REQUIRED' : isHigh ? '⚠️ HIGH VALUE' : '💰 Item Price'}
-            </div>
-            <table style="font:12px monospace;border-collapse:collapse;width:100%">
-                <tr><td style="padding:2px 8px 2px 0;color:#7f8c8d">FcSku:</td><td style="font-weight:700">${fcSku}</td></tr>
-                ${data.asin ? `<tr><td style="padding:2px 8px 2px 0;color:#7f8c8d">ASIN:</td><td>${data.asin}</td></tr>` : ''}
-                <tr><td style="padding:2px 8px 2px 0;color:#7f8c8d">FC Price:</td><td>${data.fcPrice}</td></tr>
-                <tr><td style="padding:2px 8px 2px 0;color:#7f8c8d">Amazon:</td><td style="font-weight:700;color:${isCritical ? '#c0392b' : isHigh ? '#e74c3c' : '#27ae60'}">${data.amazonPrice || 'N/A'}</td></tr>
-                <tr><td style="padding:2px 8px 2px 0;color:#7f8c8d">Qty:</td><td style="font-weight:700;color:${qtyAlert ? '#e67e22' : '#2c3e50'}">${qty}</td></tr>
-                ${data.title ? `<tr><td colspan="2" style="padding-top:4px;font:11px Segoe UI;color:#555;max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${data.title.substring(0, 55)}</td></tr>` : ''}
-            </table>
-            ${alertHtml}${btnHtml}`;
+        const btns = blocked && !price.includes('Loading') && !price.includes('Fetching')
+            ? '<div style="display:flex;gap:6px;margin-top:8px"><button id="dd-ok" style="flex:1;padding:7px;border:none;border-radius:6px;cursor:pointer;font:700 11px Segoe UI;background:#27ae60;color:#fff">✓ Continue</button><button id="dd-skip" style="flex:1;padding:7px;border:none;border-radius:6px;cursor:pointer;font:700 11px Segoe UI;background:#e74c3c;color:#fff">✗ Skip</button></div>' : '';
 
-        // Bind alert buttons
-        if (blocked && btnHtml) {
-            document.getElementById('dd-alert-continue')?.addEventListener('click', () => {
-                clickConfirm();
-                hidePriceInfo();
-            });
-            document.getElementById('dd-alert-skip')?.addEventListener('click', () => {
-                // Skip this container and move to next
-                doneSet.add(currentIdx);
-                currentIdx++;
-                saveState();
-                renderList();
-                needsRestart = true;
-                waitingForPrice = false;
-                hidePriceInfo();
-                setStatus(`[${currentIdx}] Skipped - next`, 'orange');
+        box.innerHTML = `<div style="font:700 12px Segoe UI;color:${blocked ? '#c0392b' : '#2c3e50'};margin-bottom:4px">${blocked ? '🚨 REVIEW' : '💰 Price'}</div>
+            <table style="font:11px monospace;width:100%"><tr><td style="color:#999">Sku</td><td><b>${fcSku}</b></td></tr>${data.asin ? `<tr><td style="color:#999">ASIN</td><td>${data.asin}</td></tr>` : ''}<tr><td style="color:#999">FC</td><td>${data.fcPrice}</td></tr><tr><td style="color:#999">AMZ</td><td style="font-weight:700;color:${critical ? '#c0392b' : high ? '#e74c3c' : '#27ae60'}">${data.amazonPrice || 'N/A'}</td></tr><tr><td style="color:#999">Qty</td><td style="color:${qtyHigh ? '#e67e22' : '#333'};font-weight:700">${qty}</td></tr></table>
+            ${data.title ? `<div style="font:10px Segoe UI;color:#666;margin-top:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${data.title.slice(0, 50)}</div>` : ''}${alert}${btns}`;
+
+        if (blocked && btns) {
+            document.getElementById('dd-ok')?.addEventListener('click', () => { clickConfirm(); hidePrice(); });
+            document.getElementById('dd-skip')?.addEventListener('click', () => {
+                doneSet.add(currentIdx); currentIdx++; saveState(); renderList();
+                needsRestart = true; waitingForPrice = false; hidePrice();
+                setStatus(`Skipped → next`, 'orange');
             });
         }
-
         return blocked;
     }
 
-    function hidePriceInfo() {
-        document.getElementById('dd-price-box')?.remove();
-    }
+    function hidePrice() { document.getElementById('dd-price-box')?.remove(); }
 
-    // --- Fetch and display price when on confirm page ---
-    async function handleConfirmPage() {
-        const fcSku = getFcSkuFromPage();
+    // --- Handle confirm page: fetch price ---
+    async function handleConfirm() {
+        const fcSku = getField('FcSku');
         if (!fcSku) { waitingForPrice = false; return; }
-        const qty = getQuantityFromPage();
+        const qty = parseInt(getField('Quantity to delete') || getField('Quantity') || '1', 10);
 
-        showPriceInfo(fcSku, { fcPrice: 'Loading...', amazonPrice: 'Loading...', title: '', asin: null }, qty);
-
-        // Fetch from FC Research
-        const fcData = await fetchFCResearch(fcSku);
-        let amazonPrice = 'N/A';
-
-        // If we got an ASIN, fetch Amazon price
-        if (fcData.asin) {
-            showPriceInfo(fcSku, { ...fcData, amazonPrice: 'Fetching...' }, qty);
-            amazonPrice = await fetchAmazonPrice(fcData.asin);
+        // Quick check: if qty >= 99, block immediately without fetching price
+        if (qty >= 99) {
+            showPrice(fcSku, { fcPrice: '-', amazonPrice: '-', title: '', asin: null }, qty);
+            waitingForPrice = false;
+            setStatus(`[${currentIdx + 1}] ⚠️ QTY ALERT`, '#c0392b');
+            return;
         }
 
-        const blocked = showPriceInfo(fcSku, { ...fcData, amazonPrice }, qty);
+        showPrice(fcSku, { fcPrice: '...', amazonPrice: '...', title: '', asin: null }, qty);
+
+        const fcData = await fetchFCResearch(fcSku);
+        let amzPrice = 'N/A';
+        if (fcData.asin) {
+            showPrice(fcSku, { ...fcData, amazonPrice: '...' }, qty);
+            amzPrice = await fetchAmazonPrice(fcData.asin);
+        }
+
+        const blocked = showPrice(fcSku, { ...fcData, amazonPrice: amzPrice }, qty);
         waitingForPrice = false;
 
-        // If blocked (price >= £1000 or qty >= 99), stop and wait for user action
-        if (blocked) {
-            setStatus(`[${currentIdx + 1}] ⚠️ ALERT - waiting`, '#c0392b');
-            return; // User must click Continue or Skip
-        }
+        if (blocked) { setStatus(`[${currentIdx + 1}] ⚠️ ALERT`, '#c0392b'); return; }
 
-        // Auto-confirm after price is shown (1.5s delay so user can see it)
-        if (isRunning()) {
-            setTimeout(() => {
-                if (isRunning() && getTitle().includes('Confirm the deletion')) {
-                    clickConfirm();
-                }
-            }, 1500);
-        }
+        // Auto-confirm after brief display
+        if (isRunning()) setTimeout(() => { if (isRunning() && getTitle().includes('Confirm')) clickConfirm(); }, 800);
     }
 
-    // --- Core tick (every 500ms) ---
+    // --- Core tick ---
     function tick() {
         if (!isRunning()) { stop(); return; }
-        if (currentIdx >= containerList.length) {
-            setStatus(`Done! ${containerList.length} processed`, '#27ae60');
-            stop();
-            return;
-        }
+        if (currentIdx >= containerList.length) { setStatus(`Done! ${containerList.length}`, '#27ae60'); stop(); return; }
 
-        const title = getTitle();
-        const error = getError();
-        const id = containerList[currentIdx];
-        const delType = get(LS.type, 'MISSING');
+        const title = getTitle(), error = getError();
+        const id = containerList[currentIdx], delType = get(LS.type, 'MISSING');
 
-        // Restart before each new container
-        if (needsRestart) {
-            setStatus(`[${currentIdx + 1}] Restarting...`, '#3498db');
-            startOver();
-            needsRestart = false;
-            return;
-        }
+        if (needsRestart) { startOver(); needsRestart = false; return; }
 
-        // Scan container page
         if (title.includes('Scan container')) {
-            hidePriceInfo();
+            hidePrice();
             if (error.includes('is empty')) {
-                setStatus(`[${currentIdx + 1}] Empty - skip`, 'orange');
-                doneSet.add(currentIdx);
-                currentIdx++;
-                saveState();
-                renderList();
-                needsRestart = true;
-                return;
+                doneSet.add(currentIdx); currentIdx++; saveState(); renderList();
+                needsRestart = true; setStatus(`[${currentIdx}] Empty`, 'orange'); return;
             }
-            const inp = getInput();
+            const inp = document.querySelector('#workflow form input[type="text"]');
             if (!inp) return;
             if (inp.value !== id) { fillInput(inp, id); setStatus(`[${currentIdx + 1}/${containerList.length}] ${id}`, '#c0392b'); }
             else clickPrimary();
             return;
         }
 
-        // Select Item to Delete
         if (title.includes('Select Item to Delete')) {
-            hidePriceInfo();
-            setStatus(`[${currentIdx + 1}] Selecting item...`, '#c0392b');
-            const radio = document.querySelector('#workflow input[type="radio"]');
-            if (radio && !radio.checked) { radio.checked = true; radio.dispatchEvent(new Event('change', { bubbles: true })); }
-            clickPrimary();
-            return;
+            hidePrice();
+            const r = document.querySelector('#workflow input[type="radio"]');
+            if (r && !r.checked) { r.checked = true; r.dispatchEvent(new Event('change', { bubbles: true })); }
+            clickPrimary(); return;
         }
 
-        // Select deletion type
-        if (title.includes('Select deletion type') || title.includes('deletion type')) {
-            setStatus(`[${currentIdx + 1}] Setting type: ${delType}`, '#c0392b');
-            // Find the right radio - match by value or by label text
-            let radio = document.querySelector(`#workflow input[type="radio"][value="${delType}"]`);
-            if (!radio) {
-                // Try matching by label text
-                const labels = document.querySelectorAll('#workflow label, #workflow .a-label');
-                for (const lbl of labels) {
-                    if (lbl.textContent.includes(delType === 'MISSING' ? 'Sweeping' : delType === 'DAMAGED' ? 'Damaged' : 'theft')) {
-                        radio = lbl.closest('.a-radio-label, .a-row')?.querySelector('input[type="radio"]') || lbl.previousElementSibling;
-                        break;
-                    }
-                }
+        if (title.includes('deletion type')) {
+            let r = document.querySelector(`#workflow input[type="radio"][value="${delType}"]`);
+            if (!r) {
+                const key = delType === 'MISSING' ? 'Sweeping' : delType === 'DAMAGED' ? 'Damaged' : 'theft';
+                document.querySelectorAll('#workflow label, #workflow span.a-label').forEach(l => {
+                    if (!r && l.textContent.includes(key)) r = l.closest('.a-row, .a-radio')?.querySelector('input[type="radio"]');
+                });
             }
-            if (radio && !radio.checked) { radio.checked = true; radio.dispatchEvent(new Event('change', { bubbles: true })); }
-            clickPrimary();
+            if (r && !r.checked) { r.checked = true; r.dispatchEvent(new Event('change', { bubbles: true })); }
+            clickPrimary(); return;
+        }
+
+        if (title.includes('Confirm')) {
+            if (!waitingForPrice) { waitingForPrice = true; handleConfirm(); }
             return;
         }
 
-        // Confirm deletion - fetch price first
-        if (title.includes('Confirm the deletion')) {
-            if (!waitingForPrice) {
-                waitingForPrice = true;
-                setStatus(`[${currentIdx + 1}] Fetching price...`, '#8e44ad');
-                handleConfirmPage();
-            }
-            // Don't click here - handleConfirmPage will auto-click after showing price
-            return;
-        }
-
-        // Back on scan = container done
+        // Fallback: back on scan = done
         if (title.includes('Scan') && !error) {
-            hidePriceInfo();
-            doneSet.add(currentIdx);
-            currentIdx++;
-            saveState();
-            renderList();
-            needsRestart = true;
+            hidePrice(); doneSet.add(currentIdx); currentIdx++; saveState(); renderList(); needsRestart = true;
         }
     }
 
     function start() {
         if (!containerList.length) { setStatus('Load list first', 'orange'); return; }
         set(LS.type, document.getElementById('dd-type').value);
-        set(LS.running, '1');
-        needsRestart = true;
-        waitingForPrice = false;
-        saveState();
-        polling = setInterval(tick, 500);
+        set(LS.running, '1'); needsRestart = true; waitingForPrice = false; saveState();
+        polling = setInterval(tick, 600);
         document.getElementById('dd-start').style.display = 'none';
         document.getElementById('dd-stop').style.display = '';
-        setStatus('Running...', '#c0392b');
-        renderList();
+        setStatus('Running...', '#c0392b'); renderList();
     }
 
     function stop() {
         if (polling) { clearInterval(polling); polling = null; }
-        set(LS.running, '0');
-        waitingForPrice = false;
+        set(LS.running, '0'); waitingForPrice = false;
         document.getElementById('dd-start').style.display = '';
         document.getElementById('dd-stop').style.display = 'none';
         setStatus('Stopped', '#e74c3c');
     }
 
-    // --- UI ---
-    function setStatus(msg, color = '#7f8c8d') {
-        const el = document.getElementById('dd-status');
-        if (el) { el.textContent = msg; el.style.color = color; }
-    }
+    // --- UI helpers ---
+    const setStatus = (msg, color) => { const e = document.getElementById('dd-status'); if (e) { e.textContent = msg; e.style.color = color; } };
 
     function renderList() {
-        const wrap = document.getElementById('dd-list');
+        const wrap = document.getElementById('dd-list'), fill = document.getElementById('dd-fill');
         if (!wrap) return;
-        const fill = document.getElementById('dd-fill');
         if (fill) fill.style.width = containerList.length ? `${Math.round(doneSet.size / containerList.length * 100)}%` : '0%';
-        if (!containerList.length) { wrap.innerHTML = '<div style="padding:12px;text-align:center;color:#aaa;font-size:12px">Paste IDs above</div>'; return; }
-        wrap.innerHTML = '';
-        containerList.forEach((id, i) => {
-            const done = doneSet.has(i);
-            const active = i === currentIdx && !done && isRunning();
-            const row = document.createElement('div');
-            row.style.cssText = `display:flex;align-items:center;padding:5px 10px;border-bottom:1px solid #f5f5f5;gap:8px;font:12px monospace;${done ? 'background:#f0f9f0;color:#27ae60' : active ? 'background:#fff3cd;font-weight:700' : ''}`;
-            row.innerHTML = `<div style="width:18px;height:18px;background:${done ? '#2ecc71' : active ? '#f39c12' : '#c0392b'};color:#fff;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:9px;font-weight:700">${i + 1}</div><div style="flex:1">${id}</div>${done ? '&#10003;' : ''}`;
-            wrap.appendChild(row);
-        });
-        wrap.children[Math.min(currentIdx, containerList.length - 1)]?.scrollIntoView({ block: 'nearest' });
+        if (!containerList.length) { wrap.innerHTML = '<div style="padding:10px;text-align:center;color:#aaa;font-size:11px">Paste IDs above</div>'; return; }
+        // Only rebuild if count changed or not built
+        if (wrap.childElementCount !== containerList.length) {
+            wrap.innerHTML = '';
+            containerList.forEach((id, i) => {
+                const d = document.createElement('div');
+                d.dataset.i = i;
+                d.style.cssText = 'display:flex;align-items:center;padding:4px 8px;border-bottom:1px solid #f5f5f5;gap:6px;font:11px monospace';
+                d.innerHTML = `<span class="dd-dot" style="width:16px;height:16px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:8px;font-weight:700;color:#fff"></span><span class="dd-id" style="flex:1"></span><span class="dd-chk"></span>`;
+                d.querySelector('.dd-id').textContent = id;
+                wrap.appendChild(d);
+            });
+        }
+        // Update states
+        for (let i = 0; i < wrap.children.length; i++) {
+            const row = wrap.children[i], done = doneSet.has(i), active = i === currentIdx && !done && isRunning();
+            row.style.background = done ? '#f0f9f0' : active ? '#fff8e1' : '';
+            row.style.fontWeight = active ? '700' : '';
+            const dot = row.querySelector('.dd-dot');
+            dot.style.background = done ? '#2ecc71' : active ? '#f39c12' : '#ddd';
+            dot.textContent = i + 1;
+            row.querySelector('.dd-chk').textContent = done ? '✓' : '';
+        }
     }
 
-    // --- Build panel ---
+    // --- Build panel (minimal DOM) ---
     const p = document.createElement('div');
     p.id = 'dd-panel';
-    p.style.cssText = 'position:fixed;top:80px;right:20px;z-index:999999;width:280px;background:#fff;border:2px solid #c0392b;border-radius:12px;box-shadow:0 6px 24px rgba(0,0,0,.2);font:13px Segoe UI,sans-serif;overflow:hidden';
+    p.style.cssText = 'position:fixed;top:80px;right:20px;z-index:999999;width:260px;background:#fff;border:2px solid #c0392b;border-radius:10px;box-shadow:0 4px 16px rgba(0,0,0,.15);font:12px Segoe UI,sans-serif;overflow:hidden';
     p.innerHTML = `
-        <div id="dd-hdr" style="background:linear-gradient(135deg,#c0392b,#e74c3c);color:#fff;padding:10px 12px;font:700 14px Segoe UI;cursor:move;user-select:none;display:flex;align-items:center">
-            <span>Delete Delete v4</span><span id="dd-col" style="margin-left:auto;cursor:pointer;font-size:16px">−</span>
+        <div id="dd-hdr" style="background:#c0392b;color:#fff;padding:8px 10px;font:700 13px Segoe UI;cursor:move;user-select:none;display:flex;align-items:center">
+            <span>Delete Delete v4.1</span><span id="dd-col" style="margin-left:auto;cursor:pointer;font-size:15px">−</span>
         </div>
-        <div id="dd-body" style="padding:10px 12px">
-            <textarea id="dd-ta" placeholder="Container IDs (one per line)" style="width:100%;height:70px;padding:6px;box-sizing:border-box;border:2px solid #e0e0e0;border-radius:6px;font:11px monospace;resize:vertical"></textarea>
-            <select id="dd-type" style="width:100%;padding:5px;border:2px solid #e0e0e0;border-radius:6px;font:11px Segoe UI;margin:6px 0">
+        <div id="dd-body" style="padding:8px 10px">
+            <textarea id="dd-ta" placeholder="Container IDs (one per line)" style="width:100%;height:60px;padding:5px;box-sizing:border-box;border:1px solid #ddd;border-radius:5px;font:10px monospace;resize:vertical"></textarea>
+            <select id="dd-type" style="width:100%;padding:4px;border:1px solid #ddd;border-radius:5px;font:10px Segoe UI;margin:5px 0">
                 <option value="MISSING">Sweeping out (Missing)</option>
                 <option value="DAMAGED">Damaged and unreturnable</option>
                 <option value="THEFT">Known theft</option>
             </select>
-            <div style="display:grid;grid-template-columns:1fr 1fr;gap:5px;margin-bottom:8px">
-                <button id="dd-load" style="padding:7px;border:none;border-radius:6px;cursor:pointer;font:600 11px Segoe UI;background:#c0392b;color:#fff">Load</button>
-                <button id="dd-clear" style="padding:7px;border:none;border-radius:6px;cursor:pointer;font:600 11px Segoe UI;background:#eee;color:#555">Clear</button>
-                <button id="dd-start" style="padding:7px;border:none;border-radius:6px;cursor:pointer;font:600 11px Segoe UI;background:#27ae60;color:#fff">▶ Start</button>
-                <button id="dd-stop" style="padding:7px;border:none;border-radius:6px;cursor:pointer;font:600 11px Segoe UI;background:#e74c3c;color:#fff;display:none">⬛ Stop</button>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:4px;margin-bottom:6px">
+                <button id="dd-load" style="padding:6px;border:none;border-radius:5px;cursor:pointer;font:600 10px Segoe UI;background:#c0392b;color:#fff">Load</button>
+                <button id="dd-clear" style="padding:6px;border:none;border-radius:5px;cursor:pointer;font:600 10px Segoe UI;background:#eee;color:#555">Clear</button>
+                <button id="dd-start" style="padding:6px;border:none;border-radius:5px;cursor:pointer;font:600 10px Segoe UI;background:#27ae60;color:#fff">▶ Start</button>
+                <button id="dd-stop" style="padding:6px;border:none;border-radius:5px;cursor:pointer;font:600 10px Segoe UI;background:#e74c3c;color:#fff;display:none">⬛ Stop</button>
             </div>
-            <div id="dd-list" style="max-height:150px;overflow-y:auto;border:1px solid #eee;border-radius:6px"></div>
-            <div id="dd-status" style="margin-top:6px;padding:5px;border-radius:6px;font:600 11px Segoe UI;text-align:center;background:#f8f9fa;color:#7f8c8d">Ready</div>
-            <div style="height:4px;background:#e0e0e0;border-radius:2px;overflow:hidden;margin-top:5px"><div id="dd-fill" style="height:100%;background:#e74c3c;width:0%;transition:width .3s"></div></div>
+            <div id="dd-list" style="max-height:130px;overflow-y:auto;border:1px solid #eee;border-radius:5px"></div>
+            <div id="dd-status" style="margin-top:5px;padding:4px;border-radius:4px;font:600 10px Segoe UI;text-align:center;background:#f8f9fa;color:#7f8c8d">Ready</div>
+            <div style="height:3px;background:#eee;border-radius:2px;overflow:hidden;margin-top:4px"><div id="dd-fill" style="height:100%;background:#c0392b;width:0%;transition:width .3s"></div></div>
         </div>`;
     document.body.appendChild(p);
 
-    // Draggable
-    let sx, sy;
+    // Draggable (throttled)
+    let dx, dy, dragging = false;
     document.getElementById('dd-hdr').onmousedown = e => {
-        e.preventDefault(); sx = e.clientX; sy = e.clientY;
-        const mv = ev => { p.style.top = (p.offsetTop + ev.clientY - sy) + 'px'; p.style.left = (p.offsetLeft + ev.clientX - sx) + 'px'; p.style.right = 'auto'; sx = ev.clientX; sy = ev.clientY; };
-        document.addEventListener('mousemove', mv);
-        document.addEventListener('mouseup', () => document.removeEventListener('mousemove', mv), { once: true });
+        e.preventDefault(); dx = e.clientX - p.offsetLeft; dy = e.clientY - p.offsetTop; dragging = true;
     };
+    document.addEventListener('mousemove', e => { if (dragging) { p.style.left = (e.clientX - dx) + 'px'; p.style.top = (e.clientY - dy) + 'px'; p.style.right = 'auto'; } });
+    document.addEventListener('mouseup', () => { dragging = false; });
 
     // Collapse
     document.getElementById('dd-col').onclick = () => {
@@ -461,36 +364,29 @@
     document.getElementById('dd-load').onclick = () => {
         containerList = document.getElementById('dd-ta').value.split('\n').map(s => s.trim()).filter(Boolean);
         doneSet = new Set(); currentIdx = 0;
-        set(LS.list, containerList.join('\n'));
-        set(LS.idx, '0'); set(LS.done, '[]'); set(LS.running, '0');
-        renderList();
-        setStatus(`${containerList.length} loaded`, '#27ae60');
+        set(LS.list, containerList.join('\n')); set(LS.idx, '0'); set(LS.done, '[]'); set(LS.running, '0');
+        renderList(); setStatus(`${containerList.length} loaded`, '#27ae60');
     };
-
     document.getElementById('dd-clear').onclick = () => {
-        stop();
-        containerList = []; doneSet = new Set(); currentIdx = 0;
+        stop(); containerList = []; doneSet = new Set(); currentIdx = 0;
         document.getElementById('dd-ta').value = '';
         set(LS.list, ''); set(LS.idx, '0'); set(LS.done, '[]');
         renderList(); setStatus('Cleared', '#7f8c8d');
     };
-
     document.getElementById('dd-start').onclick = start;
     document.getElementById('dd-stop').onclick = stop;
 
-    // Init: restore state
+    // Init
     const saved = get(LS.list);
-    if (saved) { document.getElementById('dd-ta').value = saved; containerList = saved.split('\n').map(s => s.trim()).filter(Boolean); }
+    if (saved) { document.getElementById('dd-ta').value = saved; containerList = saved.split('\n').filter(Boolean); }
     document.getElementById('dd-type').value = get(LS.type, 'MISSING');
-    restoreState();
-    renderList();
+    restoreState(); renderList();
 
-    // Auto-resume after page reload
+    // Auto-resume
     if (isRunning() && containerList.length && currentIdx < containerList.length) {
-        setStatus('Resuming...', '#3498db');
-        needsRestart = false;
-        polling = setInterval(tick, 500);
+        polling = setInterval(tick, 600);
         document.getElementById('dd-start').style.display = 'none';
         document.getElementById('dd-stop').style.display = '';
+        setStatus('Resuming...', '#3498db');
     }
 })();
