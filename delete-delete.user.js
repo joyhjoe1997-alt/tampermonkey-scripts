@@ -151,54 +151,86 @@
         });
     }
 
-    // --- Extract FcSku from confirm page ---
-    function getFcSkuFromPage() {
-        const dts = document.querySelectorAll('#context dt.a-list-item, #workflow dt.a-list-item');
-        for (const dt of dts) {
-            if (dt.textContent.trim().startsWith('FcSku')) {
-                const dd = dt.nextElementSibling;
-                if (dd) return dd.textContent.trim();
-            }
-        }
-        // Fallback: look in workflow area
+    // --- Extract FcSku and Quantity from confirm page ---
+    function getFieldFromPage(label) {
         const allDts = document.querySelectorAll('dt.a-list-item');
         for (const dt of allDts) {
-            if (dt.textContent.trim().startsWith('FcSku')) {
+            if (dt.textContent.trim().startsWith(label)) {
                 const dd = dt.nextElementSibling;
                 if (dd) return dd.textContent.trim();
             }
         }
         return null;
     }
+    function getFcSkuFromPage() { return getFieldFromPage('FcSku'); }
+    function getQuantityFromPage() { return parseInt(getFieldFromPage('Quantity to delete') || getFieldFromPage('Quantity') || '1', 10); }
 
     // --- Show price overlay on confirm page ---
-    function showPriceInfo(fcSku, data) {
+    function showPriceInfo(fcSku, data, qty) {
         let box = document.getElementById('dd-price-box');
         if (!box) {
             box = document.createElement('div');
             box.id = 'dd-price-box';
-            box.style.cssText = 'position:fixed;bottom:20px;right:20px;z-index:999998;background:#fff;border:2px solid #3498db;border-radius:10px;padding:12px 16px;box-shadow:0 4px 16px rgba(0,0,0,.15);font:13px Segoe UI,sans-serif;max-width:320px';
+            box.style.cssText = 'position:fixed;bottom:20px;right:20px;z-index:999998;background:#fff;border:2px solid #3498db;border-radius:10px;padding:12px 16px;box-shadow:0 4px 16px rgba(0,0,0,.15);font:13px Segoe UI,sans-serif;max-width:340px';
             document.body.appendChild(box);
         }
         const price = data.amazonPrice || data.fcPrice || 'N/A';
         const priceNum = parseFloat((price).replace(/[^0-9.]/g, '')) || 0;
+        const isCritical = priceNum >= 1000;
         const isHigh = priceNum >= 100;
-        const bgColor = isHigh ? '#fee' : '#f0f9ff';
+        const qtyAlert = qty >= 99;
+        const blocked = isCritical || qtyAlert;
+        const bgColor = blocked ? '#fde' : isHigh ? '#fee' : '#f0f9ff';
+        const borderColor = blocked ? '#c0392b' : isHigh ? '#e74c3c' : '#3498db';
         box.style.background = bgColor;
-        box.style.borderColor = isHigh ? '#e74c3c' : '#3498db';
+        box.style.borderColor = borderColor;
+
+        let alertHtml = '';
+        if (isCritical) alertHtml += `<div style="margin-top:6px;padding:6px 8px;background:#c0392b;color:#fff;border-radius:4px;font:700 12px Segoe UI;text-align:center">🚨 PRICE OVER £1000 - STOPPED</div>`;
+        if (qtyAlert) alertHtml += `<div style="margin-top:6px;padding:6px 8px;background:#e67e22;color:#fff;border-radius:4px;font:700 12px Segoe UI;text-align:center">⚠️ QTY ${qty} (99+) - STOPPED</div>`;
+
+        let btnHtml = '';
+        if (blocked && data.amazonPrice && data.amazonPrice !== 'Loading...' && data.amazonPrice !== 'Fetching...') {
+            btnHtml = `<div style="display:flex;gap:6px;margin-top:8px">
+                <button id="dd-alert-continue" style="flex:1;padding:8px;border:none;border-radius:6px;cursor:pointer;font:700 11px Segoe UI;background:#27ae60;color:#fff">✓ Continue Delete</button>
+                <button id="dd-alert-skip" style="flex:1;padding:8px;border:none;border-radius:6px;cursor:pointer;font:700 11px Segoe UI;background:#e74c3c;color:#fff">✗ Skip & Next</button>
+            </div>`;
+        }
+
         box.innerHTML = `
-            <div style="font:700 13px Segoe UI;margin-bottom:6px;color:${isHigh ? '#e74c3c' : '#2c3e50'}">
-                ${isHigh ? '⚠️ HIGH VALUE' : '💰 Item Price'}
+            <div style="font:700 13px Segoe UI;margin-bottom:6px;color:${blocked ? '#c0392b' : isHigh ? '#e74c3c' : '#2c3e50'}">
+                ${blocked ? '🚨 ALERT - REVIEW REQUIRED' : isHigh ? '⚠️ HIGH VALUE' : '💰 Item Price'}
             </div>
             <table style="font:12px monospace;border-collapse:collapse;width:100%">
                 <tr><td style="padding:2px 8px 2px 0;color:#7f8c8d">FcSku:</td><td style="font-weight:700">${fcSku}</td></tr>
                 ${data.asin ? `<tr><td style="padding:2px 8px 2px 0;color:#7f8c8d">ASIN:</td><td>${data.asin}</td></tr>` : ''}
                 <tr><td style="padding:2px 8px 2px 0;color:#7f8c8d">FC Price:</td><td>${data.fcPrice}</td></tr>
-                <tr><td style="padding:2px 8px 2px 0;color:#7f8c8d">Amazon:</td><td style="font-weight:700;color:${isHigh ? '#e74c3c' : '#27ae60'}">${data.amazonPrice || 'N/A'}</td></tr>
-                ${data.title ? `<tr><td colspan="2" style="padding-top:4px;font:11px Segoe UI;color:#555;max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${data.title.substring(0, 50)}</td></tr>` : ''}
+                <tr><td style="padding:2px 8px 2px 0;color:#7f8c8d">Amazon:</td><td style="font-weight:700;color:${isCritical ? '#c0392b' : isHigh ? '#e74c3c' : '#27ae60'}">${data.amazonPrice || 'N/A'}</td></tr>
+                <tr><td style="padding:2px 8px 2px 0;color:#7f8c8d">Qty:</td><td style="font-weight:700;color:${qtyAlert ? '#e67e22' : '#2c3e50'}">${qty}</td></tr>
+                ${data.title ? `<tr><td colspan="2" style="padding-top:4px;font:11px Segoe UI;color:#555;max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${data.title.substring(0, 55)}</td></tr>` : ''}
             </table>
-            ${isHigh ? '<div style="margin-top:6px;padding:4px 8px;background:#e74c3c;color:#fff;border-radius:4px;font:700 11px Segoe UI;text-align:center">⚠️ VALUE OVER £100 - CHECK BEFORE DELETE</div>' : ''}
-        `;
+            ${alertHtml}${btnHtml}`;
+
+        // Bind alert buttons
+        if (blocked && btnHtml) {
+            document.getElementById('dd-alert-continue')?.addEventListener('click', () => {
+                clickConfirm();
+                hidePriceInfo();
+            });
+            document.getElementById('dd-alert-skip')?.addEventListener('click', () => {
+                // Skip this container and move to next
+                doneSet.add(currentIdx);
+                currentIdx++;
+                saveState();
+                renderList();
+                needsRestart = true;
+                waitingForPrice = false;
+                hidePriceInfo();
+                setStatus(`[${currentIdx}] Skipped - next`, 'orange');
+            });
+        }
+
+        return blocked;
     }
 
     function hidePriceInfo() {
@@ -209,8 +241,9 @@
     async function handleConfirmPage() {
         const fcSku = getFcSkuFromPage();
         if (!fcSku) { waitingForPrice = false; return; }
+        const qty = getQuantityFromPage();
 
-        showPriceInfo(fcSku, { fcPrice: 'Loading...', amazonPrice: 'Loading...', title: '', asin: null });
+        showPriceInfo(fcSku, { fcPrice: 'Loading...', amazonPrice: 'Loading...', title: '', asin: null }, qty);
 
         // Fetch from FC Research
         const fcData = await fetchFCResearch(fcSku);
@@ -218,14 +251,20 @@
 
         // If we got an ASIN, fetch Amazon price
         if (fcData.asin) {
-            showPriceInfo(fcSku, { ...fcData, amazonPrice: 'Fetching...' });
+            showPriceInfo(fcSku, { ...fcData, amazonPrice: 'Fetching...' }, qty);
             amazonPrice = await fetchAmazonPrice(fcData.asin);
         }
 
-        showPriceInfo(fcSku, { ...fcData, amazonPrice });
+        const blocked = showPriceInfo(fcSku, { ...fcData, amazonPrice }, qty);
         waitingForPrice = false;
 
-        // Auto-confirm after price is shown (1s delay so user can see it)
+        // If blocked (price >= £1000 or qty >= 99), stop and wait for user action
+        if (blocked) {
+            setStatus(`[${currentIdx + 1}] ⚠️ ALERT - waiting`, '#c0392b');
+            return; // User must click Continue or Skip
+        }
+
+        // Auto-confirm after price is shown (1.5s delay so user can see it)
         if (isRunning()) {
             setTimeout(() => {
                 if (isRunning() && getTitle().includes('Confirm the deletion')) {
