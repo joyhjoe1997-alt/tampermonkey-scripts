@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Delete Delete - Auto Delete Items
 // @author       joyhjoe
-// @version      2.0
-// @description  Automated multi-container item deletion for AFT DeleteItems tool
+// @version      3.0
+// @description  Automated multi-container item deletion for AFT DeleteItems
 // @match        https://aft-qt-eu.aka.amazon.com/app/deleteitems*
 // @icon         https://cdn-icons-png.flaticon.com/512/3687/3687412.png
 // @run-at       document-idle
@@ -12,15 +12,7 @@
 (function () {
     'use strict';
 
-    const LS = {
-        list: 'dd_list',
-        idx: 'dd_idx',
-        running: 'dd_running',
-        done: 'dd_done',
-        type: 'dd_deltype',
-        log: 'dd_log',
-    };
-
+    const LS = { list: 'dd_list', idx: 'dd_idx', running: 'dd_running', done: 'dd_done', type: 'dd_type' };
     const get = (k, d = '') => localStorage.getItem(k) ?? d;
     const set = (k, v) => localStorage.setItem(k, String(v));
 
@@ -28,118 +20,78 @@
     let doneSet = new Set();
     let currentIdx = 0;
     let polling = null;
-    let lastClickTime = 0;
-
-    // === LOG ===
-    function log(action, details) {
-        const entries = getLog();
-        entries.unshift({ time: new Date().toLocaleTimeString('en-GB'), action, details });
-        if (entries.length > 200) entries.length = 200;
-        set(LS.log, JSON.stringify(entries));
-    }
-    function getLog() { try { return JSON.parse(get(LS.log, '[]')); } catch { return []; } }
-
-    // === HELPERS ===
-    function getTitle() {
-        const h1 = document.querySelector('#workflow h1');
-        return h1 ? h1.textContent.trim() : '';
-    }
-
-    function getError() {
-        const el = document.querySelector('.a-alert-inline-error .a-alert-content');
-        return el ? el.textContent.trim() : '';
-    }
-
-    function getPrimaryBtn() {
-        // Method 1: Exact selector from old working script
-        const btn1 = document.querySelector('.a-button-primary button, .a-button-primary input');
-        if (btn1 && btn1.offsetParent !== null) return btn1;
-        // Method 2: Any visible button/input with action text
-        for (const b of document.querySelectorAll('button, input[type="submit"]')) {
-            if (!b.offsetParent) continue;
-            const text = (b.innerText || b.value || '').toLowerCase();
-            if (text.includes('delete items') || text.includes('continue') || text.includes('confirm')) return b;
-        }
-        return null;
-    }
-
-    function clickBtn(btn) {
-        if (!btn) return;
-        // Prevent double-click within 1 second
-        if (Date.now() - lastClickTime < 1000) return;
-        lastClickTime = Date.now();
-        // Click the input itself
-        btn.click();
-        // Also click the parent span.a-button (Amazon's framework listens here)
-        const parentSpan = btn.closest('.a-button');
-        if (parentSpan) parentSpan.click();
-        // Also try the span.a-button-inner
-        const inner = btn.closest('.a-button-inner');
-        if (inner) inner.click();
-    }
-
-    function getTextInput() {
-        return document.querySelector('#workflow form input[type="text"]');
-    }
-
-    function fillInput(el, val) {
-        const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
-        if (setter) setter.call(el, val); else el.value = val;
-        el.dispatchEvent(new Event('input', { bubbles: true }));
-        el.dispatchEvent(new Event('change', { bubbles: true }));
-    }
+    let lastClick = 0;
+    let needsRestart = false;
 
     function isRunning() { return get(LS.running) === '1'; }
-
-    function saveState() {
-        set(LS.idx, currentIdx);
-        set(LS.done, JSON.stringify([...doneSet]));
-    }
-
+    function saveState() { set(LS.idx, currentIdx); set(LS.done, JSON.stringify([...doneSet])); }
     function restoreState() {
         currentIdx = parseInt(get(LS.idx, '0'), 10) || 0;
         try { doneSet = new Set(JSON.parse(get(LS.done, '[]'))); } catch { doneSet = new Set(); }
     }
 
-    // Track state for "Start over" flow
-    let needsRestart = false;
+    // --- Page helpers ---
+    function getTitle() { return document.querySelector('#workflow h1')?.textContent.trim() || ''; }
+    function getError() { return document.querySelector('.a-alert-inline-error .a-alert-content')?.textContent.trim() || ''; }
+    function getInput() { return document.querySelector('#workflow form input[type="text"]'); }
 
-    // === CORE: Polling tick (runs every 500ms) ===
+    function fillInput(el, val) {
+        const s = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+        if (s) s.call(el, val); else el.value = val;
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+
+    function clickPrimary() {
+        if (Date.now() - lastClick < 800) return false;
+        const btn = document.querySelector('.a-button-primary input.a-button-input, .a-button-primary button');
+        if (!btn || !btn.offsetParent) return false;
+        lastClick = Date.now();
+        btn.click();
+        btn.closest('.a-button')?.click();
+        return true;
+    }
+
+    function clickConfirm() {
+        if (Date.now() - lastClick < 800) return false;
+        const btn = document.querySelector('[data-click-action*="Confirm"] input.a-button-input');
+        if (btn) { lastClick = Date.now(); btn.click(); btn.closest('.a-button')?.click(); return true; }
+        return clickPrimary();
+    }
+
+    function startOver() {
+        // Click "Start over" link or press 'r'
+        const link = document.querySelector('[data-action="click-restart"] a, [data-click-restart] a');
+        if (link) { link.click(); return; }
+        document.dispatchEvent(new KeyboardEvent('keydown', { key: 'r', code: 'KeyR', keyCode: 82, bubbles: true }));
+    }
+
+    // --- Core tick (every 500ms) ---
     function tick() {
-        if (!isRunning()) { stopPolling(); return; }
+        if (!isRunning()) { stop(); return; }
         if (currentIdx >= containerList.length) {
-            log('ALL_DONE', `${containerList.length} containers processed`);
-            setStatus(`All ${containerList.length} done!`, '#27ae60');
-            stopPolling();
-            set(LS.running, '0');
+            setStatus(`Done! ${containerList.length} processed`, '#27ae60');
+            stop();
             return;
         }
 
         const title = getTitle();
         const error = getError();
-        const containerId = containerList[currentIdx];
+        const id = containerList[currentIdx];
         const delType = get(LS.type, 'MISSING');
 
-        // --- If we need to restart (press 'r') before next container ---
+        // Restart before each new container
         if (needsRestart) {
             setStatus(`[${currentIdx + 1}] Restarting...`, '#3498db');
-            // Simulate pressing 'r' key for "Start over"
-            document.dispatchEvent(new KeyboardEvent('keydown', { key: 'r', code: 'KeyR', keyCode: 82, bubbles: true }));
-            document.dispatchEvent(new KeyboardEvent('keypress', { key: 'r', code: 'KeyR', keyCode: 82, bubbles: true }));
-            document.dispatchEvent(new KeyboardEvent('keyup', { key: 'r', code: 'KeyR', keyCode: 82, bubbles: true }));
-            // Also try clicking the "Start over" link directly
-            const startOverLink = document.querySelector('[data-action="click-restart"] a, [data-click-restart] a');
-            if (startOverLink) startOverLink.click();
+            startOver();
             needsRestart = false;
             return;
         }
 
-        // --- On "Scan container" page ---
+        // Scan container page
         if (title.includes('Scan container')) {
-            // Check if error says empty
             if (error.includes('is empty')) {
-                log('EMPTY', `${containerId} is empty`);
-                setStatus(`[${currentIdx + 1}] Empty - next`, 'orange');
+                setStatus(`[${currentIdx + 1}] Empty - skip`, 'orange');
                 doneSet.add(currentIdx);
                 currentIdx++;
                 saveState();
@@ -147,55 +99,40 @@
                 needsRestart = true;
                 return;
             }
-            // Fill and submit
-            const inp = getTextInput();
-            if (inp && inp.value !== containerId) {
-                setStatus(`[${currentIdx + 1}/${containerList.length}] Scanning: ${containerId}`, '#c0392b');
-                log('SCAN', containerId);
-                fillInput(inp, containerId);
-            }
-            // Click continue
-            const btn = getPrimaryBtn();
-            if (btn && inp && inp.value === containerId) clickBtn(btn);
+            const inp = getInput();
+            if (!inp) return;
+            if (inp.value !== id) { fillInput(inp, id); setStatus(`[${currentIdx + 1}/${containerList.length}] ${id}`, '#c0392b'); }
+            else clickPrimary();
             return;
         }
 
-        // --- On "Select deletion type" page ---
-        if (title.includes('Select deletion type')) {
-            setStatus(`[${currentIdx + 1}] Selecting type...`, '#c0392b');
-            const radio = document.querySelector(`input[type="radio"][value="${delType}"]`);
-            if (radio && !radio.checked) { radio.checked = true; radio.dispatchEvent(new Event('change', { bubbles: true })); }
-            const btn = getPrimaryBtn();
-            if (btn) clickBtn(btn);
-            return;
-        }
-
-        // --- On "Select Item to Delete" page ---
+        // Select Item to Delete
         if (title.includes('Select Item to Delete')) {
             setStatus(`[${currentIdx + 1}] Selecting item...`, '#c0392b');
-            // First radio should already be checked, just click continue
             const radio = document.querySelector('#workflow input[type="radio"]');
             if (radio && !radio.checked) radio.checked = true;
-            const btn = getPrimaryBtn();
-            if (btn) clickBtn(btn);
+            clickPrimary();
             return;
         }
 
-        // --- On "Confirm the deletion" page ---
+        // Select deletion type
+        if (title.includes('Select deletion type')) {
+            setStatus(`[${currentIdx + 1}] Setting type...`, '#c0392b');
+            const radio = document.querySelector(`input[type="radio"][value="${delType}"]`);
+            if (radio && !radio.checked) { radio.checked = true; radio.dispatchEvent(new Event('change', { bubbles: true })); }
+            clickPrimary();
+            return;
+        }
+
+        // Confirm deletion
         if (title.includes('Confirm the deletion')) {
-            setStatus(`[${currentIdx + 1}] Confirming...`, '#c0392b');
-            // Click "Delete items" (the Confirm action button)
-            const btn = document.querySelector('[data-click-action*="Confirm"] input.a-button-input');
-            if (btn) { clickBtn(btn); return; }
-            // Fallback to primary
-            const primaryBtn = getPrimaryBtn();
-            if (primaryBtn) clickBtn(primaryBtn);
+            setStatus(`[${currentIdx + 1}] Deleting...`, '#c0392b');
+            clickConfirm();
             return;
         }
 
-        // --- On success/done page (back to scan means item deleted) ---
-        // If none of the above matched, check if we're done with this container
-        if (title.includes('Scan container')) {
+        // If we somehow ended back on scan without going through above flow
+        if (title.includes('Scan') && !error) {
             doneSet.add(currentIdx);
             currentIdx++;
             saveState();
@@ -204,150 +141,127 @@
         }
     }
 
-    function startPolling() {
-        if (polling) return;
+    function start() {
+        if (!containerList.length) { setStatus('Load list first', 'orange'); return; }
+        set(LS.type, document.getElementById('dd-type').value);
         set(LS.running, '1');
+        needsRestart = true;
+        saveState();
         polling = setInterval(tick, 500);
+        document.getElementById('dd-start').style.display = 'none';
+        document.getElementById('dd-stop').style.display = '';
+        setStatus('Running...', '#c0392b');
+        renderList();
     }
 
-    function stopPolling() {
+    function stop() {
         if (polling) { clearInterval(polling); polling = null; }
+        set(LS.running, '0');
+        document.getElementById('dd-start').style.display = '';
+        document.getElementById('dd-stop').style.display = 'none';
+        setStatus('Stopped', '#e74c3c');
     }
 
-    // === UI ===
+    // --- UI ---
     function setStatus(msg, color = '#7f8c8d') {
         const el = document.getElementById('dd-status');
         if (el) { el.textContent = msg; el.style.color = color; }
     }
 
     function renderList() {
-        const wrap = document.getElementById('dd-list-wrap');
+        const wrap = document.getElementById('dd-list');
         if (!wrap) return;
-        const fill = document.getElementById('dd-prog-fill');
+        const fill = document.getElementById('dd-fill');
         if (fill) fill.style.width = containerList.length ? `${Math.round(doneSet.size / containerList.length * 100)}%` : '0%';
-        if (!containerList.length) { wrap.innerHTML = '<div style="padding:14px;text-align:center;color:#aaa;font-size:12px">Paste container IDs above</div>'; return; }
+        if (!containerList.length) { wrap.innerHTML = '<div style="padding:12px;text-align:center;color:#aaa;font-size:12px">Paste IDs above</div>'; return; }
         wrap.innerHTML = '';
         containerList.forEach((id, i) => {
             const done = doneSet.has(i);
             const active = i === currentIdx && !done && isRunning();
             const row = document.createElement('div');
-            row.style.cssText = `display:flex;align-items:center;padding:6px 10px;border-bottom:1px solid #f5f5f5;gap:8px;font:12px monospace;${done ? 'background:#f0f9f0;color:#27ae60' : active ? 'background:#fff3cd;font-weight:700' : ''}`;
-            row.innerHTML = `<div style="width:20px;height:20px;background:${done ? '#2ecc71' : active ? '#f39c12' : '#c0392b'};color:#fff;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:700">${i + 1}</div><div style="flex:1">${id}</div>${done ? '<span style="color:#27ae60">&#10003;</span>' : ''}`;
+            row.style.cssText = `display:flex;align-items:center;padding:5px 10px;border-bottom:1px solid #f5f5f5;gap:8px;font:12px monospace;${done ? 'background:#f0f9f0;color:#27ae60' : active ? 'background:#fff3cd;font-weight:700' : ''}`;
+            row.innerHTML = `<div style="width:18px;height:18px;background:${done ? '#2ecc71' : active ? '#f39c12' : '#c0392b'};color:#fff;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:9px;font-weight:700">${i + 1}</div><div style="flex:1">${id}</div>${done ? '&#10003;' : ''}`;
             wrap.appendChild(row);
         });
         wrap.children[currentIdx]?.scrollIntoView({ block: 'nearest' });
     }
 
-    function showLog() {
-        const entries = getLog();
-        const rows = entries.length ? entries.map(e => `<tr><td style="font-size:11px;color:#888;padding:3px 8px">${e.time}</td><td style="font:700 12px Segoe UI;padding:3px 8px">${e.action}</td><td style="font-size:12px;padding:3px 8px">${e.details}</td></tr>`).join('') : '<tr><td colspan="3" style="text-align:center;padding:20px;color:#aaa">Empty</td></tr>';
-        const d = document.createElement('div');
-        d.id = 'dd-log-dlg';
-        d.style.cssText = 'position:fixed;inset:0;z-index:1000003;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center';
-        d.innerHTML = `<div style="background:#fff;border-radius:14px;width:650px;max-width:95vw;max-height:80vh;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 16px 50px rgba(0,0,0,.35)"><div style="background:#c0392b;color:#fff;padding:12px 16px;font:700 15px Segoe UI;display:flex;justify-content:space-between"><span>Log (${entries.length})</span><button id="dd-log-x" style="background:none;border:none;color:#fff;font-size:18px;cursor:pointer">X</button></div><div style="overflow-y:auto;flex:1;padding:8px"><table style="width:100%;border-collapse:collapse">${rows}</table></div></div>`;
-        document.getElementById('dd-log-dlg')?.remove();
-        document.body.appendChild(d);
-        document.getElementById('dd-log-x').onclick = () => d.remove();
-    }
-
-    function buildPanel() {
-        const p = document.createElement('div');
-        p.id = 'dd-panel';
-        p.style.cssText = 'position:fixed;top:80px;right:20px;z-index:999999;width:300px;background:#fff;border:2px solid #c0392b;border-radius:14px;box-shadow:0 8px 30px rgba(0,0,0,.22);font:13px Segoe UI,sans-serif;overflow:hidden';
-        p.innerHTML = `
-            <div id="dd-hdr" style="background:linear-gradient(135deg,#c0392b,#e74c3c);color:#fff;padding:12px 14px;display:flex;align-items:center;font:700 14px Segoe UI;cursor:move;user-select:none">
-                <span>Delete Delete v2.0</span>
-                <span id="dd-col" style="margin-left:auto;cursor:pointer;font-size:18px">-</span>
+    // Build panel
+    const p = document.createElement('div');
+    p.id = 'dd-panel';
+    p.style.cssText = 'position:fixed;top:80px;right:20px;z-index:999999;width:280px;background:#fff;border:2px solid #c0392b;border-radius:12px;box-shadow:0 6px 24px rgba(0,0,0,.2);font:13px Segoe UI,sans-serif;overflow:hidden';
+    p.innerHTML = `
+        <div id="dd-hdr" style="background:linear-gradient(135deg,#c0392b,#e74c3c);color:#fff;padding:10px 12px;font:700 14px Segoe UI;cursor:move;user-select:none;display:flex;align-items:center">
+            <span>Delete Delete v3</span><span id="dd-col" style="margin-left:auto;cursor:pointer;font-size:16px">-</span>
+        </div>
+        <div id="dd-body" style="padding:10px 12px">
+            <textarea id="dd-ta" placeholder="Container IDs (one per line)" style="width:100%;height:70px;padding:6px;box-sizing:border-box;border:2px solid #e0e0e0;border-radius:6px;font:11px monospace;resize:vertical"></textarea>
+            <select id="dd-type" style="width:100%;padding:5px;border:2px solid #e0e0e0;border-radius:6px;font:11px Segoe UI;margin:6px 0">
+                <option value="MISSING">Sweeping out (Missing)</option>
+                <option value="THEFT">Known theft</option>
+            </select>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:5px;margin-bottom:8px">
+                <button id="dd-load" style="padding:7px;border:none;border-radius:6px;cursor:pointer;font:600 11px Segoe UI;background:#c0392b;color:#fff">Load</button>
+                <button id="dd-clear" style="padding:7px;border:none;border-radius:6px;cursor:pointer;font:600 11px Segoe UI;background:#eee;color:#555">Clear</button>
+                <button id="dd-start" style="padding:7px;border:none;border-radius:6px;cursor:pointer;font:600 11px Segoe UI;background:#27ae60;color:#fff">Start</button>
+                <button id="dd-stop" style="padding:7px;border:none;border-radius:6px;cursor:pointer;font:600 11px Segoe UI;background:#e74c3c;color:#fff;display:none">Stop</button>
             </div>
-            <div id="dd-body" style="padding:12px 14px">
-                <textarea id="dd-ta" placeholder="Paste container IDs (one per line)" style="width:100%;height:80px;padding:8px;box-sizing:border-box;border:2px solid #e0e0e0;border-radius:8px;font:12px monospace;resize:vertical"></textarea>
-                <div style="margin:8px 0">
-                    <label style="font:600 11px Segoe UI;color:#555">Deletion Type:</label>
-                    <select id="dd-type" style="width:100%;padding:5px;border:2px solid #e0e0e0;border-radius:6px;font:12px Segoe UI;margin-top:3px">
-                        <option value="MISSING">Sweeping out (Missing)</option>
-                        <option value="THEFT">Known theft</option>
-                    </select>
-                </div>
-                <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:10px">
-                    <button id="dd-load" style="padding:7px;border:none;border-radius:8px;cursor:pointer;font:600 12px Segoe UI;background:#c0392b;color:#fff">Load</button>
-                    <button id="dd-clear" style="padding:7px;border:none;border-radius:8px;cursor:pointer;font:600 12px Segoe UI;background:#f0f0f0;color:#555">Clear</button>
-                    <button id="dd-start" style="padding:7px;border:none;border-radius:8px;cursor:pointer;font:600 12px Segoe UI;background:#27ae60;color:#fff">Start</button>
-                    <button id="dd-stop" style="padding:7px;border:none;border-radius:8px;cursor:pointer;font:600 12px Segoe UI;background:#e74c3c;color:#fff">Stop</button>
-                    <button id="dd-log" style="padding:7px;border:none;border-radius:8px;cursor:pointer;font:600 12px Segoe UI;background:#8e44ad;color:#fff;grid-column:span 2">View Log</button>
-                </div>
-                <div id="dd-list-wrap" style="max-height:170px;overflow-y:auto;border:1px solid #eee;border-radius:8px"></div>
-                <div id="dd-status" style="margin-top:8px;padding:6px;border-radius:7px;font:600 11px Segoe UI;text-align:center;background:#f8f9fa;color:#7f8c8d">Ready</div>
-                <div style="height:5px;background:#e0e0e0;border-radius:3px;overflow:hidden;margin-top:6px"><div id="dd-prog-fill" style="height:100%;background:linear-gradient(90deg,#e74c3c,#c0392b);width:0%;transition:width .35s;border-radius:3px"></div></div>
-            </div>`;
-        document.body.appendChild(p);
+            <div id="dd-list" style="max-height:150px;overflow-y:auto;border:1px solid #eee;border-radius:6px"></div>
+            <div id="dd-status" style="margin-top:6px;padding:5px;border-radius:6px;font:600 11px Segoe UI;text-align:center;background:#f8f9fa;color:#7f8c8d">Ready</div>
+            <div style="height:4px;background:#e0e0e0;border-radius:2px;overflow:hidden;margin-top:5px"><div id="dd-fill" style="height:100%;background:#e74c3c;width:0%;transition:width .3s"></div></div>
+        </div>`;
+    document.body.appendChild(p);
 
-        // Draggable
-        let sx, sy;
-        document.getElementById('dd-hdr').onmousedown = e => {
-            e.preventDefault(); sx = e.clientX; sy = e.clientY;
-            const mv = ev => { p.style.top = (p.offsetTop + ev.clientY - sy) + 'px'; p.style.left = (p.offsetLeft + ev.clientX - sx) + 'px'; p.style.right = 'auto'; sx = ev.clientX; sy = ev.clientY; };
-            const up = () => document.removeEventListener('mousemove', mv);
-            document.addEventListener('mousemove', mv);
-            document.addEventListener('mouseup', up, { once: true });
-        };
+    // Draggable
+    let sx, sy;
+    document.getElementById('dd-hdr').onmousedown = e => {
+        e.preventDefault(); sx = e.clientX; sy = e.clientY;
+        const mv = ev => { p.style.top = (p.offsetTop + ev.clientY - sy) + 'px'; p.style.left = (p.offsetLeft + ev.clientX - sx) + 'px'; p.style.right = 'auto'; sx = ev.clientX; sy = ev.clientY; };
+        document.addEventListener('mousemove', mv);
+        document.addEventListener('mouseup', () => document.removeEventListener('mousemove', mv), { once: true });
+    };
 
-        // Collapse
-        document.getElementById('dd-col').onclick = () => {
-            const b = document.getElementById('dd-body');
-            b.style.display = b.style.display === 'none' ? '' : 'none';
-            document.getElementById('dd-col').textContent = b.style.display === 'none' ? '+' : '-';
-        };
+    // Collapse
+    document.getElementById('dd-col').onclick = () => {
+        const b = document.getElementById('dd-body');
+        b.style.display = b.style.display === 'none' ? '' : 'none';
+        document.getElementById('dd-col').textContent = b.style.display === 'none' ? '+' : '-';
+    };
 
-        // Buttons
-        document.getElementById('dd-load').onclick = () => {
-            containerList = document.getElementById('dd-ta').value.split('\n').map(s => s.trim()).filter(Boolean);
-            doneSet = new Set(); currentIdx = 0;
-            set(LS.list, containerList.join('\n'));
-            set(LS.idx, '0'); set(LS.done, '[]'); set(LS.running, '0');
-            renderList();
-            setStatus(`${containerList.length} loaded`, '#27ae60');
-        };
+    // Buttons
+    document.getElementById('dd-load').onclick = () => {
+        containerList = document.getElementById('dd-ta').value.split('\n').map(s => s.trim()).filter(Boolean);
+        doneSet = new Set(); currentIdx = 0;
+        set(LS.list, containerList.join('\n'));
+        set(LS.idx, '0'); set(LS.done, '[]'); set(LS.running, '0');
+        renderList();
+        setStatus(`${containerList.length} loaded`, '#27ae60');
+    };
 
-        document.getElementById('dd-clear').onclick = () => {
-            stopPolling(); set(LS.running, '0');
-            containerList = []; doneSet = new Set(); currentIdx = 0;
-            document.getElementById('dd-ta').value = '';
-            set(LS.list, ''); set(LS.idx, '0'); set(LS.done, '[]');
-            renderList(); setStatus('Cleared', '#7f8c8d');
-        };
+    document.getElementById('dd-clear').onclick = () => {
+        stop();
+        containerList = []; doneSet = new Set(); currentIdx = 0;
+        document.getElementById('dd-ta').value = '';
+        set(LS.list, ''); set(LS.idx, '0'); set(LS.done, '[]');
+        renderList(); setStatus('Cleared', '#7f8c8d');
+    };
 
-        document.getElementById('dd-start').onclick = () => {
-            if (!containerList.length) { setStatus('Load list first', 'orange'); return; }
-            set(LS.type, document.getElementById('dd-type').value);
-            needsRestart = true; // Start fresh for first container
-            saveState();
-            startPolling();
-            setStatus('Running...', '#c0392b');
-        };
+    document.getElementById('dd-start').onclick = start;
+    document.getElementById('dd-stop').onclick = stop;
 
-        document.getElementById('dd-stop').onclick = () => {
-            stopPolling(); set(LS.running, '0');
-            setStatus('Stopped', '#e74c3c');
-        };
-
-        document.getElementById('dd-log').onclick = showLog;
-    }
-
-    // === INIT ===
-    buildPanel();
+    // Init: restore state
     const saved = get(LS.list);
-    if (saved) {
-        document.getElementById('dd-ta').value = saved;
-        containerList = saved.split('\n').map(s => s.trim()).filter(Boolean);
-    }
-    const savedType = get(LS.type, 'MISSING');
-    document.getElementById('dd-type').value = savedType;
+    if (saved) { document.getElementById('dd-ta').value = saved; containerList = saved.split('\n').map(s => s.trim()).filter(Boolean); }
+    document.getElementById('dd-type').value = get(LS.type, 'MISSING');
     restoreState();
     renderList();
 
-    // Auto-resume if was running
+    // Auto-resume
     if (isRunning() && containerList.length && currentIdx < containerList.length) {
-        setStatus(`Resuming ${currentIdx + 1}/${containerList.length}...`, '#3498db');
-        startPolling();
+        setStatus(`Resuming...`, '#3498db');
+        needsRestart = true;
+        polling = setInterval(tick, 500);
+        document.getElementById('dd-start').style.display = 'none';
+        document.getElementById('dd-stop').style.display = '';
     }
 })();
