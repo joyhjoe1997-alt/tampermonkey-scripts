@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Page Copier - Learning Portal Text Extractor
 // @author       joyhjoe
-// @version      1.1
+// @version      1.2
 // @description  Auto-navigates pages, clicks interactive elements, extracts all text to clipboard
 // @match        *://myquriosity-learnerportal.learningcloud.me/*
 // @match        *://*.learningcloud.me/*
@@ -9,282 +9,411 @@
 // @icon         https://cdn-icons-png.flaticon.com/512/1621/1621635.png
 // @run-at       document-idle
 // @grant        GM_setClipboard
-// @noframes
 // ==/UserScript==
 
 (function () {
     'use strict';
 
-    // Only run in top frame (prevents duplicate panels in iframes)
-    if (window.self !== window.top) return;
+    // Wait for content to be ready, then decide if we should run
+    // We run ONLY where actual course content exists (inside the content iframe)
+    // Detection: look for ntx-author root or pageContent class
+    let initAttempts = 0;
+    const maxAttempts = 20;
 
-    let isRunning = false;
-    let allText = [];
+    function tryInit() {
+        initAttempts++;
+        const hasContent = document.querySelector('.ntx-ck-editor-container') ||
+                          document.querySelector('[data-ntx-type="PageContent"]') ||
+                          document.querySelector('#root.ntx-author') ||
+                          document.querySelector('.pageContent');
 
-    // --- Helpers ---
-    function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-
-    // Get the iframe document where course content lives
-    function getContentDoc() {
-        const iframe = document.querySelector('iframe[src*="learningcloud.me"]');
-        if (iframe) {
-            try { return iframe.contentDocument || iframe.contentWindow.document; } catch (e) { /* cross-origin */ }
+        if (hasContent) {
+            // Don't create duplicate panels
+            if (document.getElementById('pc-panel')) return;
+            initScript();
+        } else if (initAttempts < maxAttempts) {
+            setTimeout(tryInit, 1000);
         }
-        return document;
     }
 
-    // Scroll inside content to trigger lazy loading
-    async function autoScroll(doc) {
-        const scrollTarget = doc.querySelector('.pageContent') || doc.documentElement;
-        if (!scrollTarget) return;
-        const maxScroll = scrollTarget.scrollHeight;
-        let current = 0;
-        const step = 400;
-        while (current < maxScroll) {
-            current += step;
-            scrollTarget.scrollTop = current;
-            await sleep(100);
-        }
-        const iframeEl = document.querySelector('iframe[src*="learningcloud.me"]');
-        if (iframeEl) { try { iframeEl.contentWindow?.scrollTo(0, current); } catch(e) {} }
-        await sleep(400);
-    }
+    // Start checking after a short delay
+    setTimeout(tryInit, 1500);
 
-    // Get page progress from content doc (e.g. "2/14")
-    function getPageProgress(doc) {
-        const els = doc.querySelectorAll('.ntx-ck-editor-container p, .ntx-ck-editor-container span');
-        for (const el of els) {
-            const match = el.textContent.trim().match(/^(\d+)\/(\d+)\s*$/);
-            if (match) return { current: parseInt(match[1]), total: parseInt(match[2]) };
-        }
-        return null;
-    }
+    function initScript() {
+        let isRunning = false;
+        let allText = [];
 
-    // Click all carousel dots and extract content from each slide
-    async function extractCarousels(doc) {
-        let texts = [];
-        const carousels = doc.querySelectorAll('[data-ntx-type="Composite"]');
-        for (const carousel of carousels) {
-            const dots = carousel.querySelectorAll('button[role="tab"]');
-            if (dots.length <= 1) continue;
-            for (const dot of dots) {
-                dot.click();
-                await sleep(500);
-                const panel = carousel.querySelector('[role="tabpanel"]:not([hidden])');
-                if (panel) {
-                    const els = panel.querySelectorAll('.ntx-ck-editor-container p, .ntx-ck-editor-container h1, .ntx-ck-editor-container h2, .ntx-ck-editor-container h3, .ntx-ck-editor-container h4, .ntx-ck-editor-container li');
-                    for (const e of els) {
-                        const t = e.textContent.trim();
-                        if (t && t.length > 1 && !texts.includes(t)) texts.push(t);
+        // --- Helpers ---
+        function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+        // Scroll the page to load lazy content
+        async function autoScroll() {
+            const root = document.querySelector('.pageContent') ||
+                        document.querySelector('#root.ntx-author') ||
+                        document.documentElement;
+            const maxScroll = Math.max(root.scrollHeight, document.body.scrollHeight, document.documentElement.scrollHeight);
+            let current = 0;
+            const step = 300;
+
+            while (current < maxScroll) {
+                current += step;
+                window.scrollTo(0, current);
+                root.scrollTop = current;
+                document.documentElement.scrollTop = current;
+                await sleep(120);
+            }
+            await sleep(500);
+            // Scroll back to top
+            window.scrollTo(0, 0);
+        }
+
+        // Get page progress (e.g. "2/14")
+        function getPageProgress() {
+            const allEls = document.querySelectorAll('.ntx-ck-editor-container p, .ntx-ck-editor-container span');
+            for (const el of allEls) {
+                const text = el.textContent.trim();
+                const match = text.match(/^(\d+)\s*\/\s*(\d+)$/);
+                if (match && parseInt(match[2]) > 1) {
+                    return { current: parseInt(match[1]), total: parseInt(match[2]) };
+                }
+            }
+            return null;
+        }
+
+        // Click all carousel/composite dots and extract from each slide
+        async function extractCarousels() {
+            let texts = [];
+            const carousels = document.querySelectorAll('[data-ntx-type="Composite"]');
+            for (const carousel of carousels) {
+                const dots = carousel.querySelectorAll('button[role="tab"]');
+                if (dots.length <= 1) continue;
+                for (let i = 0; i < dots.length; i++) {
+                    dots[i].click();
+                    await sleep(600);
+                    // Get the currently visible panel
+                    const panels = carousel.querySelectorAll('[role="tabpanel"]');
+                    for (const p of panels) {
+                        if (p.hidden) continue;
+                        const els = p.querySelectorAll('.ntx-ck-editor-container p, .ntx-ck-editor-container h1, .ntx-ck-editor-container h2, .ntx-ck-editor-container h3, .ntx-ck-editor-container h4, .ntx-ck-editor-container li');
+                        for (const e of els) {
+                            const t = e.textContent.trim();
+                            if (t && t.length > 1 && !texts.includes(t)) texts.push(t);
+                        }
                     }
                 }
             }
+            return texts;
         }
-        return texts;
-    }
 
-    // Click all Launcher buttons (interactive elements) and extract popup content
-    async function extractLaunchers(doc) {
-        let texts = [];
-        const launchers = doc.querySelectorAll('[data-ntx-type="Launcher"][role="button"]');
-        for (const launcher of launchers) {
-            const label = launcher.querySelector('.ntx-ck-editor-container')?.textContent.trim();
-            launcher.click();
-            await sleep(700);
-            // Find the close button which indicates a popup opened
-            const closeBtn = doc.querySelector('button[title="Close pop-up"]');
-            if (closeBtn) {
-                if (label) texts.push(`\n**${label}:**`);
-                // Extract text from the popup area (parent sections near close button)
-                const popupSection = closeBtn.closest('[data-ntx-type="Section"]')?.parentElement;
-                if (popupSection) {
-                    const pEls = popupSection.querySelectorAll('.ntx-ck-editor-container p, .ntx-ck-editor-container h4, .ntx-ck-editor-container li');
-                    for (const pe of pEls) {
-                        const pt = pe.textContent.trim();
-                        if (pt && pt.length > 2 && pt !== label && !texts.includes(pt)) texts.push(pt);
+        // Click all Launcher/interactive buttons and extract popup content
+        async function extractLaunchers() {
+            let texts = [];
+            const launchers = document.querySelectorAll('[data-ntx-type="Launcher"][role="button"]');
+            if (launchers.length === 0) return texts;
+
+            for (const launcher of launchers) {
+                // Get the label text of this launcher
+                const labelEl = launcher.querySelector('.ntx-ck-editor-container');
+                const label = labelEl ? labelEl.textContent.trim() : '';
+
+                // Click to open popup
+                launcher.click();
+                await sleep(800);
+
+                // Look for the close popup button (indicates popup is open)
+                const closeBtn = document.querySelector('button[title="Close pop-up"]');
+                if (closeBtn) {
+                    if (label) texts.push(`\n**${label}:**`);
+
+                    // Extract all text visible after popup opens
+                    // The popup content is typically in sections near the close button
+                    const popupParent = closeBtn.closest('[data-ntx-type="Row"]')?.parentElement ||
+                                       closeBtn.closest('[data-ntx-type="Section"]')?.parentElement ||
+                                       closeBtn.parentElement?.parentElement?.parentElement;
+
+                    if (popupParent) {
+                        const popupEls = popupParent.querySelectorAll('.ntx-ck-editor-container p, .ntx-ck-editor-container h4, .ntx-ck-editor-container h3, .ntx-ck-editor-container li');
+                        for (const pe of popupEls) {
+                            const pt = pe.textContent.trim();
+                            // Skip the label itself and short/empty text
+                            if (pt && pt.length > 2 && pt !== label && !texts.includes(pt)) {
+                                texts.push(pt);
+                            }
+                        }
+                    }
+
+                    // Also try: get all ntx-ck-editor text that appeared after click
+                    // by looking for content in the launcher's selected state area
+                    const selectedContent = document.querySelectorAll('[data-ntx-type="Launcher"][data-selected="true"] ~ [data-ntx-type="Section"] .ntx-ck-editor-container p');
+                    for (const sc of selectedContent) {
+                        const sct = sc.textContent.trim();
+                        if (sct && sct.length > 2 && sct !== label && !texts.includes(sct)) {
+                            texts.push(sct);
+                        }
+                    }
+
+                    // Close the popup
+                    closeBtn.click();
+                    await sleep(400);
+                } else {
+                    // Maybe the launcher shows content inline (selected state)
+                    await sleep(300);
+                    const inlineContent = launcher.parentElement?.querySelectorAll('.ntx-ck-editor-container p');
+                    if (inlineContent) {
+                        if (label) texts.push(`\n**${label}:**`);
+                        for (const ic of inlineContent) {
+                            const ict = ic.textContent.trim();
+                            if (ict && ict.length > 2 && ict !== label && !texts.includes(ict)) texts.push(ict);
+                        }
                     }
                 }
-                closeBtn.click();
+            }
+            return texts;
+        }
+
+        // Extract all visible text from current page
+        function extractVisibleText() {
+            const texts = [];
+            const seen = new Set();
+            const elements = document.querySelectorAll('.ntx-ck-editor-container h1, .ntx-ck-editor-container h2, .ntx-ck-editor-container h3, .ntx-ck-editor-container h4, .ntx-ck-editor-container p, .ntx-ck-editor-container li');
+
+            for (const el of elements) {
+                // Skip hidden carousel panels
+                if (el.closest('[role="tabpanel"][hidden]')) continue;
+                // Skip hidden elements
+                if (el.offsetParent === null && !el.closest('[data-ntx-type="Launcher"]')) continue;
+
+                let content = el.textContent.trim();
+                if (!content || content.length < 2) continue;
+                // Skip UI text
+                if (/^\d+\s*\/\s*\d+$/.test(content)) continue;
+                if (content === 'Go to content') continue;
+                if (content.includes('reached the end of the page')) continue;
+                if (content === 'Select the arrows to navigate through the content.') continue;
+
+                // Format by tag
+                const tag = el.tagName.toLowerCase();
+                if (tag === 'h1') content = `\n# ${content}\n`;
+                else if (tag === 'h2') content = `\n## ${content}\n`;
+                else if (tag === 'h3') content = `\n### ${content}\n`;
+                else if (tag === 'h4') content = `\n#### ${content}\n`;
+                else if (tag === 'li') content = `  - ${content}`;
+
+                if (!seen.has(content.trim())) {
+                    seen.add(content.trim());
+                    texts.push(content);
+                }
+            }
+
+            // Image alt text
+            const images = document.querySelectorAll('figure img[alt]');
+            for (const img of images) {
+                const alt = img.getAttribute('alt')?.trim();
+                if (alt && alt.length > 2 && !seen.has(alt)) {
+                    seen.add(alt);
+                    texts.push(`[Image: ${alt}]`);
+                }
+            }
+            return texts;
+        }
+
+        // Click "Next page" button
+        function clickNextPage() {
+            // Try multiple selectors for the next button
+            const selectors = [
+                'button[title="Next page"]',
+                'button[aria-label="Next page"]',
+                '[data-ntx-type="Button"][title="Next page"]',
+                'button .fa-angle-right'
+            ];
+            for (const sel of selectors) {
+                const btn = document.querySelector(sel);
+                if (btn) {
+                    const target = btn.closest('button') || btn;
+                    if (!target.disabled) { target.click(); return true; }
+                }
+            }
+            // Fallback: find button containing angle-right SVG that's for page nav (not carousel)
+            const allBtns = document.querySelectorAll('button[aria-label]');
+            for (const b of allBtns) {
+                if (b.getAttribute('aria-label')?.toLowerCase().includes('next page')) {
+                    b.click(); return true;
+                }
+            }
+            return false;
+        }
+
+        // --- Main: Extract ALL pages ---
+        async function extractAllPages() {
+            if (isRunning) return;
+            isRunning = true;
+            allText = [];
+            setStatus('Starting...', '#3498db');
+
+            const progress = getPageProgress();
+            const total = progress ? progress.total : '?';
+            let pageNum = progress ? progress.current : 1;
+
+            while (isRunning) {
+                setStatus(`Page ${pageNum}/${total} - scrolling...`, '#8e44ad');
+                await autoScroll();
                 await sleep(400);
+
+                setStatus(`Page ${pageNum}/${total} - text...`, '#8e44ad');
+                const pageText = extractVisibleText();
+
+                setStatus(`Page ${pageNum}/${total} - slides...`, '#8e44ad');
+                const carouselText = await extractCarousels();
+
+                setStatus(`Page ${pageNum}/${total} - popups...`, '#8e44ad');
+                const launcherText = await extractLaunchers();
+
+                // Combine all unique text for this page
+                const combined = [`\n=== Page ${pageNum} ===\n`];
+                const seen = new Set();
+                for (const arr of [pageText, carouselText, launcherText]) {
+                    for (const t of arr) {
+                        if (!seen.has(t.trim())) { seen.add(t.trim()); combined.push(t); }
+                    }
+                }
+                allText.push(...combined);
+
+                // Check if we reached the last page
+                const prog = getPageProgress();
+                if (prog && prog.current >= prog.total) break;
+
+                // Try next page
+                setStatus(`Page ${pageNum}/${total} - next...`, '#3498db');
+                const prevPage = prog ? prog.current : pageNum;
+                if (!clickNextPage()) {
+                    setStatus(`Page ${pageNum} - no next button found`, '#e67e22');
+                    break;
+                }
+
+                // Wait for page to change (content reload)
+                let changed = false;
+                for (let i = 0; i < 20; i++) {
+                    await sleep(500);
+                    const np = getPageProgress();
+                    if (np && np.current !== prevPage) { changed = true; break; }
+                    // Also check if h1 changed
+                    const h1 = document.querySelector('.ntx-ck-editor-container h1');
+                    if (h1 && i > 5) { changed = true; break; }
+                }
+                if (!changed) { setStatus(`Page ${pageNum} - stuck, stopping`, '#e67e22'); break; }
+
+                pageNum++;
+                await sleep(600);
             }
+
+            finishExtraction();
         }
-        return texts;
-    }
 
-    // Extract all visible text from current page
-    function extractVisibleText(doc) {
-        const texts = [];
-        const seen = new Set();
-        const elements = doc.querySelectorAll('.ntx-ck-editor-container h1, .ntx-ck-editor-container h2, .ntx-ck-editor-container h3, .ntx-ck-editor-container h4, .ntx-ck-editor-container p, .ntx-ck-editor-container li');
-        for (const el of elements) {
-            if (el.closest('[role="tabpanel"][hidden]')) continue;
-            let content = el.textContent.trim();
-            if (!content || content.length < 2) continue;
-            if (/^\d+\/\d+$/.test(content)) continue;
-            if (content === 'Go to content' || content.includes('reached the end of the page')) continue;
-            if (content === 'Select the arrows to navigate through the content.') continue;
-            const tag = el.tagName.toLowerCase();
-            if (tag === 'h1') content = `\n# ${content}\n`;
-            else if (tag === 'h2') content = `\n## ${content}\n`;
-            else if (tag === 'h3') content = `\n### ${content}\n`;
-            else if (tag === 'h4') content = `\n#### ${content}\n`;
-            else if (tag === 'li') content = `  - ${content}`;
-            if (!seen.has(content.trim())) { seen.add(content.trim()); texts.push(content); }
-        }
-        // Image alt text
-        const images = doc.querySelectorAll('figure img[alt]');
-        for (const img of images) {
-            const alt = img.getAttribute('alt')?.trim();
-            if (alt && alt.length > 2 && !seen.has(alt)) { seen.add(alt); texts.push(`[Image: ${alt}]`); }
-        }
-        return texts;
-    }
+        // --- Main: Extract current page only ---
+        async function extractCurrentPage() {
+            if (isRunning) return;
+            isRunning = true;
+            allText = [];
+            setStatus('Scrolling...', '#3498db');
 
-    // Click "Next page" in content doc
-    function clickNextPage(doc) {
-        const btn = doc.querySelector('button[title="Next page"]') || doc.querySelector('button[aria-label="Next page"]');
-        if (btn && !btn.disabled) { btn.click(); return true; }
-        return false;
-    }
-
-    // --- Main: Extract ALL pages ---
-    async function extractAllPages() {
-        if (isRunning) return;
-        isRunning = true;
-        allText = [];
-        setStatus('Starting...', '#3498db');
-
-        const doc = getContentDoc();
-        const progress = getPageProgress(doc);
-        const total = progress ? progress.total : '?';
-        let pageNum = progress ? progress.current : 1;
-
-        while (isRunning) {
-            setStatus(`Page ${pageNum}/${total} - scrolling...`, '#8e44ad');
-            await autoScroll(doc);
+            await autoScroll();
             await sleep(300);
 
-            setStatus(`Page ${pageNum}/${total} - extracting...`, '#8e44ad');
-            const pageText = extractVisibleText(doc);
+            setStatus('Extracting text...', '#8e44ad');
+            const pageText = extractVisibleText();
 
-            setStatus(`Page ${pageNum}/${total} - carousels...`, '#8e44ad');
-            const carouselText = await extractCarousels(doc);
+            setStatus('Checking slides...', '#8e44ad');
+            const carouselText = await extractCarousels();
 
-            setStatus(`Page ${pageNum}/${total} - interactive items...`, '#8e44ad');
-            const launcherText = await extractLaunchers(doc);
+            setStatus('Checking popups...', '#8e44ad');
+            const launcherText = await extractLaunchers();
 
-            // Combine all unique text
-            const combined = [`\n=== Page ${pageNum} ===\n`];
             const seen = new Set();
             for (const arr of [pageText, carouselText, launcherText]) {
-                for (const t of arr) { if (!seen.has(t.trim())) { seen.add(t.trim()); combined.push(t); } }
+                for (const t of arr) {
+                    if (!seen.has(t.trim())) { seen.add(t.trim()); allText.push(t); }
+                }
             }
-            allText.push(...combined);
 
-            // Check if last page
-            const prog = getPageProgress(doc);
-            if (prog && prog.current >= prog.total) break;
+            finishExtraction();
+        }
 
-            // Navigate to next page
-            setStatus(`Page ${pageNum}/${total} - next...`, '#3498db');
-            if (!clickNextPage(doc)) break;
-
-            // Wait for page change
-            let waited = 0;
-            const prevPage = prog ? prog.current : pageNum;
-            while (waited < 15) {
-                await sleep(500);
-                const np = getPageProgress(doc);
-                if (np && np.current !== prevPage) break;
-                waited++;
+        function finishExtraction() {
+            const finalText = allText.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+            if (finalText) {
+                try {
+                    if (typeof GM_setClipboard !== 'undefined') {
+                        GM_setClipboard(finalText, 'text');
+                    } else {
+                        navigator.clipboard.writeText(finalText);
+                    }
+                    setStatus(`\u2713 Copied! ${finalText.length} chars`, '#27ae60');
+                } catch (e) {
+                    setStatus('Extracted - check preview (clipboard failed)', '#e67e22');
+                }
+                showPreview(finalText);
+            } else {
+                setStatus('No text found on this page', '#e74c3c');
             }
-            pageNum++;
-            await sleep(500);
+            isRunning = false;
         }
 
-        finishExtraction();
-    }
-
-    // --- Main: Extract current page only ---
-    async function extractCurrentPage() {
-        if (isRunning) return;
-        isRunning = true;
-        allText = [];
-        setStatus('Extracting...', '#3498db');
-
-        const doc = getContentDoc();
-        await autoScroll(doc);
-
-        const pageText = extractVisibleText(doc);
-        const carouselText = await extractCarousels(doc);
-        const launcherText = await extractLaunchers(doc);
-
-        const seen = new Set();
-        for (const arr of [pageText, carouselText, launcherText]) {
-            for (const t of arr) { if (!seen.has(t.trim())) { seen.add(t.trim()); allText.push(t); } }
+        // --- UI ---
+        function setStatus(msg, color) {
+            const el = document.getElementById('pc-status');
+            if (el) { el.textContent = msg; el.style.color = color; }
         }
 
-        finishExtraction();
-    }
-
-    function finishExtraction() {
-        const finalText = allText.join('\n').replace(/\n{3,}/g, '\n\n').trim();
-        if (finalText) {
-            if (typeof GM_setClipboard !== 'undefined') { GM_setClipboard(finalText, 'text'); }
-            else { navigator.clipboard.writeText(finalText); }
-            setStatus(`\u2713 Copied! ${finalText.length} chars`, '#27ae60');
-            showPreview(finalText);
-        } else {
-            setStatus('No text found', '#e74c3c');
+        function showPreview(text) {
+            const p = document.getElementById('pc-preview');
+            if (p) {
+                p.textContent = text.substring(0, 5000) + (text.length > 5000 ? '\n\n... [full text in clipboard]' : '');
+                p.style.display = 'block';
+            }
         }
-        isRunning = false;
-    }
 
-    // --- UI ---
-    function setStatus(msg, color) {
-        const el = document.getElementById('pc-status');
-        if (el) { el.textContent = msg; el.style.color = color; }
-    }
-
-    function showPreview(text) {
-        const p = document.getElementById('pc-preview');
-        if (p) { p.textContent = text.substring(0, 3000) + (text.length > 3000 ? '\n\n... [full text in clipboard]' : ''); p.style.display = 'block'; }
-    }
-
-    // Build panel
-    const panel = document.createElement('div');
-    panel.id = 'pc-panel';
-    panel.style.cssText = 'position:fixed;top:80px;right:20px;z-index:999999;width:300px;background:#fff;border:2px solid #8e44ad;border-radius:10px;box-shadow:0 4px 20px rgba(0,0,0,.2);font:13px Segoe UI,sans-serif;overflow:hidden';
-    panel.innerHTML = `
-        <div id="pc-hdr" style="background:linear-gradient(135deg,#8e44ad,#9b59b6);color:#fff;padding:8px 12px;font:700 13px Segoe UI;cursor:move;user-select:none;display:flex;align-items:center">
-            <span>\uD83D\uDCCB Page Copier v1.1</span><span id="pc-col" style="margin-left:auto;cursor:pointer;font-size:15px">\u2212</span>
-        </div>
-        <div id="pc-body" style="padding:10px">
-            <div style="display:flex;gap:6px;margin-bottom:8px">
-                <button id="pc-all" style="flex:1;padding:8px;border:none;border-radius:6px;cursor:pointer;font:700 11px Segoe UI;background:#8e44ad;color:#fff">\uD83D\uDCDA All Pages</button>
-                <button id="pc-page" style="flex:1;padding:8px;border:none;border-radius:6px;cursor:pointer;font:700 11px Segoe UI;background:#3498db;color:#fff">\uD83D\uDCC4 This Page</button>
+        // Build panel
+        const panel = document.createElement('div');
+        panel.id = 'pc-panel';
+        panel.style.cssText = 'position:fixed;top:60px;right:10px;z-index:2147483647;width:280px;background:#fff;border:2px solid #8e44ad;border-radius:10px;box-shadow:0 4px 20px rgba(0,0,0,.25);font:13px Segoe UI,sans-serif;overflow:hidden';
+        panel.innerHTML = `
+            <div id="pc-hdr" style="background:linear-gradient(135deg,#8e44ad,#9b59b6);color:#fff;padding:8px 10px;font:700 12px Segoe UI;cursor:move;user-select:none;display:flex;align-items:center">
+                <span>\uD83D\uDCCB Page Copier v1.2</span><span id="pc-col" style="margin-left:auto;cursor:pointer;font-size:15px">\u2212</span>
             </div>
-            <button id="pc-stop" style="width:100%;padding:6px;border:none;border-radius:6px;cursor:pointer;font:600 10px Segoe UI;background:#e74c3c;color:#fff;margin-bottom:6px">\u25A0 Stop</button>
-            <div id="pc-status" style="padding:4px;border-radius:4px;font:600 10px Segoe UI;text-align:center;background:#f8f9fa;color:#7f8c8d">Ready</div>
-            <textarea id="pc-preview" style="display:none;width:100%;height:180px;margin-top:8px;padding:6px;box-sizing:border-box;border:1px solid #ddd;border-radius:6px;font:10px monospace;resize:vertical;color:#333" readonly></textarea>
-        </div>`;
-    document.body.appendChild(panel);
+            <div id="pc-body" style="padding:8px">
+                <div style="display:flex;gap:5px;margin-bottom:6px">
+                    <button id="pc-all" style="flex:1;padding:7px;border:none;border-radius:6px;cursor:pointer;font:700 11px Segoe UI;background:#8e44ad;color:#fff">\uD83D\uDCDA All Pages</button>
+                    <button id="pc-page" style="flex:1;padding:7px;border:none;border-radius:6px;cursor:pointer;font:700 11px Segoe UI;background:#3498db;color:#fff">\uD83D\uDCC4 This Page</button>
+                </div>
+                <button id="pc-stop" style="width:100%;padding:5px;border:none;border-radius:6px;cursor:pointer;font:600 10px Segoe UI;background:#e74c3c;color:#fff;margin-bottom:5px">\u25A0 Stop</button>
+                <div id="pc-status" style="padding:4px;border-radius:4px;font:600 10px Segoe UI;text-align:center;background:#f8f9fa;color:#7f8c8d">Ready</div>
+                <textarea id="pc-preview" style="display:none;width:100%;height:200px;margin-top:6px;padding:5px;box-sizing:border-box;border:1px solid #ddd;border-radius:6px;font:9px monospace;resize:vertical;color:#333" readonly></textarea>
+            </div>`;
+        document.body.appendChild(panel);
 
-    // Draggable
-    let dx, dy, dragging = false;
-    document.getElementById('pc-hdr').onmousedown = e => { e.preventDefault(); dx = e.clientX - panel.offsetLeft; dy = e.clientY - panel.offsetTop; dragging = true; };
-    document.addEventListener('mousemove', e => { if (dragging) { panel.style.left = (e.clientX - dx) + 'px'; panel.style.top = (e.clientY - dy) + 'px'; panel.style.right = 'auto'; } });
-    document.addEventListener('mouseup', () => { dragging = false; });
+        // Draggable
+        let dx, dy, dragging = false;
+        document.getElementById('pc-hdr').onmousedown = e => {
+            e.preventDefault();
+            dx = e.clientX - panel.offsetLeft;
+            dy = e.clientY - panel.offsetTop;
+            dragging = true;
+        };
+        document.addEventListener('mousemove', e => {
+            if (dragging) { panel.style.left = (e.clientX - dx) + 'px'; panel.style.top = (e.clientY - dy) + 'px'; panel.style.right = 'auto'; }
+        });
+        document.addEventListener('mouseup', () => { dragging = false; });
 
-    // Collapse
-    document.getElementById('pc-col').onclick = () => {
-        const b = document.getElementById('pc-body');
-        b.style.display = b.style.display === 'none' ? '' : 'none';
-        document.getElementById('pc-col').textContent = b.style.display === 'none' ? '+' : '\u2212';
-    };
+        // Collapse
+        document.getElementById('pc-col').onclick = () => {
+            const b = document.getElementById('pc-body');
+            b.style.display = b.style.display === 'none' ? '' : 'none';
+            document.getElementById('pc-col').textContent = b.style.display === 'none' ? '+' : '\u2212';
+        };
 
-    // Buttons
-    document.getElementById('pc-all').onclick = extractAllPages;
-    document.getElementById('pc-page').onclick = extractCurrentPage;
-    document.getElementById('pc-stop').onclick = () => { isRunning = false; setStatus('Stopped', '#e74c3c'); };
+        // Buttons
+        document.getElementById('pc-all').onclick = extractAllPages;
+        document.getElementById('pc-page').onclick = extractCurrentPage;
+        document.getElementById('pc-stop').onclick = () => { isRunning = false; setStatus('Stopped', '#e74c3c'); };
+    }
 })();
