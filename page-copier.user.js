@@ -81,66 +81,111 @@
             return null;
         }
 
-        // Click all carousel/composite slides - handles both dot navigation and arrow buttons
+        // Click all carousel/composite slides - goes both directions to catch everything
         async function extractCarousels() {
             let texts = [];
             const carousels = document.querySelectorAll('[data-ntx-type="Composite"]');
 
             for (const carousel of carousels) {
-                // Method 1: Click dots if available
-                const dots = carousel.querySelectorAll('button[role="tab"]');
-                if (dots.length > 1) {
-                    for (let i = 0; i < dots.length; i++) {
-                        dots[i].click();
-                        await sleep(600);
-                        extractFromVisiblePanels(carousel, texts);
-                    }
-                }
+                // Strategy: First go all the way LEFT (to first slide), then go all the way RIGHT
+                // This ensures we don't miss slides regardless of starting position
 
-                // Method 2: Click next arrow button repeatedly
-                const nextBtn = carousel.querySelector('button[aria-label*="Next"], button[aria-label*="next"], button[title*="Next"], .composite-arrow button .fa-angle-right')?.closest('button') ||
+                const prevBtn = carousel.querySelector('button[aria-label*="Previous"], button[aria-label*="previous"], button[title*="anterior"]')?.closest?.('button') ||
+                               carousel.querySelector('.composite-arrow-0 button') ||
+                               carousel.querySelector('button .fa-angle-left')?.closest('button');
+
+                const nextBtn = carousel.querySelector('button[aria-label*="Next"], button[aria-label*="next"], button[title*="siguiente"]')?.closest?.('button') ||
                                carousel.querySelector('.composite-arrow-1 button') ||
                                carousel.querySelector('button .fa-angle-right')?.closest('button');
 
-                if (nextBtn) {
-                    // First extract current slide
-                    extractFromVisiblePanels(carousel, texts);
-                    // Click next until disabled or content stops changing
-                    let prevText = '';
-                    let clickCount = 0;
-                    const maxClicks = 20; // Safety limit
-                    while (clickCount < maxClicks) {
-                        if (nextBtn.disabled || nextBtn.getAttribute('aria-disabled') === 'true') break;
-                        nextBtn.click();
-                        await sleep(600);
-                        const currentText = carousel.querySelector('[role="tabpanel"]:not([hidden])')?.textContent?.trim() || '';
-                        if (currentText === prevText) break; // No new content
-                        prevText = currentText;
-                        extractFromVisiblePanels(carousel, texts);
-                        clickCount++;
+                // Step 1: Go all the way to the first slide (click prev until stuck)
+                if (prevBtn) {
+                    let safety = 0;
+                    while (safety < 20) {
+                        if (prevBtn.disabled || prevBtn.getAttribute('aria-disabled') === 'true') break;
+                        const before = carousel.querySelector('[role="tabpanel"]:not([hidden])')?.id || '';
+                        prevBtn.click();
+                        await sleep(400);
+                        const after = carousel.querySelector('[role="tabpanel"]:not([hidden])')?.id || '';
+                        if (before === after) break; // Didn't change - we're at the start
+                        safety++;
                     }
+                    await sleep(300);
+                }
+
+                // Step 2: Also click first dot if dots exist
+                const dots = carousel.querySelectorAll('button[role="tab"]');
+                if (dots.length > 1) {
+                    dots[0].click();
+                    await sleep(400);
+                }
+
+                // Step 3: Now extract current slide and go RIGHT through all slides
+                let visitedIds = new Set();
+                let safety = 0;
+                while (safety < 30) {
+                    // Extract from current visible panel
+                    const visiblePanel = carousel.querySelector('[role="tabpanel"]:not([hidden])');
+                    if (visiblePanel) {
+                        const panelId = visiblePanel.id || safety.toString();
+                        if (visitedIds.has(panelId)) break; // Already seen this slide
+                        visitedIds.add(panelId);
+
+                        const els = visiblePanel.querySelectorAll('.ntx-ck-editor-container p, .ntx-ck-editor-container h1, .ntx-ck-editor-container h2, .ntx-ck-editor-container h3, .ntx-ck-editor-container h4, .ntx-ck-editor-container li');
+                        for (const e of els) {
+                            const t = e.textContent.trim();
+                            if (t && t.length > 1 && !texts.includes(t)) texts.push(t);
+                        }
+
+                        // Check for launchers/tiles INSIDE this carousel slide
+                        const slideLaunchers = visiblePanel.querySelectorAll('[data-ntx-type="Launcher"][role="button"]');
+                        for (const sl of slideLaunchers) {
+                            const slLabel = sl.querySelector('.ntx-ck-editor-container')?.textContent.trim() || '';
+                            sl.click();
+                            await sleep(700);
+                            const closeBtn = document.querySelector('button[title="Close pop-up"]');
+                            if (closeBtn) {
+                                if (slLabel) texts.push(`\n**${slLabel}:**`);
+                                const popupArea = closeBtn.closest('[data-ntx-type="Row"]')?.parentElement ||
+                                                 closeBtn.closest('[data-ntx-type="Section"]')?.parentElement;
+                                if (popupArea) {
+                                    const popEls = popupArea.querySelectorAll('.ntx-ck-editor-container p, .ntx-ck-editor-container h4, .ntx-ck-editor-container li');
+                                    for (const pe of popEls) {
+                                        const pt = pe.textContent.trim();
+                                        if (pt && pt.length > 2 && pt !== slLabel && !texts.includes(pt)) texts.push(pt);
+                                    }
+                                }
+                                closeBtn.click();
+                                await sleep(400);
+                            }
+                        }
+                    }
+
+                    // Try to go to next slide
+                    if (dots.length > 1) {
+                        // Use dots - click next unvisited dot
+                        const currentIdx = Array.from(dots).findIndex(d => d.getAttribute('aria-selected') === 'true' || d.getAttribute('data-selected') === 'true');
+                        if (currentIdx < dots.length - 1) {
+                            dots[currentIdx + 1].click();
+                            await sleep(500);
+                        } else {
+                            break; // Last dot reached
+                        }
+                    } else if (nextBtn) {
+                        // Use arrow button
+                        if (nextBtn.disabled || nextBtn.getAttribute('aria-disabled') === 'true') break;
+                        const beforeId = carousel.querySelector('[role="tabpanel"]:not([hidden])')?.id || '';
+                        nextBtn.click();
+                        await sleep(500);
+                        const afterId = carousel.querySelector('[role="tabpanel"]:not([hidden])')?.id || '';
+                        if (beforeId === afterId) break; // Didn't change
+                    } else {
+                        break; // No navigation available
+                    }
+                    safety++;
                 }
             }
             return texts;
-        }
-
-        // Helper: extract text from visible carousel panels
-        function extractFromVisiblePanels(carousel, texts) {
-            const panels = carousel.querySelectorAll('[role="tabpanel"]');
-            for (const p of panels) {
-                if (p.hidden || p.getAttribute('hidden') !== null) continue;
-                const els = p.querySelectorAll('.ntx-ck-editor-container p, .ntx-ck-editor-container h1, .ntx-ck-editor-container h2, .ntx-ck-editor-container h3, .ntx-ck-editor-container h4, .ntx-ck-editor-container li');
-                for (const e of els) {
-                    const t = e.textContent.trim();
-                    if (t && t.length > 1 && !texts.includes(t)) texts.push(t);
-                }
-            }
-            // Also check for content outside tabpanels but inside the composite (some layouts)
-            const directContent = carousel.querySelectorAll('[data-child-wrapper] > .ntx-ck-editor-container p, [data-composite-item] .ntx-ck-editor-container p');
-            for (const dc of directContent) {
-                const t = dc.textContent.trim();
-                if (t && t.length > 1 && !texts.includes(t)) texts.push(t);
-            }
         }
 
         // Click all Launcher/interactive buttons and extract popup content
