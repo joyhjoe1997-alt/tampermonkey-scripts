@@ -1,11 +1,12 @@
 // ==UserScript==
 // @name         Page Copier - Learning Portal Text Extractor
 // @author       joyhjoe
-// @version      1.2
+// @version      1.3
 // @description  Auto-navigates pages, clicks interactive elements, extracts all text to clipboard
 // @match        *://myquriosity-learnerportal.learningcloud.me/*
 // @match        *://*.learningcloud.me/*
 // @match        *://cdncms.learningcloud.me/*
+// @match        *://*/*
 // @icon         https://cdn-icons-png.flaticon.com/512/1621/1621635.png
 // @run-at       document-idle
 // @grant        GM_setClipboard
@@ -80,29 +81,66 @@
             return null;
         }
 
-        // Click all carousel/composite dots and extract from each slide
+        // Click all carousel/composite slides - handles both dot navigation and arrow buttons
         async function extractCarousels() {
             let texts = [];
             const carousels = document.querySelectorAll('[data-ntx-type="Composite"]');
+
             for (const carousel of carousels) {
+                // Method 1: Click dots if available
                 const dots = carousel.querySelectorAll('button[role="tab"]');
-                if (dots.length <= 1) continue;
-                for (let i = 0; i < dots.length; i++) {
-                    dots[i].click();
-                    await sleep(600);
-                    // Get the currently visible panel
-                    const panels = carousel.querySelectorAll('[role="tabpanel"]');
-                    for (const p of panels) {
-                        if (p.hidden) continue;
-                        const els = p.querySelectorAll('.ntx-ck-editor-container p, .ntx-ck-editor-container h1, .ntx-ck-editor-container h2, .ntx-ck-editor-container h3, .ntx-ck-editor-container h4, .ntx-ck-editor-container li');
-                        for (const e of els) {
-                            const t = e.textContent.trim();
-                            if (t && t.length > 1 && !texts.includes(t)) texts.push(t);
-                        }
+                if (dots.length > 1) {
+                    for (let i = 0; i < dots.length; i++) {
+                        dots[i].click();
+                        await sleep(600);
+                        extractFromVisiblePanels(carousel, texts);
+                    }
+                }
+
+                // Method 2: Click next arrow button repeatedly
+                const nextBtn = carousel.querySelector('button[aria-label*="Next"], button[aria-label*="next"], button[title*="Next"], .composite-arrow button .fa-angle-right')?.closest('button') ||
+                               carousel.querySelector('.composite-arrow-1 button') ||
+                               carousel.querySelector('button .fa-angle-right')?.closest('button');
+
+                if (nextBtn) {
+                    // First extract current slide
+                    extractFromVisiblePanels(carousel, texts);
+                    // Click next until disabled or content stops changing
+                    let prevText = '';
+                    let clickCount = 0;
+                    const maxClicks = 20; // Safety limit
+                    while (clickCount < maxClicks) {
+                        if (nextBtn.disabled || nextBtn.getAttribute('aria-disabled') === 'true') break;
+                        nextBtn.click();
+                        await sleep(600);
+                        const currentText = carousel.querySelector('[role="tabpanel"]:not([hidden])')?.textContent?.trim() || '';
+                        if (currentText === prevText) break; // No new content
+                        prevText = currentText;
+                        extractFromVisiblePanels(carousel, texts);
+                        clickCount++;
                     }
                 }
             }
             return texts;
+        }
+
+        // Helper: extract text from visible carousel panels
+        function extractFromVisiblePanels(carousel, texts) {
+            const panels = carousel.querySelectorAll('[role="tabpanel"]');
+            for (const p of panels) {
+                if (p.hidden || p.getAttribute('hidden') !== null) continue;
+                const els = p.querySelectorAll('.ntx-ck-editor-container p, .ntx-ck-editor-container h1, .ntx-ck-editor-container h2, .ntx-ck-editor-container h3, .ntx-ck-editor-container h4, .ntx-ck-editor-container li');
+                for (const e of els) {
+                    const t = e.textContent.trim();
+                    if (t && t.length > 1 && !texts.includes(t)) texts.push(t);
+                }
+            }
+            // Also check for content outside tabpanels but inside the composite (some layouts)
+            const directContent = carousel.querySelectorAll('[data-child-wrapper] > .ntx-ck-editor-container p, [data-composite-item] .ntx-ck-editor-container p');
+            for (const dc of directContent) {
+                const t = dc.textContent.trim();
+                if (t && t.length > 1 && !texts.includes(t)) texts.push(t);
+            }
         }
 
         // Click all Launcher/interactive buttons and extract popup content
@@ -378,7 +416,7 @@
         panel.style.cssText = 'position:fixed;top:60px;right:10px;z-index:2147483647;width:280px;background:#fff;border:2px solid #8e44ad;border-radius:10px;box-shadow:0 4px 20px rgba(0,0,0,.25);font:13px Segoe UI,sans-serif;overflow:hidden';
         panel.innerHTML = `
             <div id="pc-hdr" style="background:linear-gradient(135deg,#8e44ad,#9b59b6);color:#fff;padding:8px 10px;font:700 12px Segoe UI;cursor:move;user-select:none;display:flex;align-items:center">
-                <span>\uD83D\uDCCB Page Copier v1.2</span><span id="pc-col" style="margin-left:auto;cursor:pointer;font-size:15px">\u2212</span>
+                <span>\uD83D\uDCCB Page Copier v1.3</span><span id="pc-col" style="margin-left:auto;cursor:pointer;font-size:15px">\u2212</span>
             </div>
             <div id="pc-body" style="padding:8px">
                 <div style="display:flex;gap:5px;margin-bottom:6px">
