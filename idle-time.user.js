@@ -2,7 +2,7 @@
 // @name        Idle Time (FS,LM) - amazon.com
 // @namespace   Violentmonkey Scripts
 // @match       https://fclm-portal.amazon.com/reports/functionRollup*
-// @version     7.0
+// @version     7.1
 // @grant       GM_xmlhttpRequest
 // @author      mmarcelp
 // @author      koosting
@@ -878,11 +878,62 @@ function getTime(row, href, table) {
     });
 }
 
+// --- Night Shift Quick-Fill Button ---
+function createNightShiftButton() {
+    const btn = document.createElement('button');
+    btn.textContent = '\uD83C\uDF19 Night Shift (18:15 \u2192 04:45)';
+    btn.style.cssText = 'position:fixed;top:20px;right:240px;background:#1a1a2e;color:#fff;border:none;border-radius:5px;padding:10px 16px;cursor:pointer;z-index:1000;font:bold 13px Segoe UI,sans-serif;box-shadow:0 2px 8px rgba(0,0,0,.3)';
+    btn.onclick = function() {
+        const now = new Date();
+        const hour = now.getHours();
+        let startDate, endDate;
+
+        // If 18:00-23:59 → today to tomorrow
+        // If 00:00-04:59 → yesterday to today
+        // Otherwise default to today to tomorrow
+        if (hour >= 18) {
+            startDate = new Date(now);
+            endDate = new Date(now);
+            endDate.setDate(endDate.getDate() + 1);
+        } else if (hour < 5) {
+            startDate = new Date(now);
+            startDate.setDate(startDate.getDate() - 1);
+            endDate = new Date(now);
+        } else {
+            startDate = new Date(now);
+            endDate = new Date(now);
+            endDate.setDate(endDate.getDate() + 1);
+        }
+
+        const fmt = d => d.getFullYear() + '/' + String(d.getMonth()+1).padStart(2,'0') + '/' + String(d.getDate()).padStart(2,'0');
+
+        // Select Intraday radio
+        const intradayRadio = document.querySelector('input[name="spanType"][value="Intraday"]');
+        if (intradayRadio) { intradayRadio.checked = true; intradayRadio.click(); }
+
+        // Start: 18:15
+        document.getElementById('startDateIntraday').value = fmt(startDate);
+        document.getElementById('startHourIntraday').value = '18';
+        document.getElementById('startMinuteIntraday').value = '15';
+
+        // End: 04:45
+        document.getElementById('endDateIntraday').value = fmt(endDate);
+        document.getElementById('endHourIntraday').value = '4';
+        document.getElementById('endMinuteIntraday').value = '45';
+
+        btn.textContent = '\u2713 Set! (' + fmt(startDate) + ' \u2192 ' + fmt(endDate) + ')';
+        btn.style.background = '#27ae60';
+        setTimeout(function() { btn.textContent = '\uD83C\uDF19 Night Shift (18:15 \u2192 04:45)'; btn.style.background = '#1a1a2e'; }, 3000);
+    };
+    document.body.appendChild(btn);
+}
+
 // Initialize
 function initialize() {
     try {
         employeeMisses.clear();
         processedLogins.clear();
+        createNightShiftButton();
         createTransferSummaryButton();
         addColumnHeaders();
 
