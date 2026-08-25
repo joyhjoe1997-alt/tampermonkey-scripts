@@ -2,7 +2,8 @@
 // @name        Idle Time (FS,LM) - amazon.com
 // @namespace   Violentmonkey Scripts
 // @match       https://fclm-portal.amazon.com/reports/functionRollup*
-// @version     7.1
+// @match       https://fclm-portal.amazon.com/employee/timeDetails*
+// @version     7.2
 // @grant       GM_xmlhttpRequest
 // @author      mmarcelp
 // @author      koosting
@@ -912,14 +913,20 @@ function createNightShiftButton() {
         if (intradayRadio) { intradayRadio.checked = true; intradayRadio.click(); }
 
         // Start: 18:15
-        document.getElementById('startDateIntraday').value = fmt(startDate);
-        document.getElementById('startHourIntraday').value = '18';
-        document.getElementById('startMinuteIntraday').value = '15';
+        const sd = document.getElementById('startDateIntraday');
+        if (sd) sd.value = fmt(startDate);
+        const sh = document.getElementById('startHourIntraday');
+        if (sh) sh.value = '18';
+        const sm = document.getElementById('startMinuteIntraday');
+        if (sm) sm.value = '15';
 
         // End: 04:45
-        document.getElementById('endDateIntraday').value = fmt(endDate);
-        document.getElementById('endHourIntraday').value = '4';
-        document.getElementById('endMinuteIntraday').value = '45';
+        const ed = document.getElementById('endDateIntraday');
+        if (ed) ed.value = fmt(endDate);
+        const eh = document.getElementById('endHourIntraday');
+        if (eh) eh.value = '4';
+        const em2 = document.getElementById('endMinuteIntraday');
+        if (em2) em2.value = '45';
 
         btn.textContent = '\u2713 Set! (' + fmt(startDate) + ' \u2192 ' + fmt(endDate) + ')';
         btn.style.background = '#27ae60';
@@ -931,9 +938,14 @@ function createNightShiftButton() {
 // Initialize
 function initialize() {
     try {
+        // Night Shift button shows on ALL matched pages
+        createNightShiftButton();
+
+        // Table processing only on functionRollup page
+        if (!location.pathname.includes('/reports/functionRollup')) return;
+
         employeeMisses.clear();
         processedLogins.clear();
-        createNightShiftButton();
         createTransferSummaryButton();
         addColumnHeaders();
 
