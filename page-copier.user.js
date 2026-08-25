@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Page Copier - Learning Portal Text Extractor
 // @author       joyhjoe
-// @version      1.3
+// @version      1.4
 // @description  Auto-navigates pages, clicks interactive elements, extracts all text to clipboard
 // @match        *://myquriosity-learnerportal.learningcloud.me/*
 // @match        *://*.learningcloud.me/*
@@ -19,14 +19,17 @@
     // We run ONLY where actual course content exists (inside the content iframe)
     // Detection: look for ntx-author root or pageContent class
     let initAttempts = 0;
-    const maxAttempts = 20;
+    const maxAttempts = 40;
 
     function tryInit() {
         initAttempts++;
         const hasContent = document.querySelector('.ntx-ck-editor-container') ||
                           document.querySelector('[data-ntx-type="PageContent"]') ||
                           document.querySelector('#root.ntx-author') ||
-                          document.querySelector('.pageContent');
+                          document.querySelector('.pageContent') ||
+                          document.querySelector('[data-ntx-type="Composite"]') ||
+                          document.querySelector('[data-ntx-type="Launcher"]') ||
+                          (location.hostname.includes('cdncms') && document.querySelector('[data-ntx-type]'));
 
         if (hasContent) {
             // Don't create duplicate panels
@@ -285,6 +288,39 @@
                     }
                 }
             }
+
+            // Also click buttons with fa-check icons (checklist/accordion items)
+            const checkBtns = document.querySelectorAll('button .fa-check, button .fa-circle-check');
+            const clickedCheckBtns = new Set();
+            for (const icon of checkBtns) {
+                const btn = icon.closest('button');
+                if (!btn || clickedCheckBtns.has(btn)) continue;
+                // Skip navigation and close buttons
+                if (btn.getAttribute('title')?.includes('Close') || btn.getAttribute('title')?.includes('Next') || btn.getAttribute('title')?.includes('Previous')) continue;
+                if (btn.closest('[data-ntx-type="Composite"] .composite-arrow')) continue;
+                clickedCheckBtns.add(btn);
+
+                const label = btn.querySelector('.ntx-ck-editor-container')?.textContent.trim() || btn.textContent.trim() || '';
+                btn.click();
+                await sleep(700);
+
+                const closeBtn = document.querySelector('button[title="Close pop-up"]');
+                if (closeBtn) {
+                    if (label && label.length > 1) texts.push(`\n**${label}:**`);
+                    const popupArea = closeBtn.closest('[data-ntx-type="Row"]')?.parentElement ||
+                                     closeBtn.closest('[data-ntx-type="Section"]')?.parentElement;
+                    if (popupArea) {
+                        const popEls = popupArea.querySelectorAll('.ntx-ck-editor-container p, .ntx-ck-editor-container h4, .ntx-ck-editor-container li');
+                        for (const pe of popEls) {
+                            const pt = pe.textContent.trim();
+                            if (pt && pt.length > 2 && pt !== label && !texts.includes(pt)) texts.push(pt);
+                        }
+                    }
+                    closeBtn.click();
+                    await sleep(400);
+                }
+            }
+
             return texts;
         }
 
@@ -495,7 +531,7 @@
         panel.style.cssText = 'position:fixed;top:60px;right:10px;z-index:2147483647;width:280px;background:#fff;border:2px solid #8e44ad;border-radius:10px;box-shadow:0 4px 20px rgba(0,0,0,.25);font:13px Segoe UI,sans-serif;overflow:hidden';
         panel.innerHTML = `
             <div id="pc-hdr" style="background:linear-gradient(135deg,#8e44ad,#9b59b6);color:#fff;padding:8px 10px;font:700 12px Segoe UI;cursor:move;user-select:none;display:flex;align-items:center">
-                <span>\uD83D\uDCCB Page Copier v1.3</span><span id="pc-col" style="margin-left:auto;cursor:pointer;font-size:15px">\u2212</span>
+                <span>\uD83D\uDCCB Page Copier v1.4</span><span id="pc-col" style="margin-left:auto;cursor:pointer;font-size:15px">\u2212</span>
             </div>
             <div id="pc-body" style="padding:8px">
                 <div style="display:flex;gap:5px;margin-bottom:6px">
