@@ -113,76 +113,110 @@
                     await sleep(300);
                 }
 
-                // Step 2: Also click first dot if dots exist
+                // Step 2: Click first tab/dot to start from beginning
                 const dots = carousel.querySelectorAll('button[role="tab"]');
                 if (dots.length > 1) {
+                    // Click first tab to ensure we start from the beginning
                     dots[0].click();
-                    await sleep(400);
+                    await sleep(500);
                 }
 
-                // Step 3: Now extract current slide and go RIGHT through all slides
-                let visitedIds = new Set();
-                let safety = 0;
-                while (safety < 30) {
-                    // Extract from current visible panel
-                    const visiblePanel = carousel.querySelector('[role="tabpanel"]:not([hidden])');
-                    if (visiblePanel) {
-                        const panelId = visiblePanel.id || safety.toString();
-                        if (visitedIds.has(panelId)) break; // Already seen this slide
-                        visitedIds.add(panelId);
+                // Step 3: Extract from ALL tabs/slides by clicking each one sequentially
+                if (dots.length > 1) {
+                    for (let i = 0; i < dots.length; i++) {
+                        dots[i].click();
+                        await sleep(600);
 
-                        const els = visiblePanel.querySelectorAll('.ntx-ck-editor-container p, .ntx-ck-editor-container h1, .ntx-ck-editor-container h2, .ntx-ck-editor-container h3, .ntx-ck-editor-container h4, .ntx-ck-editor-container li');
-                        for (const e of els) {
-                            const t = e.textContent.trim();
-                            if (t && t.length > 1 && !texts.includes(t)) texts.push(t);
+                        // Get tab label for context
+                        const tabLabel = dots[i].querySelector('.ntx-ck-editor-container')?.textContent.trim() ||
+                                        dots[i].textContent.trim() || '';
+                        if (tabLabel && tabLabel.length > 1 && !texts.includes(`\n**[${tabLabel}]**`)) {
+                            texts.push(`\n**[${tabLabel}]**`);
                         }
 
-                        // Check for launchers/tiles INSIDE this carousel slide
-                        const slideLaunchers = visiblePanel.querySelectorAll('[data-ntx-type="Launcher"][role="button"]');
-                        for (const sl of slideLaunchers) {
-                            const slLabel = sl.querySelector('.ntx-ck-editor-container')?.textContent.trim() || '';
-                            sl.click();
-                            await sleep(700);
-                            const closeBtn = document.querySelector('button[title="Close pop-up"]');
-                            if (closeBtn) {
-                                if (slLabel) texts.push(`\n**${slLabel}:**`);
-                                const popupArea = closeBtn.closest('[data-ntx-type="Row"]')?.parentElement ||
-                                                 closeBtn.closest('[data-ntx-type="Section"]')?.parentElement;
-                                if (popupArea) {
-                                    const popEls = popupArea.querySelectorAll('.ntx-ck-editor-container p, .ntx-ck-editor-container h4, .ntx-ck-editor-container li');
-                                    for (const pe of popEls) {
-                                        const pt = pe.textContent.trim();
-                                        if (pt && pt.length > 2 && pt !== slLabel && !texts.includes(pt)) texts.push(pt);
+                        // Extract from visible panel
+                        const visiblePanel = carousel.querySelector('[role="tabpanel"]:not([hidden])') ||
+                                           carousel.querySelector('[data-composite-item]:not([hidden])');
+                        if (visiblePanel) {
+                            const els = visiblePanel.querySelectorAll('.ntx-ck-editor-container p, .ntx-ck-editor-container h1, .ntx-ck-editor-container h2, .ntx-ck-editor-container h3, .ntx-ck-editor-container h4, .ntx-ck-editor-container li');
+                            for (const e of els) {
+                                const t = e.textContent.trim();
+                                if (t && t.length > 1 && !texts.includes(t)) texts.push(t);
+                            }
+
+                            // Check for launchers/tiles INSIDE this tab
+                            const slideLaunchers = visiblePanel.querySelectorAll('[data-ntx-type="Launcher"][role="button"]');
+                            for (const sl of slideLaunchers) {
+                                const slLabel = sl.querySelector('.ntx-ck-editor-container')?.textContent.trim() || '';
+                                sl.click();
+                                await sleep(700);
+                                const closeBtn = document.querySelector('button[title="Close pop-up"]');
+                                if (closeBtn) {
+                                    if (slLabel) texts.push(`\n**${slLabel}:**`);
+                                    const popupArea = closeBtn.closest('[data-ntx-type="Row"]')?.parentElement ||
+                                                     closeBtn.closest('[data-ntx-type="Section"]')?.parentElement;
+                                    if (popupArea) {
+                                        const popEls = popupArea.querySelectorAll('.ntx-ck-editor-container p, .ntx-ck-editor-container h4, .ntx-ck-editor-container li');
+                                        for (const pe of popEls) {
+                                            const pt = pe.textContent.trim();
+                                            if (pt && pt.length > 2 && pt !== slLabel && !texts.includes(pt)) texts.push(pt);
+                                        }
                                     }
+                                    closeBtn.click();
+                                    await sleep(400);
                                 }
-                                closeBtn.click();
-                                await sleep(400);
                             }
                         }
                     }
+                } else if (nextBtn) {
+                    // No tabs/dots - use arrow navigation
+                    let visitedIds = new Set();
+                    let safety = 0;
+                    while (safety < 30) {
+                        const visiblePanel = carousel.querySelector('[role="tabpanel"]:not([hidden])');
+                        if (visiblePanel) {
+                            const panelId = visiblePanel.id || safety.toString();
+                            if (visitedIds.has(panelId)) break;
+                            visitedIds.add(panelId);
 
-                    // Try to go to next slide
-                    if (dots.length > 1) {
-                        // Use dots - click next unvisited dot
-                        const currentIdx = Array.from(dots).findIndex(d => d.getAttribute('aria-selected') === 'true' || d.getAttribute('data-selected') === 'true');
-                        if (currentIdx < dots.length - 1) {
-                            dots[currentIdx + 1].click();
-                            await sleep(500);
-                        } else {
-                            break; // Last dot reached
+                            const els = visiblePanel.querySelectorAll('.ntx-ck-editor-container p, .ntx-ck-editor-container h1, .ntx-ck-editor-container h2, .ntx-ck-editor-container h3, .ntx-ck-editor-container h4, .ntx-ck-editor-container li');
+                            for (const e of els) {
+                                const t = e.textContent.trim();
+                                if (t && t.length > 1 && !texts.includes(t)) texts.push(t);
+                            }
+
+                            // Check for launchers inside slide
+                            const slideLaunchers = visiblePanel.querySelectorAll('[data-ntx-type="Launcher"][role="button"]');
+                            for (const sl of slideLaunchers) {
+                                const slLabel = sl.querySelector('.ntx-ck-editor-container')?.textContent.trim() || '';
+                                sl.click();
+                                await sleep(700);
+                                const closeBtn = document.querySelector('button[title="Close pop-up"]');
+                                if (closeBtn) {
+                                    if (slLabel) texts.push(`\n**${slLabel}:**`);
+                                    const popupArea = closeBtn.closest('[data-ntx-type="Row"]')?.parentElement ||
+                                                     closeBtn.closest('[data-ntx-type="Section"]')?.parentElement;
+                                    if (popupArea) {
+                                        const popEls = popupArea.querySelectorAll('.ntx-ck-editor-container p, .ntx-ck-editor-container h4, .ntx-ck-editor-container li');
+                                        for (const pe of popEls) {
+                                            const pt = pe.textContent.trim();
+                                            if (pt && pt.length > 2 && pt !== slLabel && !texts.includes(pt)) texts.push(pt);
+                                        }
+                                    }
+                                    closeBtn.click();
+                                    await sleep(400);
+                                }
+                            }
                         }
-                    } else if (nextBtn) {
-                        // Use arrow button
+
                         if (nextBtn.disabled || nextBtn.getAttribute('aria-disabled') === 'true') break;
                         const beforeId = carousel.querySelector('[role="tabpanel"]:not([hidden])')?.id || '';
                         nextBtn.click();
                         await sleep(500);
                         const afterId = carousel.querySelector('[role="tabpanel"]:not([hidden])')?.id || '';
-                        if (beforeId === afterId) break; // Didn't change
-                    } else {
-                        break; // No navigation available
+                        if (beforeId === afterId) break;
+                        safety++;
                     }
-                    safety++;
                 }
             }
             return texts;
