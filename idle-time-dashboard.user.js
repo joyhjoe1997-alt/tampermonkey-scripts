@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Idle Time Dashboard
 // @namespace    http://tampermonkey.net/
-// @version      1.0
-// @description  Standalone idle time dashboard for FCLM portal — tracks AA idle time, break misuse, bottom 8% JPH, top 8% break offenders with timestamps
+// @version      1.1
+// @description  Standalone idle time dashboard for FCLM portal — tracks AA idle time, break misuse, missed fast start / strong finish, with login + station enrichment
 // @author       joyhjoe
 // @match        https://fclm-portal-dub.dub.proxy.amazon.com/*
 // @match        https://fclm-portal.amazon.com/*
@@ -14,6 +14,11 @@
 // @grant        GM_setValue
 // @connect      fclm-portal-dub.dub.proxy.amazon.com
 // @connect      fclm-portal.amazon.com
+// @connect      adapt-iad.amazon.com
+// @connect      roboscout.amazon.com
+// @connect      staffingcommandcenter-na.aka.amazon.com
+// @connect      staffingcommandcenter-eu.aka.amazon.com
+// @connect      inbound-flow-svc-iad-prod.amazon.com
 // ==/UserScript==
 
 (function () {
@@ -23,8 +28,15 @@
     // SECTION 1: CONFIGURATION & DEFAULTS
     // ═══════════════════════════════════════════════════════════════
 
-    const VERSION = '1.0';
+    const VERSION = '1.1';
     const BASE_URL = location.origin; // Auto-detect: works on both fclm-portal.amazon.com and fclm-portal-dub.dub.proxy.amazon.com
+
+    // ── Enrichment config (login + station lookup, ported from Track4) ──
+    const ENRICH_LOGIN_CACHE_KEY = 'IdleDash_LoginCache_v1';
+    const ENRICH_STATION_CACHE_KEY = 'IdleDash_StationCache_v1';
+    const ENRICH_LOGIN_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+    const ENRICH_STATION_TTL_MS = 5 * 60 * 1000;         // 5 minutes
+    const ENRICH_SCC_REGIONS = ['na', 'eu'];
 
     const DEFAULT_SETTINGS = {
         shiftStart: '18:15',
@@ -209,6 +221,293 @@
     }
 
     // ═══════════════════════════════════════════════════════════════
+    // SECTION 3B: LOGIN + STATION ENRICHMENT (ported from Track4)
+    //   Provides login (adapt-iad) and station/Location (SCC + RoboScout
+    //   + IFC) lookups. Results are cached via GM storage.
+    // ═══════════════════════════════════════════════════════════════
+
+    function enrichReadJson(key, fallback) {
+        try {
+            const raw = GM_getValue(key, null);
+            if (raw == null) return fallback;
+            return typeof raw === 'string' ? JSON.parse(raw) : raw;
+        } catch (e) {
+            return fallback;
+        }
+    }
+
+    function enrichWriteJson(key, value) {
+        try {
+            GM_setValue(key, JSON.stringify(value));
+        } catch (e) {
+            try { GM_setValue(key, value); } catch (_) {}
+        }
+    }
+
+    function enrichChunk(arr, size) {
+        const out = [];
+        for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+        return out;
+    }
+
+    function enrichUniq(values) {
+        return Array.from(new Set((values || []).map(v => String(v || '').trim()).filter(Boolean)));
+    }
+
+    function enrichGmRequest(method, url, { data = null, headers = {}, timeout = 30000, responseType = 'text' } = {}) {
+        return new Promise((resolve, reject) => {
+            GM_xmlhttpRequest({
+                method,
+                url,
+                data,
+                headers,
+                timeout,
+                responseType,
+                onload: (response) => {
+                    if (response.status >= 200 && response.status < 300) {
+                        resolve(response);
+                    } else {
+                        reject(new Error(`HTTP ${response.status} for ${url}`));
+                    }
+                },
+                onerror: (err) => reject(new Error(`Network error for ${url}: ${err && err.error ? err.error : 'request failed'}`)),
+                ontimeout: () => reject(new Error(`Timeout for ${url}`))
+            });
+        });
+    }
+
+    async function enrichGetJson(url, timeout = 30000, headers = {}) {
+        const response = await enrichGmRequest('GET', url, { timeout, headers });
+        const text = response.responseText || '';
+        return typeof text === 'object' ? text : JSON.parse(text);
+    }
+
+    async function enrichPostJson(url, payload, headers = {}, timeout = 30000) {
+        const response = await enrichGmRequest('POST', url, {
+            data: JSON.stringify(payload),
+            headers,
+            timeout
+        });
+        const text = response.responseText || '';
+        return typeof text === 'object' ? text : JSON.parse(text);
+    }
+
+    function enrichNormalizeProfile(profile) {
+        if (!profile || typeof profile !== 'object') return null;
+        return {
+            employeeId: profile.employeeId != null ? String(profile.employeeId) : '',
+            login: profile.login != null ? String(profile.login) : '',
+            shiftCode: profile.shiftCode != null ? String(profile.shiftCode) : '',
+            badgeBarcodeId: profile.badgeBarcodeId != null ? String(profile.badgeBarcodeId) : '',
+            timestamp: Date.now()
+        };
+    }
+
+    async function ensureProfiles(identifiers) {
+        const wanted = enrichUniq(identifiers);
+        const cache = enrichReadJson(ENRICH_LOGIN_CACHE_KEY, {});
+        const now = Date.now();
+        const missing = [];
+        wanted.forEach((id) => {
+            const cached = cache[id];
+            if (!cached || !cached.timestamp || (now - cached.timestamp) > ENRICH_LOGIN_TTL_MS) {
+                missing.push(id);
+            }
+        });
+        for (const batch of enrichChunk(missing, 100)) {
+            const url = `https://adapt-iad.amazon.com/api/employee-profile-svc/GetEmployeeProfiles?employeeLogins=${encodeURIComponent(JSON.stringify(batch))}`;
+            try {
+                const data = await enrichGetJson(url, 45000);
+                Object.keys(data || {}).forEach((key) => {
+                    const profile = enrichNormalizeProfile(data[key]);
+                    if (!profile) return;
+                    if (key) cache[String(key)] = profile;
+                    if (profile.employeeId) cache[profile.employeeId] = profile;
+                    if (profile.login) cache[profile.login] = profile;
+                });
+            } catch (e) {
+                console.warn('[IdleDash] profile lookup failed for batch:', batch, e);
+            }
+        }
+        enrichWriteJson(ENRICH_LOGIN_CACHE_KEY, cache);
+        const result = {};
+        wanted.forEach((id) => {
+            result[id] = cache[id] || null;
+        });
+        return result;
+    }
+
+    function enrichApplyStation(target, station, employeeId = '', login = '') {
+        const cleanStation = String(station || '').trim();
+        if (!cleanStation) return;
+        if (employeeId) target.stationsById[String(employeeId)] = cleanStation;
+        if (login) target.stationsByLogin[String(login)] = cleanStation;
+    }
+
+    async function enrichFetchStationsFromSCC(warehouseId, processName, bucket) {
+        let latest = null;
+        let regionUsed = null;
+        for (const region of ENRICH_SCC_REGIONS) {
+            try {
+                latest = await enrichGetJson(`https://staffingcommandcenter-${region}.aka.amazon.com/getLatestGeneratedPlanRecord/${warehouseId}`, 30000);
+                if (latest && latest.planId) {
+                    regionUsed = region;
+                    break;
+                }
+            } catch (e) {}
+        }
+        if (!latest || !latest.planId || !regionUsed) return;
+        let intervals = [];
+        try {
+            intervals = await enrichGetJson(`https://staffingcommandcenter-${regionUsed}.aka.amazon.com/getPlanIntervals/${latest.planId}/${warehouseId}/${processName}`, 30000);
+        } catch (e) {
+            return;
+        }
+        if (!Array.isArray(intervals) || !intervals.length) return;
+        const now = Date.now();
+        let interval = null;
+        let bestStart = -Infinity;
+        intervals.forEach((candidate) => {
+            const start = Number(candidate && candidate.startTime ? candidate.startTime : 0) * 1000;
+            if (start && start <= now && start > bestStart) {
+                bestStart = start;
+                interval = candidate;
+            }
+        });
+        if (!interval) interval = intervals[0];
+        if (!interval) return;
+        let plan = null;
+        try {
+            plan = await enrichPostJson(
+                `https://staffingcommandcenter-${regionUsed}.aka.amazon.com/getStaffingPlansForWorkInterval/${latest.planId}/${processName}`,
+                interval,
+                { 'Accept': '*/*', 'content-type': 'application/json' },
+                45000
+            );
+        } catch (e) {
+            return;
+        }
+        const map = plan && plan.employeeIdToStationsMap ? plan.employeeIdToStationsMap : {};
+        Object.keys(map).forEach((employeeId) => {
+            const station = map[employeeId] && map[employeeId][0] && map[employeeId][0].scannableId ? map[employeeId][0].scannableId : '';
+            enrichApplyStation(bucket, station, employeeId, '');
+        });
+    }
+
+    async function enrichFetchStationsFromRobo(warehouseId, bucket) {
+        const urls = [2078, 2080, 2081, 2079].map((instanceId) =>
+            `https://roboscout.amazon.com/view_plot_data/?sites=(${warehouseId})&instance_id=${instanceId}&object_id=20672&BrowserTZ=America%2FNew_York&app_name=RoboScout`
+        );
+        const loginToStation = {};
+        for (const url of urls) {
+            try {
+                const data = await enrichGetJson(url, 45000);
+                const temp = {};
+                (data && Array.isArray(data.data) ? data.data : []).forEach((entry) => {
+                    if (!entry || !['Station_Id', 'Associate Login', 'StationType', 'Floor'].includes(entry.key)) return;
+                    if (!temp[entry.xValue]) temp[entry.xValue] = {};
+                    let value = String(entry.yValue || '');
+                    if (value.includes('>')) value = value.split('>')[1].split('<')[0];
+                    temp[entry.xValue][entry.key] = value;
+                });
+                Object.keys(temp).forEach((key) => {
+                    const row = temp[key] || {};
+                    const login = String(row['Associate Login'] || '').trim();
+                    const stationId = String(row['Station_Id'] || '').trim();
+                    if (!login || !stationId) return;
+                    const floor = String(row['Floor'] || '').replace('paKiva', '').trim();
+                    const stationType = String(row['StationType'] || '').trim();
+                    const station = `${floor ? floor + ' - ' : ''}${stationType ? stationType[0] : ''}${stationId}`.trim();
+                    if (station) loginToStation[login] = station;
+                });
+            } catch (e) {}
+        }
+        const logins = Object.keys(loginToStation);
+        if (!logins.length) return;
+        const profiles = await ensureProfiles(logins);
+        logins.forEach((login) => {
+            const profile = profiles[login] || null;
+            enrichApplyStation(bucket, loginToStation[login], profile && profile.employeeId ? profile.employeeId : '', login);
+        });
+    }
+
+    async function enrichFetchStationsFromIFC(warehouseId, bucket) {
+        try {
+            const payload = { warehouseId };
+            const headers = {
+                'Accept': 'application/json, text/javascript, */*; q=0.01',
+                'Cache-Control': 'no-cache',
+                'X-Amz-Date': new Date(Date.now()).toUTCString(),
+                'X-Amz-Target': 'AFTInboundFlowControlService.GetFcFlowSnapshot',
+                'Accept-Language': 'en-US,en;q=0.5',
+                'Content-Type': 'application/x-amz-json-1.0'
+            };
+            const response = await enrichPostJson('https://inbound-flow-svc-iad-prod.amazon.com/', payload, headers, 45000);
+            const root = response && response.warehouse && Array.isArray(response.warehouse.locations) ? response.warehouse.locations : [];
+            const loginStations = {};
+            const walk = (node) => {
+                if (!node || typeof node !== 'object') return;
+                const children = Array.isArray(node.childLocations) ? node.childLocations : [];
+                const employees = Array.isArray(node.employees) ? node.employees : [];
+                if (employees.length && !children.length && node.id) {
+                    employees.forEach((emp) => {
+                        if (emp && emp.id) loginStations[String(emp.id)] = String(node.id);
+                    });
+                }
+                children.forEach(walk);
+            };
+            root.forEach(walk);
+            const logins = Object.keys(loginStations);
+            if (!logins.length) return;
+            const profiles = await ensureProfiles(logins);
+            logins.forEach((login) => {
+                const profile = profiles[login] || null;
+                enrichApplyStation(bucket, loginStations[login], profile && profile.employeeId ? profile.employeeId : '', login);
+            });
+        } catch (e) {}
+    }
+
+    async function getStationsForWarehouse(warehouseId) {
+        const cache = enrichReadJson(ENRICH_STATION_CACHE_KEY, {});
+        const cached = cache[warehouseId];
+        const now = Date.now();
+        if (cached && cached.timestamp && (now - cached.timestamp) <= ENRICH_STATION_TTL_MS) {
+            return cached;
+        }
+        const bucket = { timestamp: now, stationsById: {}, stationsByLogin: {} };
+        await Promise.allSettled([
+            enrichFetchStationsFromSCC(warehouseId, 'PPAFE1', bucket),
+            enrichFetchStationsFromSCC(warehouseId, 'PPAFE2', bucket),
+            enrichFetchStationsFromSCC(warehouseId, 'Singles', bucket),
+            enrichFetchStationsFromRobo(warehouseId, bucket),
+            enrichFetchStationsFromIFC(warehouseId, bucket)
+        ]);
+        cache[warehouseId] = bucket;
+        enrichWriteJson(ENRICH_STATION_CACHE_KEY, cache);
+        return bucket;
+    }
+
+    async function decorateRowsWithLoginStation(rows, warehouseId, idKey = 'employeeId') {
+        const ids = enrichUniq((rows || []).map((row) => row && row[idKey] ? row[idKey] : ''));
+        const profiles = ids.length ? await ensureProfiles(ids) : {};
+        const stationBundle = await getStationsForWarehouse(warehouseId);
+        (rows || []).forEach((row) => {
+            if (!row || !row[idKey]) {
+                row.login = row && row.login ? row.login : '';
+                row.station = row && row.station ? row.station : '';
+                return;
+            }
+            const key = String(row[idKey]);
+            const profile = profiles[key] || null;
+            const employeeId = profile && profile.employeeId ? profile.employeeId : key;
+            const login = row.login || (profile && profile.login ? profile.login : '');
+            row.login = login || '';
+            row.station = row.station || stationBundle.stationsById[employeeId] || (login ? stationBundle.stationsByLogin[login] : '') || '';
+        });
+        return rows;
+    }
+
+    // ═══════════════════════════════════════════════════════════════
     // SECTION 4: FETCH AA LIST + JPH FROM functionRollup
     // ═══════════════════════════════════════════════════════════════
 
@@ -242,10 +541,14 @@
             // Find JPH column index from header
             const headers = table.querySelectorAll('thead th, thead td');
             let jphColIdx = -1;
+            let mgrColIdx = -1;
             headers.forEach((th, idx) => {
                 const text = th.textContent.trim().toLowerCase();
                 if (text === 'jph' || text === 'uph' || text.includes('jobs per hour') || text.includes('units per hour')) {
                     jphColIdx = idx;
+                }
+                if (text === 'manager' || text.includes('manager') || text.includes('supervisor')) {
+                    mgrColIdx = idx;
                 }
             });
 
@@ -264,18 +567,20 @@
 
                 const name = link.textContent.trim();
                 let jph = 0;
+                let manager = '';
 
-                if (jphColIdx >= 0) {
-                    const cells = row.querySelectorAll('td');
-                    if (cells[jphColIdx]) {
-                        jph = parseFloat(cells[jphColIdx].textContent.trim()) || 0;
-                    }
+                const cells = row.querySelectorAll('td');
+                if (jphColIdx >= 0 && cells[jphColIdx]) {
+                    jph = parseFloat(cells[jphColIdx].textContent.trim()) || 0;
+                }
+                if (mgrColIdx >= 0 && cells[mgrColIdx]) {
+                    manager = cells[mgrColIdx].textContent.trim();
                 }
 
                 // Also try to extract from the timeDetails link for later use
                 const timeDetailsHref = href.includes('timeDetails') ? href : null;
 
-                aaList.push({ employeeId, name, jph, timeDetailsHref });
+                aaList.push({ employeeId, name, jph, manager, timeDetailsHref });
             });
         });
 
@@ -450,6 +755,7 @@
     function analyzeBreaks(segments) {
         const breakWindows = getBreakWindows();
         const threshold = settings.breakMisuseThreshold;
+        const shiftDates = getShiftDates();
 
         let totalIdleMinutes = 0;
         let break1IdleMinutes = 0;
@@ -525,6 +831,35 @@
         const break1ExcessTotal = Math.max(0, break1IdleMinutes - breakWindows.break1.scheduledDuration);
         const break2ExcessTotal = Math.max(0, break2IdleMinutes - breakWindows.break2.scheduledDuration);
 
+        // ── Fast Start / Strong Finish (from activity segment timestamps) ──
+        // firstActivity = earliest segment start, lastActivity = latest segment end.
+        let firstActivity = null;
+        let lastActivity = null;
+        segments.forEach(seg => {
+            if (seg.start && (!firstActivity || seg.start < firstActivity)) firstActivity = seg.start;
+            if (seg.end && (!lastActivity || seg.end > lastActivity)) lastActivity = seg.end;
+        });
+
+        // Missed Fast Start = first activity begins more than 15 min after shift start.
+        const FAST_START_TOLERANCE_MS = 15 * 60000;
+        const missedFastStart = !!firstActivity &&
+            (firstActivity.getTime() - shiftDates.startDate.getTime()) > FAST_START_TOLERANCE_MS;
+
+        // Missed Strong Finish = last activity ends before the configured shift end.
+        const missedStrongFinish = !!lastActivity &&
+            lastActivity.getTime() < shiftDates.endDate.getTime();
+
+        const isBreakAbuse = break1Misuse || break2Misuse;
+        const isIdleTime = nonBreakIdleMinutes > threshold;
+
+        // ── Behavioral Type (joined with " / ", "Normal" if none) ──
+        const behaviors = [];
+        if (isBreakAbuse) behaviors.push('Break Abuse');
+        if (isIdleTime) behaviors.push('Idle Time');
+        if (missedFastStart) behaviors.push('Missed Fast Start');
+        if (missedStrongFinish) behaviors.push('Missed Strong Finish');
+        const behavioralType = behaviors.length ? behaviors.join(' / ') : 'Normal';
+
         return {
             totalIdleMinutes: Math.round(totalIdleMinutes * 100) / 100,
             break1IdleMinutes: Math.round(break1IdleMinutes * 100) / 100,
@@ -538,6 +873,11 @@
             break2Excess: Math.round(break2ExcessTotal * 100) / 100,
             idleTimestamps15,
             idleTimestamps30,
+            firstActivity,
+            lastActivity,
+            missedFastStart,
+            missedStrongFinish,
+            behavioralType,
             isBreakOffender: break1Misuse || break2Misuse || nonBreakIdleMinutes > threshold
         };
     }
@@ -1142,11 +1482,25 @@
             });
             if (!isScanning) return;
 
-            // Step 5: Calculate thresholds
+            // Step 5: Enrich with login + station (Location). Non-fatal: on
+            // failure, login/station stay blank and the scan still completes.
+            setStatus('Enriching login & station...', '#16a085');
+            try {
+                await decorateRowsWithLoginStation(aaList, settings.warehouseId, 'employeeId');
+            } catch (enrichErr) {
+                console.warn('[IdleDash] Enrichment failed, continuing without login/station:', enrichErr);
+                aaList.forEach(aa => {
+                    if (aa.login == null) aa.login = '';
+                    if (aa.station == null) aa.station = '';
+                });
+            }
+            if (!isScanning) return;
+
+            // Step 6: Calculate thresholds
             setStatus('Calculating thresholds...', '#8e44ad');
             const thresholds = calculateThresholds(aaList);
 
-            // Step 6: Render results
+            // Step 7: Render results
             scanResults = aaList;
             renderResults(aaList, thresholds);
 
@@ -1168,7 +1522,7 @@
     // ═══════════════════════════════════════════════════════════════
 
     let currentFilter = 'all';
-    let currentSort = { col: 'nonBreakIdle', dir: 'desc' };
+    let currentSort = { col: 'idleTime', dir: 'desc' };
 
     function renderResults(aaList, thresholds) {
         const resultsDiv = document.getElementById('idash-results');
@@ -1215,32 +1569,45 @@
             default: filtered = [...aaList];
         }
 
+        // Column definitions for the reworked layout.
+        // type: 'string' -> localeCompare sort; 'number' -> numeric sort.
+        const columns = [
+            { key: 'login', label: 'Login', type: 'string' },
+            { key: 'manager', label: 'Logging Manager', type: 'string' },
+            { key: 'behavioralType', label: 'Behavioral Type', type: 'string' },
+            { key: 'idleTime', label: 'Idle Time (min)', type: 'number' },
+            { key: 'location', label: 'Location', type: 'string' },
+            { key: 'idle15', label: 'Instances >15 min', type: 'number' },
+            { key: 'idle30', label: 'Instances >30 min', type: 'number' }
+        ];
+
+        const colValue = (aa, key) => {
+            const a = aa.analysis || {};
+            switch (key) {
+                case 'login': return aa.login || '';
+                case 'manager': return aa.manager || '';
+                case 'behavioralType': return a.behavioralType || '';
+                case 'location': return aa.station || '';
+                case 'idleTime': return a.nonBreakIdleMinutes || 0;
+                case 'idle15': return a.idleTimestamps15?.length || 0;
+                case 'idle30': return a.idleTimestamps30?.length || 0;
+                default: return '';
+            }
+        };
+
+        const sortCol = columns.find(c => c.key === currentSort.col);
+        const sortType = sortCol ? sortCol.type : 'number';
+
         // Apply sort
         filtered.sort((a, b) => {
-            let va, vb;
-            switch (currentSort.col) {
-                case 'name': va = a.name || ''; vb = b.name || ''; return currentSort.dir === 'asc' ? va.localeCompare(vb) : vb.localeCompare(va);
-                case 'jph': va = a.jph || 0; vb = b.jph || 0; break;
-                case 'totalIdle': va = a.analysis?.totalIdleMinutes || 0; vb = b.analysis?.totalIdleMinutes || 0; break;
-                case 'nonBreakIdle': va = a.analysis?.nonBreakIdleMinutes || 0; vb = b.analysis?.nonBreakIdleMinutes || 0; break;
-                case 'break1Excess': va = a.analysis?.break1Excess || 0; vb = b.analysis?.break1Excess || 0; break;
-                case 'break2Excess': va = a.analysis?.break2Excess || 0; vb = b.analysis?.break2Excess || 0; break;
-                case 'idle15': va = a.analysis?.idleTimestamps15?.length || 0; vb = b.analysis?.idleTimestamps15?.length || 0; break;
-                default: va = 0; vb = 0;
+            const va = colValue(a, currentSort.col);
+            const vb = colValue(b, currentSort.col);
+            if (sortType === 'string') {
+                const sa = String(va), sb = String(vb);
+                return currentSort.dir === 'asc' ? sa.localeCompare(sb) : sb.localeCompare(sa);
             }
-            if (typeof va === 'string') return 0;
             return currentSort.dir === 'asc' ? va - vb : vb - va;
         });
-
-        const columns = [
-            { key: 'name', label: 'Name' },
-            { key: 'jph', label: 'JPH' },
-            { key: 'nonBreakIdle', label: 'Idle (min)' },
-            { key: 'break1Excess', label: 'Break 1 Misuse' },
-            { key: 'break2Excess', label: 'Break 2 Misuse' },
-            { key: 'idle15', label: '>15m Gaps' },
-            { key: 'flags', label: 'Flags' }
-        ];
 
         const arrow = (col) => {
             if (currentSort.col !== col) return '';
@@ -1260,38 +1627,34 @@
             else if (aa.isBottomJPH) rowClass = 'row-bottom-jph';
             else if (aa.isTopBreakOffender) rowClass = 'row-break-offender';
 
-            // Format break misuse columns
-            const break1Str = a.break1Excess > 0
-                ? `${a.break1Excess.toFixed(1)}m ${a.break1ReturnTime ? '(back ' + formatTimeShort(a.break1ReturnTime) + ')' : ''}`
-                : '\u2713';
-            const break2Str = a.break2Excess > 0
-                ? `${a.break2Excess.toFixed(1)}m ${a.break2ReturnTime ? '(back ' + formatTimeShort(a.break2ReturnTime) + ')' : ''}`
-                : '\u2713';
+            // Login cell — link to the associate's timeDetails when we have an ID.
+            const loginText = aa.login || aa.employeeId || '\u2013';
+            const loginCell = aa.timeDetailsHref
+                ? `<a href="${escapeHtml(aa.timeDetailsHref)}" target="_blank" title="${escapeHtml(aa.name || '')}">${escapeHtml(loginText)}</a>`
+                : `<span title="${escapeHtml(aa.name || '')}">${escapeHtml(loginText)}</span>`;
 
-            // Format >15m gaps with timestamps
+            const behavioralType = a.behavioralType || 'Normal';
+            const isNormal = behavioralType === 'Normal';
+
+            // Instances >15 / >30 with hover timestamps
             const idle15Count = a.idleTimestamps15?.length || 0;
-            let idle15Str = idle15Count > 0 ? `${idle15Count}` : '\u2713';
-            let idle15Title = '';
-            if (a.idleTimestamps15 && a.idleTimestamps15.length > 0) {
-                idle15Title = a.idleTimestamps15.map(t =>
-                    `${formatTimeShort(t.start)}\u2192${formatTimeShort(t.end)} (${t.duration.toFixed(0)}m)`
-                ).join('\n');
-                idle15Str += ` <span class="idash-timestamps" title="${escapeHtml(idle15Title)}">${formatTimeShort(a.idleTimestamps15[0].start)}</span>`;
-            }
-
-            // Flags
-            let flags = '';
-            if (aa.isBottomJPH) flags += '<span class="idash-badge idash-badge-red">LOW JPH</span> ';
-            if (aa.isTopBreakOffender) flags += '<span class="idash-badge idash-badge-orange">BRK</span> ';
+            const idle30Count = a.idleTimestamps30?.length || 0;
+            const buildTitle = (list) => (list || []).map(t =>
+                `${formatTimeShort(t.start)}\u2192${formatTimeShort(t.end)} (${t.duration.toFixed(0)}m)`
+            ).join('\n');
+            const idle15Title = buildTitle(a.idleTimestamps15);
+            const idle30Title = buildTitle(a.idleTimestamps30);
+            const idle15Str = idle15Count > 0 ? String(idle15Count) : '\u2713';
+            const idle30Str = idle30Count > 0 ? String(idle30Count) : '\u2713';
 
             html += `<tr class="${rowClass}">
-                <td title="${escapeHtml(aa.employeeId)}">${escapeHtml(aa.name || aa.employeeId)}</td>
-                <td>${(aa.jph || 0).toFixed(1)}</td>
+                <td>${loginCell}</td>
+                <td>${escapeHtml(aa.manager || '\u2013')}</td>
+                <td style="color:${isNormal ? '#27ae60' : '#e74c3c'};font-weight:600">${escapeHtml(behavioralType)}</td>
                 <td>${(a.nonBreakIdleMinutes || 0).toFixed(1)}</td>
-                <td style="color:${a.break1Excess > 0 ? '#e74c3c' : '#27ae60'}">${break1Str}</td>
-                <td style="color:${a.break2Excess > 0 ? '#e74c3c' : '#27ae60'}">${break2Str}</td>
+                <td>${escapeHtml(aa.station || '\u2013')}</td>
                 <td title="${escapeHtml(idle15Title)}" style="color:${idle15Count > 0 ? '#e74c3c' : '#27ae60'}">${idle15Str}</td>
-                <td>${flags}</td>
+                <td title="${escapeHtml(idle30Title)}" style="color:${idle30Count > 0 ? '#e74c3c' : '#27ae60'}">${idle30Str}</td>
             </tr>`;
         });
 
@@ -1303,7 +1666,6 @@
         document.querySelectorAll('.idash-table th[data-sort]').forEach(th => {
             th.onclick = () => {
                 const col = th.dataset.sort;
-                if (col === 'flags') return;
                 if (currentSort.col === col) {
                     currentSort.dir = currentSort.dir === 'asc' ? 'desc' : 'asc';
                 } else {
@@ -1336,11 +1698,9 @@
             return;
         }
 
-        const headers = ['Name', 'Employee ID', 'JPH', 'Total Idle (min)', 'Non-Break Idle (min)',
-            'Break 1 Idle (min)', 'Break 1 Excess (min)', 'Break 1 Return Time',
-            'Break 2 Idle (min)', 'Break 2 Excess (min)', 'Break 2 Return Time',
-            'Gaps >15m Count', 'Gaps >15m Timestamps', 'Gaps >30m Count',
-            'Bottom JPH Flag', 'Break Offender Flag'];
+        const headers = ['Login', 'Employee ID', 'Logging Manager', 'Behavioral Type',
+            'Idle Time (min)', 'Location', 'Instances >15 min', 'Instances >30 min',
+            'Gaps >15m Timestamps'];
 
         const rows = scanResults.map(aa => {
             const a = aa.analysis || {};
@@ -1348,22 +1708,15 @@
                 `${formatTimeShort(t.start)}-${formatTimeShort(t.end)}(${t.duration.toFixed(0)}m)`
             ).join('; ');
             return [
-                aa.name || '',
+                aa.login || '',
                 aa.employeeId || '',
-                (aa.jph || 0).toFixed(1),
-                (a.totalIdleMinutes || 0).toFixed(1),
+                aa.manager || '',
+                a.behavioralType || 'Normal',
                 (a.nonBreakIdleMinutes || 0).toFixed(1),
-                (a.break1IdleMinutes || 0).toFixed(1),
-                (a.break1Excess || 0).toFixed(1),
-                a.break1ReturnTime ? formatTimeShort(a.break1ReturnTime) : '',
-                (a.break2IdleMinutes || 0).toFixed(1),
-                (a.break2Excess || 0).toFixed(1),
-                a.break2ReturnTime ? formatTimeShort(a.break2ReturnTime) : '',
+                aa.station || '',
                 (a.idleTimestamps15 || []).length,
-                ts15,
                 (a.idleTimestamps30 || []).length,
-                aa.isBottomJPH ? 'YES' : '',
-                aa.isTopBreakOffender ? 'YES' : ''
+                ts15
             ].map(v => `"${String(v).replace(/"/g, '""')}"`).join(',');
         });
 
