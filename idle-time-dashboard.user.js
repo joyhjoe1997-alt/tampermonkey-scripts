@@ -602,6 +602,15 @@
         #idle-dash-panel.expanded {
             width: 900px;
         }
+        /* Collapsed = compact pill so it does not cover the page UI */
+        #idle-dash-panel.collapsed {
+            width: 230px;
+            max-height: 44px;
+            border-radius: 22px;
+        }
+        #idle-dash-panel.collapsed #idle-dash-body { display: none !important; }
+        #idle-dash-panel.collapsed #idle-dash-hdr { border-radius: 20px; padding: 9px 14px; cursor: pointer; }
+        #idle-dash-panel.collapsed #idash-expand-btn { display: none; }
         #idle-dash-hdr {
             background: linear-gradient(135deg, #2c3e50, #34495e);
             color: #fff;
@@ -787,6 +796,55 @@
         .idash-badge-red { background: #e74c3c; }
         .idash-badge-orange { background: #f39c12; }
         .sort-arrow { font-size: 9px; margin-left: 3px; }
+
+        /* ── In-page table enhancement styles (merged from idle-time.user.js) ── */
+        .transfer-button {
+            background-color: #0066cc; color: #fff; border: none; border-radius: 3px;
+            padding: 1px 4px; cursor: pointer; margin-left: 3px; font-size: 11px;
+            vertical-align: middle; min-width: 40px; font-weight: normal;
+        }
+        .idle-time-cell { font-size: 11px; vertical-align: middle; white-space: nowrap; }
+        .transfer-time-cell { display: flex; align-items: center; white-space: nowrap; max-width: 120px; }
+        .transfer-time-display { display: inline-block; margin-right: 3px; }
+        .transfer-summary-button {
+            position: fixed; top: 20px; right: 20px; background-color: #0066cc; color: #fff;
+            border: none; border-radius: 5px; padding: 10px 20px; cursor: pointer;
+            z-index: 1000; font-weight: bold;
+        }
+        .transfer-summary-modal {
+            display: none; position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
+            background-color: #fff; padding: 20px; border-radius: 5px; box-shadow: 0 2px 10px rgba(0,0,0,.2);
+            z-index: 1000001; max-height: 80vh; overflow-y: auto; min-width: 600px;
+        }
+        .transfer-summary-modal.show { display: block; }
+        .modal-backdrop {
+            display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+            background-color: rgba(0,0,0,.5); z-index: 1000000;
+        }
+        .modal-backdrop.show { display: block; }
+        .transfer-summary-header { font-size: 18px; font-weight: bold; margin-bottom: 15px; padding-bottom: 10px; border-bottom: 1px solid #ddd; }
+        .transfer-summary-content { margin-bottom: 15px; }
+        .transfer-detail-item { padding: 8px; border-bottom: 1px solid #eee; margin-bottom: 10px; }
+        .transfer-detail-item:nth-child(odd) { background-color: #f9f9f9; }
+        .transfer-miss { color: red; margin-left: 15px; padding: 3px 0; }
+        .close-modal-button { position: absolute; top: 10px; right: 10px; background: none; border: none; font-size: 20px; cursor: pointer; }
+        .total-misses { font-size: 16px; font-weight: bold; margin-bottom: 15px; padding: 10px; background-color: #f0f0f0; border-radius: 5px; text-align: center; }
+        .manager-section { margin-bottom: 20px; padding: 10px; border: 1px solid #ddd; border-radius: 5px; }
+        .manager-header { font-size: 16px; font-weight: bold; margin-bottom: 10px; padding-bottom: 5px; border-bottom: 2px solid #0066cc; color: #0066cc; }
+        .transfer-details {
+            display: none; position: absolute; background-color: #fff; border: 1px solid #ddd;
+            padding: 10px; box-shadow: 0 2px 5px rgba(0,0,0,.2); z-index: 1000; font-size: 12px; min-width: 150px;
+        }
+        .transfer-details.show { display: block; }
+        .sort-button {
+            background: none; border: none; cursor: pointer; font-weight: bold; padding: 5px;
+            width: 100%; text-align: left; display: flex; align-items: center; justify-content: space-between; font-size: 11px;
+        }
+        .sort-button:hover { background-color: #f0f0f0; }
+        .sort-button.active { color: #0066cc; }
+        .sort-icon { display: inline-block; width: 12px; height: 12px; margin-left: 5px; }
+        .sort-button.desc .sort-icon::after { content: '\\25BC'; }
+        .sort-button.asc .sort-icon::after { content: '\\25B2'; }
     `);
 
     // ═══════════════════════════════════════════════════════════════
@@ -796,6 +854,7 @@
     function buildPanel() {
         const panel = document.createElement('div');
         panel.id = 'idle-dash-panel';
+        panel.className = 'collapsed';
         panel.innerHTML = `
             <div id="idle-dash-hdr">
                 <div class="title-area">
@@ -813,7 +872,7 @@
                 <!-- Settings Section -->
                 <div class="idash-section">
                     <div class="idash-section-title" id="idash-settings-toggle">\u2699 Settings <span style="font-weight:400;font-size:10px">(click to toggle)</span></div>
-                    <div class="idash-collapse show" id="idash-settings-content">
+                    <div class="idash-collapse" id="idash-settings-content">
                         <div class="idash-settings-grid">
                             <label>Shift Preset
                                 <select id="idash-preset">
@@ -900,18 +959,22 @@
         });
         document.addEventListener('mouseup', () => { dragging = false; });
 
-        // Minimize toggle
-        document.getElementById('idash-min-btn').onclick = () => {
-            const body = document.getElementById('idle-dash-body');
+        // Minimize / expand toggle (collapsed pill <-> full panel)
+        document.getElementById('idash-min-btn').onclick = (e) => {
+            e.stopPropagation();
             const btn = document.getElementById('idash-min-btn');
-            if (body.style.display === 'none') {
-                body.style.display = '';
-                btn.textContent = '\u2212';
-            } else {
-                body.style.display = 'none';
-                btn.textContent = '+';
-            }
+            const isCollapsed = panel.classList.toggle('collapsed');
+            btn.textContent = isCollapsed ? '+' : '\u2212';
         };
+
+        // Clicking the collapsed pill header opens the panel
+        document.getElementById('idle-dash-hdr').addEventListener('click', (e) => {
+            if (e.target.tagName === 'BUTTON') return;
+            if (panel.classList.contains('collapsed')) {
+                panel.classList.remove('collapsed');
+                document.getElementById('idash-min-btn').textContent = '\u2212';
+            }
+        });
 
         // Expand toggle
         document.getElementById('idash-expand-btn').onclick = () => {
@@ -1323,6 +1386,436 @@
     }
 
     // ═══════════════════════════════════════════════════════════════
+    // SECTION 16: IN-PAGE TABLE ENHANCEMENTS (merged from idle-time.user.js)
+    //   Injects columns directly into the FCLM functionRollup table:
+    //   Total Idle, Idle %, Fast Start, Transfer, Idle >15m, Idle >30m
+    //   Plus Transfer Misses Summary modal + Night Shift quick-fill button.
+    // ═══════════════════════════════════════════════════════════════
+
+    const employeeMisses = new Map();
+    const processedLogins = new Set();
+
+    // Department definitions (process -> department mapping)
+    const departments = {
+        P2R: { name: 'P2R', processes: [
+            'Pack Multis\u2666Pack Kaizen 1','Pack Singles\u2666Pack Kaizen 1','Pack Multis\u2666Pack Kaizen 2',
+            'Pack Singles\u2666Pack Kaizen 2','Pack Multis\u2666Pack Merge','Pack Singles\u2666Pack Merge',
+            'Pick\u2666Pick To Rebin','Pack Support\u2666P2R Waterspider','Process Guide PackMu',
+            'Pack Support\u2666Process Guide PackMu' ] },
+        ArsawPick: { name: 'ARSAW', processes: [
+            'Pick\u2666MultiFlow Picking','Pick\u2666RF Pick Singles','Pick\u2666RF Pick',
+            'Transfer Out Pick\u2666RF Pick Transship','Pick Support\u2666Tote Replenishment' ] },
+        Stow: { name: 'Stow', processes: [
+            'Each Transfer In\u2666Stow Each Nike','Stow to Prime\u2666Stow Each Nike','Stow to Prime\u2666Stow Each Nike Light',
+            'Each Transfer In\u2666Stow Each Nike Light','Pack Support\u2666Buffer Operator','Buffer Operator',
+            'Transfer In Support\u2666Cart/Pallet Builder','Facility\u2666Tote Prep' ] },
+        Dock: { name: 'DOCK', processes: [
+            'Container Load\u2666Container Loader','Fluid Load\u2666Fluid Loader','Container Build\u2666Auto Cont. Builder',
+            'Container Move\u2666Flat Waterspider','Container Move\u2666Flat Wing','Pallet Banding',
+            'I Induct\u2666Flat Inductor','Process Guide Ship','Ship Dock Support\u2666Process Guide Ship',
+            'Ship Dock Support\u2666FSRI Operator','FSRI Operator','Dock Pallet Loader',
+            'Container Build\u2666Manual Cont. Builder' ] },
+        Problemsolve: { name: 'PS', processes: [
+            'Pack Multis\u2666Scan Packages','Pack Support\u2666SLAM Kickout','OB Problem Solve\u2666POPS Check In',
+            'OB Problem Solve\u2666Pack from POPS','OB Problem Solve\u2666POPS Collector','OB Problem Solve\u2666POPS Runner',
+            'OB Problem Solve\u2666POPS Overage' ] },
+        Singlepack: { name: 'SM', processes: [
+            'Pack Singles\u2666Scan Verify SIOC','Chuting\u2666Scan Verify AFE','Buffer Operator',
+            'Pack Support\u2666Buffer Operator','SLAM Operator','Pack Support\u2666SLAM Operator',
+            'Gift-Wrap\u2666Pack HandTape','Gift-Wrap\u2666Pack Multis HandTape','Custom Packaging\u2666Pack Multis HandTape',
+            'Pack Singles\u2666Scan Verify Medium','Pack Singles\u2666Scan Verify','Sort-Flow\u2666AFE 1 Rebin',
+            'Pack Singles\u2666Scan Verify Large','Pack Singles\u2666Slam At Pack','Pack Singles\u2666SLAP Mix',
+            'Sort-Flow\u2666AFE1 Induct' ] },
+        Icqa: { name: 'ICQA', processes: [
+            'IC-QA-CS\u2666SBC - Other','IC-QA-CS\u2666Other Other','IC-QA-CS\u2666Simple Record Count',
+            'IC-QA-CS\u2666Amnesty','Amnesty','IC-QA-CS\u2666Damage Processing','IC-QA-CS\u2666Andon Bin Chk WAVE',
+            'IB Problem Solve\u2666Stow to Prime PSolve' ] },
+        Receive: { name: 'REC', processes: [
+            'Facility\u2666Tote Prep','Transfer In Dock\u2666Decant','RSR Support\u2666Decant',
+            'Receive-Support\u2666Decant Non-TI','Transfer In Support\u2666Line Load Injection',
+            'Each-Receive\u2666Receive Medium A','Transfer In Dock\u2666Pallet_decant_split',
+            'Prep Recorder\u2666Prep Receive','Transfer In Support\u2666TransferIn Transport' ] }
+    };
+
+    function ip_createCell(content, backgroundColor, textColor = '', isIdleTime = false) {
+        const cell = document.createElement('td');
+        cell.textContent = content;
+        if (backgroundColor) cell.style.backgroundColor = backgroundColor;
+        if (textColor) cell.style.color = textColor;
+        if (isIdleTime) cell.classList.add('idle-time-cell');
+        cell.setAttribute('data-custom', 'true');
+        return cell;
+    }
+
+    function ip_getIdleTimeColor(pct) {
+        if (pct > 10) return '#ffc7ce';
+        if (pct >= 8) return '#ffeb9c';
+        return '#c6efce';
+    }
+
+    function ip_getGapColor(count) {
+        if (count >= 3) return '#ffc7ce';
+        if (count >= 1) return '#ffeb9c';
+        return '#c6efce';
+    }
+
+    function ip_parseTransferTimeToMinutes(timeStr) {
+        if (!timeStr) return 0;
+        try {
+            if (timeStr.includes(':')) {
+                const [m, s] = timeStr.split(':').map(Number);
+                return m + (s / 60);
+            }
+            return parseFloat(timeStr) || 0;
+        } catch { return 0; }
+    }
+
+    function ip_formatMinutesToTime(totalMinutes) {
+        const minutes = Math.floor(totalMinutes);
+        const seconds = Math.round((totalMinutes % 1) * 60);
+        return `${minutes}:${seconds.toString().padStart(2, '0')}`;
+    }
+
+    function ip_calculateIdlePercentage(idleTime, paidTimeSegments) {
+        let totalTime = 0;
+        paidTimeSegments.forEach((row) => {
+            const tds = row.querySelectorAll('td');
+            if (tds.length >= 4) {
+                const timeText = tds[3].innerText;
+                const [hours, minutes] = timeText.split(':').map(Number);
+                totalTime += hours + (minutes / 60);
+            }
+        });
+        return totalTime > 0 ? (idleTime / totalTime * 100) : 0;
+    }
+
+    function ip_checkForTransfer(currentProcess, nextProcess) {
+        let fromDepartment = null, toDepartment = null;
+        for (let dept in departments) {
+            if (departments[dept].processes.includes(currentProcess)) fromDepartment = departments[dept].name;
+            if (departments[dept].processes.includes(nextProcess)) toDepartment = departments[dept].name;
+        }
+        if (fromDepartment && toDepartment && fromDepartment !== toDepartment) {
+            return { from: fromDepartment, to: toDepartment, fromProcess: currentProcess, toProcess: nextProcess };
+        }
+        return null;
+    }
+
+    // Sorting for injected columns
+    function ip_getColumnValue(row, columnType) {
+        const cells = row.querySelectorAll('td[data-custom]');
+        let value = 0, text, minutes, seconds, transferCell;
+        switch (columnType) {
+            case 'idle': text = cells[0]?.textContent || '0'; value = parseFloat(text.replace(/[^\d.]/g, '')) || 0; break;
+            case 'idlePercentage': text = cells[1]?.textContent || '0%'; value = parseFloat(text.replace('%', '')) || 0; break;
+            case 'fast': text = cells[2]?.textContent || ''; value = text === '\u2713' ? 0 : parseInt(text.replace(/[^\d.]/g, '')) || 0; break;
+            case 'transfer':
+                transferCell = cells[3]?.querySelector('.transfer-time-display');
+                if (!transferCell || transferCell.textContent === '-') { value = 0; }
+                else { [minutes, seconds] = (transferCell.textContent || '0:00').split(':').map(Number); value = (minutes || 0) + ((seconds || 0) / 60); }
+                break;
+            case 'idle15': text = cells[4]?.textContent || '0'; value = text === '\u2713' ? 0 : parseInt(text) || 0; break;
+            case 'idle30': text = cells[5]?.textContent || '0'; value = text === '\u2713' ? 0 : parseInt(text) || 0; break;
+            default: value = 0;
+        }
+        return value;
+    }
+
+    function ip_sortTableByColumn(table, columnType, ascending = false) {
+        const tbody = table.querySelector('tbody');
+        if (!tbody) return;
+        const rows = Array.from(tbody.querySelectorAll('tr'));
+        rows.forEach((row, index) => row.setAttribute('data-original-order', index));
+        rows.sort((a, b) => {
+            const va = ip_getColumnValue(a, columnType), vb = ip_getColumnValue(b, columnType);
+            if (va === vb) return (parseInt(a.getAttribute('data-original-order')) - parseInt(b.getAttribute('data-original-order')));
+            return ascending ? va - vb : vb - va;
+        });
+        tbody.innerHTML = '';
+        rows.forEach(row => tbody.appendChild(row));
+    }
+
+    function ip_createTransferCell(transfers, login, row) {
+        const cell = document.createElement('td');
+        cell.classList.add('transfer-time-cell');
+        cell.setAttribute('data-custom', 'true');
+        if (!transfers || transfers.length === 0) { cell.textContent = '-'; return cell; }
+
+        let totalMinutes = 0, missCount = 0;
+        const validTransfers = transfers.filter(t => t && t.from && t.to && t.idleTime && ip_parseTransferTimeToMinutes(t.idleTime) > 10);
+        validTransfers.forEach(t => { totalMinutes += ip_parseTransferTimeToMinutes(t.idleTime); missCount++; });
+
+        const loginCell = row.querySelector('td:nth-child(6)');
+        const loginName = loginCell ? loginCell.textContent.trim() : 'Unknown';
+        const managerCell = row.querySelector('td:nth-child(4)');
+        const manager = managerCell ? managerCell.textContent.trim() : 'Unknown';
+
+        if (loginName && missCount > 0 && !processedLogins.has(loginName)) {
+            employeeMisses.set(loginName, {
+                loginName, missCount, totalTime: totalMinutes, manager,
+                details: validTransfers.map(t => ({ from: t.from, to: t.to, time: t.idleTime, minutes: ip_parseTransferTimeToMinutes(t.idleTime) }))
+            });
+            processedLogins.add(loginName);
+        }
+
+        const timeDisplay = document.createElement('span');
+        timeDisplay.textContent = missCount > 0 ? ip_formatMinutesToTime(totalMinutes) : '-';
+        timeDisplay.classList.add('transfer-time-display');
+        cell.appendChild(timeDisplay);
+
+        if (validTransfers.length > 0) {
+            const detailsButton = document.createElement('button');
+            detailsButton.textContent = 'Details';
+            detailsButton.className = 'transfer-button';
+            cell.appendChild(detailsButton);
+
+            const detailsDiv = document.createElement('div');
+            detailsDiv.className = 'transfer-details';
+            validTransfers.forEach(t => {
+                const detail = document.createElement('div');
+                detail.textContent = `${t.from} \u2192 ${t.to} (${t.idleTime})`;
+                detail.style.color = 'red';
+                detailsDiv.appendChild(detail);
+            });
+            detailsButton.onclick = (e) => {
+                e.stopPropagation();
+                document.querySelectorAll('.transfer-details').forEach(d => { if (d !== detailsDiv) d.classList.remove('show'); });
+                detailsDiv.classList.toggle('show');
+            };
+            document.addEventListener('click', (e) => {
+                if (!detailsDiv.contains(e.target) && e.target !== detailsButton) detailsDiv.classList.remove('show');
+            });
+            cell.appendChild(detailsDiv);
+        }
+        cell.style.backgroundColor = missCount > 0 ? '#ffc7ce' : '#c6efce';
+        return cell;
+    }
+
+    function ip_addColumnHeaders() {
+        const tables = document.querySelectorAll("table[id^=function]");
+        tables.forEach(table => {
+            const headerRow = table.querySelector("thead tr");
+            if (!headerRow) return;
+            headerRow.querySelectorAll('th[data-custom]').forEach(h => h.remove());
+            const newHeaders = [
+                { text: 'Total Idle', type: 'idle' },
+                { text: 'Idle %', type: 'idlePercentage' },
+                { text: 'Fast Start', type: 'fast' },
+                { text: 'Transfer', type: 'transfer' },
+                { text: 'Idle >15m', type: 'idle15' },
+                { text: 'Idle >30m', type: 'idle30' }
+            ];
+            newHeaders.forEach(({ text, type }) => {
+                const th = document.createElement('th');
+                th.setAttribute('data-custom', 'true');
+                const button = document.createElement('button');
+                button.className = 'sort-button';
+                button.innerHTML = `${text}<span class="sort-icon"></span>`;
+                button.setAttribute('data-sort-type', type);
+                let ascending = false;
+                button.addEventListener('click', function (e) {
+                    e.preventDefault(); e.stopPropagation();
+                    document.querySelectorAll('.sort-button').forEach(btn => btn.classList.remove('active', 'asc', 'desc'));
+                    ascending = !ascending;
+                    this.classList.add('active', ascending ? 'asc' : 'desc');
+                    const parentTable = this.closest('table');
+                    if (parentTable) ip_sortTableByColumn(parentTable, type, ascending);
+                });
+                th.appendChild(button);
+                headerRow.appendChild(th);
+            });
+        });
+    }
+
+    function ip_createTransferSummaryButton() {
+        const button = document.createElement('button');
+        button.className = 'transfer-summary-button';
+        button.textContent = 'Transfer Misses Summary';
+        const modal = document.createElement('div');
+        modal.className = 'transfer-summary-modal';
+        const backdrop = document.createElement('div');
+        backdrop.className = 'modal-backdrop';
+        const closeButton = document.createElement('button');
+        closeButton.className = 'close-modal-button';
+        closeButton.textContent = '\u00d7';
+        modal.appendChild(closeButton);
+        const header = document.createElement('div');
+        header.className = 'transfer-summary-header';
+        header.textContent = 'Transfer Misses Summary';
+        modal.appendChild(header);
+        const content = document.createElement('div');
+        content.className = 'transfer-summary-content';
+        modal.appendChild(content);
+        button.onclick = ip_updateAndShowModal;
+        closeButton.onclick = () => { modal.classList.remove('show'); backdrop.classList.remove('show'); };
+        backdrop.onclick = closeButton.onclick;
+        document.body.appendChild(button);
+        document.body.appendChild(modal);
+        document.body.appendChild(backdrop);
+    }
+
+    function ip_updateAndShowModal() {
+        const modal = document.querySelector('.transfer-summary-modal');
+        const backdrop = document.querySelector('.modal-backdrop');
+        const content = modal.querySelector('.transfer-summary-content');
+        content.innerHTML = '';
+        const managerGroups = new Map();
+        employeeMisses.forEach((data) => {
+            const manager = data.manager;
+            if (!managerGroups.has(manager)) managerGroups.set(manager, []);
+            managerGroups.get(manager).push({ ...data });
+        });
+        let totalMisses = 0;
+        employeeMisses.forEach(data => { totalMisses += data.missCount; });
+        const totalMissesDiv = document.createElement('div');
+        totalMissesDiv.className = 'total-misses';
+        totalMissesDiv.textContent = `Total Transfer Misses: ${totalMisses}`;
+        content.appendChild(totalMissesDiv);
+        const sortedManagers = Array.from(managerGroups.entries()).sort((a, b) => {
+            const ma = a[1].reduce((s, e) => s + e.missCount, 0), mb = b[1].reduce((s, e) => s + e.missCount, 0);
+            return mb - ma;
+        });
+        const wh = settings.warehouseId || 'EMA4';
+        sortedManagers.forEach(([manager, employees]) => {
+            const managerSection = document.createElement('div');
+            managerSection.className = 'manager-section';
+            const managerHeader = document.createElement('div');
+            managerHeader.className = 'manager-header';
+            managerHeader.textContent = `Manager: ${manager}`;
+            managerSection.appendChild(managerHeader);
+            employees.sort((a, b) => b.totalTime - a.totalTime);
+            employees.forEach(({ loginName, missCount, details, totalTime }) => {
+                if (missCount <= 0) return;
+                const detailItem = document.createElement('div');
+                detailItem.className = 'transfer-detail-item';
+                let detailsHtml = `
+                    <strong>Login:</strong> <a href="${BASE_URL}/employee/timeDetails?warehouseId=${wh}&employeeId=${loginName}" target="_blank">${loginName}</a><br>
+                    <strong>Total Misses:</strong> ${missCount}<br>
+                    <strong>Total Transfer Time:</strong> ${ip_formatMinutesToTime(totalTime)}<br>
+                    <strong>Transfer Details:</strong>`;
+                details.filter(t => ip_parseTransferTimeToMinutes(t.time) > 10).forEach(t => {
+                    detailsHtml += `<div class="transfer-miss">${t.from} \u2192 ${t.to} (${t.time})</div>`;
+                });
+                detailItem.innerHTML = detailsHtml;
+                managerSection.appendChild(detailItem);
+            });
+            content.appendChild(managerSection);
+        });
+        modal.classList.add('show');
+        backdrop.classList.add('show');
+    }
+
+    // Fetch + inject columns for one AA row (mirrors idle-time.user.js getTime)
+    function ip_getTime(row, href) {
+        GM_xmlhttpRequest({
+            method: "GET",
+            url: href,
+            headers: { "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", "Cache-Control": "no-cache" },
+            onload: function (response) {
+                try {
+                    const tempHtml = document.createElement('div');
+                    tempHtml.innerHTML = response.responseText;
+                    const editableElements = tempHtml.querySelectorAll('.editable');
+                    const paidTimeSegments = tempHtml.querySelectorAll('.clock-seg.on-clock.paid');
+
+                    let idleTime = 0, shiftStartIdleMinutes = 0, fastStartFound = false;
+                    let transfers = [], idleOver15 = 0, idleOver30 = 0;
+
+                    const shiftStartHM = parseTime(settings.shiftStart);
+
+                    editableElements.forEach((item) => {
+                        if (item.parentNode.parentNode.classList.contains('edited')) return;
+                        const processRow = item.parentNode.parentNode;
+                        const processCell = processRow.cells[0];
+                        const currentProcess = processCell ? processCell.textContent.trim() : '';
+                        const timeCell = processRow.querySelector('.rightAlign');
+                        const idleTimeText = timeCell ? timeCell.textContent : '';
+
+                        if (idleTimeText && idleTimeText.includes(':')) {
+                            const [minutes, seconds] = idleTimeText.split(':').map(Number);
+                            const gapMinutes = minutes + (seconds / 60);
+                            idleTime += gapMinutes;
+                            if (gapMinutes > 15) idleOver15++;
+                            if (gapMinutes > 30) idleOver30++;
+
+                            // Fast Start calculation using configured shift start
+                            if (!fastStartFound) {
+                                const previousRow = processRow.previousElementSibling;
+                                const previousProcess = previousRow ? previousRow.cells[0].textContent.trim() : '';
+                                if (previousProcess === 'OnClock/Paid') {
+                                    const startEndTimes = processRow.querySelector('td:nth-child(3)');
+                                    if (startEndTimes) {
+                                        const timeMatch = startEndTimes.textContent.match(/\d{2}\/\d{2}-(\d{2}):(\d{2}):\d{2}/);
+                                        if (timeMatch) {
+                                            const endHour = parseInt(timeMatch[1]), endMin = parseInt(timeMatch[2]);
+                                            const activityStartMinutes = (endHour * 60) + endMin;
+                                            const shiftStartMinutes = (shiftStartHM.h * 60) + shiftStartHM.m;
+                                            const toleranceMinutes = 10;
+                                            const timeDifference = activityStartMinutes - shiftStartMinutes;
+                                            shiftStartIdleMinutes = timeDifference <= toleranceMinutes ? 0 : timeDifference - toleranceMinutes;
+                                            fastStartFound = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Transfers
+                        const nextRow = processRow.nextElementSibling;
+                        if (nextRow && currentProcess) {
+                            const nextProcess = nextRow.cells[0] ? nextRow.cells[0].textContent.trim() : '';
+                            const transfer = ip_checkForTransfer(currentProcess, nextProcess);
+                            if (transfer && idleTimeText && idleTimeText.includes(':')) {
+                                transfers.push({ from: transfer.from, to: transfer.to, idleTime: idleTimeText });
+                            }
+                        }
+                    });
+
+                    const idlePercentage = ip_calculateIdlePercentage(idleTime, paidTimeSegments);
+                    const roundedPercentage = Math.round(idlePercentage * 100) / 100;
+                    const color = ip_getIdleTimeColor(roundedPercentage);
+
+                    const newCells = [
+                        ip_createCell(Math.round(idleTime * 100) / 100, color, '', true),
+                        ip_createCell(roundedPercentage + '%', color, '', true),
+                        ip_createCell(shiftStartIdleMinutes > 0 ? shiftStartIdleMinutes + ' min' : '\u2713',
+                            shiftStartIdleMinutes > 0 ? '#800080' : '#c6efce', shiftStartIdleMinutes > 0 ? '#FFFFFF' : '#006100'),
+                        ip_createTransferCell(transfers, null, row),
+                        ip_createCell(idleOver15 > 0 ? idleOver15 : '\u2713', ip_getGapColor(idleOver15), idleOver15 > 0 ? '' : '#006100', true),
+                        ip_createCell(idleOver30 > 0 ? idleOver30 : '\u2713', ip_getGapColor(idleOver30), idleOver30 > 0 ? '' : '#006100', true)
+                    ];
+                    newCells.forEach(cell => { cell.setAttribute('data-custom', 'true'); row.appendChild(cell); });
+                } catch (error) {
+                    console.error('[IdleDash] ip_getTime error:', error);
+                }
+            },
+            onerror: function (error) { console.error('[IdleDash] ip_getTime request error:', error); }
+        });
+    }
+
+    // Run the in-page enhancement (auto on functionRollup page)
+    function runInPageEnhancement() {
+        if (!location.pathname.includes('/reports/functionRollup')) return;
+        if (document.querySelector('th[data-custom]')) return; // already injected
+        employeeMisses.clear();
+        processedLogins.clear();
+        ip_createTransferSummaryButton();
+        ip_addColumnHeaders();
+
+        const tables = document.querySelectorAll("table[id^=function]");
+        if (tables.length === 0) return;
+        tables.forEach((table) => {
+            const rows = table.querySelectorAll('tbody tr');
+            rows.forEach((row) => {
+                try {
+                    const link = row.querySelector('td:nth-child(2) a');
+                    if (link) ip_getTime(row, link.href);
+                } catch (e) { console.error('[IdleDash] row error:', e); }
+            });
+        });
+    }
+
+    // ═══════════════════════════════════════════════════════════════
     // SECTION 15: INITIALIZATION
     // ═══════════════════════════════════════════════════════════════
 
@@ -1330,6 +1823,8 @@
         loadSettings();
         buildPanel();
         populateSettingsUI();
+        // Auto-populate the FCLM table with idle-time columns on the functionRollup page
+        try { runInPageEnhancement(); } catch (e) { console.error('[IdleDash] enhancement error:', e); }
         console.log('[IdleDash] Idle Time Dashboard v' + VERSION + ' loaded');
     }
 
