@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Idle Time Dashboard
 // @namespace    http://tampermonkey.net/
-// @version      1.1
-// @description  Standalone idle time dashboard for FCLM portal — tracks AA idle time, break misuse, missed fast start / strong finish, with login + station enrichment
+// @version      1.2
+// @description  Standalone idle time dashboard for FCLM portal — idle time, break misuse, missed fast start / strong finish (via PPA clock punches), login + station enrichment, live manager filter
 // @author       joyhjoe
 // @match        https://fclm-portal-dub.dub.proxy.amazon.com/*
 // @match        https://fclm-portal.amazon.com/*
@@ -28,7 +28,7 @@
     // SECTION 1: CONFIGURATION & DEFAULTS
     // ═══════════════════════════════════════════════════════════════
 
-    const VERSION = '1.1';
+    const VERSION = '1.2';
     const BASE_URL = location.origin; // Auto-detect: works on both fclm-portal.amazon.com and fclm-portal-dub.dub.proxy.amazon.com
 
     // ── Enrichment config (login + station lookup, ported from Track4) ──
@@ -508,6 +508,108 @@
     }
 
     // ═══════════════════════════════════════════════════════════════
+    // SECTION 3C: PPA ATTENDANCE (CLOCK-IN / CLOCK-OUT)  (ported from Track4)
+    //   Fetches real clock punches so Fast Start / Strong Finish can be
+    //   measured against actual clock-in/out rather than activity gaps.
+    //   Header-based column detection with fixed-index fallback. Non-fatal.
+    // ═══════════════════════════════════════════════════════════════
+
+    // Minimal CSV parser (dashboard does not @require PapaParse).
+    // Handles quoted fields and embedded commas/quotes.
+    function parseCsv(text) {
+        const rows = [];
+        let row = [];
+        let field = '';
+        let inQuotes = false;
+        const s = String(text || '');
+        for (let i = 0; i < s.length; i++) {
+            const ch = s[i];
+            if (inQuotes) {
+                if (ch === '"') {
+                    if (s[i + 1] === '"') { field += '"'; i++; }
+                    else inQuotes = false;
+                } else {
+                    field += ch;
+                }
+            } else if (ch === '"') {
+                inQuotes = true;
+            } else if (ch === ',') {
+                row.push(field); field = '';
+            } else if (ch === '\n') {
+                row.push(field); rows.push(row); row = []; field = '';
+            } else if (ch === '\r') {
+                // ignore; handled by \n
+            } else {
+                field += ch;
+            }
+        }
+        if (field.length || row.length) { row.push(field); rows.push(row); }
+        return rows.filter(r => r.length && !(r.length === 1 && r[0].trim() === ''));
+    }
+
+    // Fixed-index fallbacks (Track4 defaults)
+    const PPA_EMP_ID_INDEX = 0;
+    const PPA_PUNCH_TYPE_INDEX = 4;
+    const PPA_PUNCH_TIME_INDEX = 5;
+
+    function ppaColumnIndices(headerRow) {
+        const idx = { id: PPA_EMP_ID_INDEX, type: PPA_PUNCH_TYPE_INDEX, time: PPA_PUNCH_TIME_INDEX };
+        if (!Array.isArray(headerRow)) return idx;
+        const lower = headerRow.map(h => String(h || '').trim().toLowerCase());
+        const find = (preds) => lower.findIndex(h => preds.some(p => h.includes(p)));
+        const idCol = find(['employee id', 'emp id', 'employeeid', 'badge']);
+        const typeCol = find(['punch type', 'type', 'direction', 'in/out']);
+        const timeCol = find(['punch time', 'time', 'timestamp', 'clock']);
+        if (idCol >= 0) idx.id = idCol;
+        if (typeCol >= 0) idx.type = typeCol;
+        if (timeCol >= 0) idx.time = timeCol;
+        return idx;
+    }
+
+    // Returns Map<employeeId, {clockIn: Date|null, clockOut: Date|null}>
+    async function fetchPpaAttendance() {
+        const map = new Map();
+        try {
+            const { startDate, endDate } = getShiftDates();
+            const fmtDay = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+            const url =
+                `${BASE_URL}/reports/ppaAttendance?reportFormat=CSV` +
+                `&warehouseId=${encodeURIComponent(settings.warehouseId)}` +
+                `&startDateDay=${fmtDay(startDate)}` +
+                `&maxIntradayDays=30&spanType=Intraday` +
+                `&startDateIntraday=${fmtDay(startDate)}` +
+                `&startHourIntraday=${startDate.getHours()}&startMinuteIntraday=${startDate.getMinutes()}` +
+                `&endDateIntraday=${fmtDay(endDate)}` +
+                `&endHourIntraday=${endDate.getHours()}&endMinuteIntraday=${endDate.getMinutes()}`;
+            const csv = await gmFetch(url, 90000);
+            const parsed = parseCsv(csv.trim());
+            if (parsed.length < 2) return map;
+            const idxCols = ppaColumnIndices(parsed[0]);
+            const dataRows = parsed.slice(1);
+            dataRows.forEach(cells => {
+                const empId = String(cells[idxCols.id] || '').trim();
+                if (!empId || /^employee/i.test(empId)) return;
+                const punchType = String(cells[idxCols.type] || '').trim().toLowerCase();
+                const rawTime = String(cells[idxCols.time] || '').trim();
+                if (!rawTime || !punchType) return;
+                let t = new Date(rawTime);
+                if (isNaN(t)) t = new Date(rawTime.replace(/\u202f/g, ' '));
+                if (isNaN(t)) return;
+                let entry = map.get(empId);
+                if (!entry) { entry = { clockIn: null, clockOut: null }; map.set(empId, entry); }
+                if (punchType.includes('in')) {
+                    if (!entry.clockIn || t < entry.clockIn) entry.clockIn = t;
+                } else if (punchType.includes('out')) {
+                    if (!entry.clockOut || t > entry.clockOut) entry.clockOut = t;
+                }
+            });
+        } catch (e) {
+            console.warn('[IdleDash] PPA attendance fetch failed (non-fatal):', e);
+        }
+        return map;
+    }
+
+    // ═══════════════════════════════════════════════════════════════
     // SECTION 4: FETCH AA LIST + JPH FROM functionRollup
     // ═══════════════════════════════════════════════════════════════
 
@@ -752,7 +854,7 @@
         return (overlapEnd - overlapStart) / 60000;
     }
 
-    function analyzeBreaks(segments) {
+    function analyzeBreaks(segments, ppa) {
         const breakWindows = getBreakWindows();
         const threshold = settings.breakMisuseThreshold;
         const shiftDates = getShiftDates();
@@ -840,14 +942,22 @@
             if (seg.end && (!lastActivity || seg.end > lastActivity)) lastActivity = seg.end;
         });
 
-        // Missed Fast Start = first activity begins more than 15 min after shift start.
-        const FAST_START_TOLERANCE_MS = 15 * 60000;
-        const missedFastStart = !!firstActivity &&
-            (firstActivity.getTime() - shiftDates.startDate.getTime()) > FAST_START_TOLERANCE_MS;
+        // Clock punches (when available) give a more accurate first/last reference.
+        const clockIn = ppa && ppa.clockIn ? ppa.clockIn : null;
+        const clockOut = ppa && ppa.clockOut ? ppa.clockOut : null;
 
-        // Missed Strong Finish = last activity ends before the configured shift end.
+        // Missed Fast Start = first activity begins more than 15 min after the
+        // reference start. Prefer real clock-in; fall back to configured shift start.
+        const FAST_START_TOLERANCE_MS = 15 * 60000;
+        const fastRef = clockIn || shiftDates.startDate;
+        const missedFastStart = !!firstActivity &&
+            (firstActivity.getTime() - fastRef.getTime()) > FAST_START_TOLERANCE_MS;
+
+        // Missed Strong Finish = last activity ends before the reference end.
+        // Prefer real clock-out; fall back to configured shift end.
+        const strongRef = clockOut || shiftDates.endDate;
         const missedStrongFinish = !!lastActivity &&
-            lastActivity.getTime() < shiftDates.endDate.getTime();
+            lastActivity.getTime() < strongRef.getTime();
 
         const isBreakAbuse = break1Misuse || break2Misuse;
         const isIdleTime = nonBreakIdleMinutes > threshold;
@@ -875,6 +985,8 @@
             idleTimestamps30,
             firstActivity,
             lastActivity,
+            clockIn,
+            clockOut,
             missedFastStart,
             missedStrongFinish,
             behavioralType,
@@ -1048,10 +1160,11 @@
         }
         .idash-table-wrap {
             overflow-x: auto;
-            max-height: 400px;
+            max-height: 420px;
             overflow-y: auto;
-            border: 1px solid #eee;
-            border-radius: 6px;
+            border: 1px solid #e3ebf5;
+            border-radius: 10px;
+            box-shadow: 0 6px 18px rgba(44,62,80,.06);
         }
         .idash-table {
             width: 100%;
@@ -1059,46 +1172,113 @@
             font: 11px 'Segoe UI';
         }
         .idash-table th {
-            background: #f8f9fa;
-            padding: 6px 8px;
+            background: linear-gradient(180deg, #eef4fc 0%, #dfe9f7 100%);
+            padding: 8px 10px;
             text-align: left;
-            font-weight: 700;
-            border-bottom: 2px solid #ddd;
+            font-weight: 800;
+            color: #234678;
+            border-bottom: 2px solid #cdd9ec;
             position: sticky;
             top: 0;
+            z-index: 2;
             cursor: pointer;
             white-space: nowrap;
             user-select: none;
         }
-        .idash-table th:hover { background: #e8f4fd; }
+        .idash-table th:hover { background: linear-gradient(180deg, #e4eefb 0%, #d3e2f5 100%); }
         .idash-table td {
-            padding: 5px 8px;
-            border-bottom: 1px solid #f0f0f0;
+            padding: 6px 10px;
+            border-bottom: 1px solid #eef2f7;
             white-space: nowrap;
         }
-        .idash-table tr:hover td { background: #f0f8ff; }
+        .idash-table tbody tr:nth-child(even) td { background: #fafcff; }
+        .idash-table tr:hover td { background: #eef6ff; }
         .idash-table tr.row-bottom-jph td { background: #fde2e2; }
         .idash-table tr.row-break-offender td { background: #fff3e0; }
         .idash-table tr.row-both td { background: #fce4ec; }
+
+        /* ── Manager Filter (live, adapted from Track4) ── */
+        .idash-manager-filter-host { margin-bottom: 10px; display: none; }
+        #idash-manager-filter {
+            background: linear-gradient(180deg, #ffffff 0%, #f6faff 100%);
+            border: 1px solid #dde7f5;
+            border-radius: 10px;
+            padding: 10px;
+            box-shadow: 0 6px 16px rgba(44,62,80,.06);
+        }
+        .idash-mgr-head {
+            display: flex; align-items: flex-start; justify-content: space-between;
+            gap: 8px; margin-bottom: 8px;
+        }
+        .idash-mgr-title { font: 800 14px 'Segoe UI'; color: #234678; }
+        .idash-mgr-caption { font: 500 10px 'Segoe UI'; color: #7f8c8d; margin-top: 1px; }
+        .idash-mgr-badge {
+            white-space: nowrap; padding: 4px 10px; border-radius: 999px;
+            background: rgba(52,152,219,.12); color: #2980b9;
+            font: 800 10px 'Segoe UI'; border: 1px solid rgba(52,152,219,.2);
+        }
+        .idash-mgr-toolbar {
+            display: flex; gap: 6px; align-items: center; margin-bottom: 8px; flex-wrap: wrap;
+        }
+        .idash-mgr-search {
+            flex: 1 1 200px; min-width: 160px;
+            border: 1px solid #cfdcef; border-radius: 8px; padding: 6px 10px;
+            font: 11px 'Segoe UI'; color: #2c3e50; background: #fff;
+        }
+        .idash-mgr-search:focus {
+            outline: none; border-color: #3498db;
+            box-shadow: 0 0 0 3px rgba(52,152,219,.15);
+        }
+        .idash-mgr-controls { display: flex; gap: 6px; }
+        .idash-mgr-btn {
+            border: 1px solid transparent; border-radius: 8px; padding: 6px 12px;
+            font: 800 10px 'Segoe UI'; cursor: pointer; transition: all .14s;
+        }
+        .idash-mgr-btn.is-primary { background: linear-gradient(135deg, #3498db, #2471a3); color: #fff; }
+        .idash-mgr-btn.is-secondary { background: #fff; color: #234678; border-color: #cfdcef; }
+        .idash-mgr-btn:hover { transform: translateY(-1px); box-shadow: 0 6px 14px rgba(44,62,80,.12); }
+        .idash-mgr-summary { font: 700 10px 'Segoe UI'; color: #445; margin-bottom: 8px; }
+        .idash-mgr-list {
+            display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 5px; max-height: 150px; overflow-y: auto; padding-right: 4px;
+        }
+        .idash-mgr-chip {
+            display: flex; align-items: center; gap: 6px; padding: 6px 9px;
+            border: 1px solid #dfe7f3; border-radius: 8px; cursor: pointer;
+            background: linear-gradient(180deg, #fff 0%, #fbfdff 100%);
+            font: 700 10px 'Segoe UI'; color: #334155; transition: all .12s;
+        }
+        .idash-mgr-chip:hover { border-color: #bcd2ee; box-shadow: 0 4px 10px rgba(44,62,80,.08); }
+        .idash-mgr-chip.is-selected {
+            background: linear-gradient(180deg, #f4f9ff 0%, #e9f3ff 100%); border-color: #9ec4ec;
+        }
+        .idash-mgr-chip input { accent-color: #3498db; cursor: pointer; }
+        .idash-mgr-chip span { word-break: break-word; }
         .idash-summary {
             display: grid;
             grid-template-columns: repeat(4, 1fr);
-            gap: 6px;
-            margin-bottom: 10px;
+            gap: 8px;
+            margin-bottom: 12px;
         }
         .idash-summary-card {
-            background: #f8f9fa;
-            border-radius: 6px;
-            padding: 8px;
+            background: linear-gradient(180deg, #ffffff 0%, #f4f8fd 100%);
+            border: 1px solid #e3ebf5;
+            border-radius: 10px;
+            padding: 10px 8px;
             text-align: center;
+            box-shadow: 0 4px 12px rgba(44,62,80,.05);
         }
         .idash-summary-card .num {
-            font: 700 18px 'Segoe UI';
+            font: 800 20px 'Segoe UI';
             color: #2c3e50;
+            line-height: 1.1;
         }
         .idash-summary-card .label {
-            font: 11px 'Segoe UI';
+            font: 600 10px 'Segoe UI';
             color: #7f8c8d;
+            margin-top: 2px;
+            text-transform: uppercase;
+            letter-spacing: .03em;
         }
         .idash-filters {
             display: flex;
@@ -1272,6 +1452,7 @@
                 <div id="idash-results" style="display:none">
                     <div class="idash-summary" id="idash-summary"></div>
                     <div class="idash-filters" id="idash-filters"></div>
+                    <div class="idash-manager-filter-host" id="idash-manager-filter"></div>
                     <div class="idash-table-wrap" id="idash-table-wrap"></div>
                 </div>
             </div>
@@ -1475,10 +1656,22 @@
             });
             if (!isScanning) return;
 
-            // Step 4: Analyze breaks for each AA
+            // Step 3b: Fetch PPA clock punches (non-fatal). Used to measure
+            // Fast Start / Strong Finish against real clock-in/out.
+            setStatus('Loading clock-in / clock-out punches...', '#2980b9');
+            let ppaMap = new Map();
+            try {
+                ppaMap = await fetchPpaAttendance();
+            } catch (ppaErr) {
+                console.warn('[IdleDash] PPA fetch failed, using activity times:', ppaErr);
+            }
+            if (!isScanning) return;
+
+            // Step 4: Analyze breaks for each AA (pass clock punches when available)
             setStatus('Analyzing break patterns...', '#e67e22');
             aaList.forEach(aa => {
-                aa.analysis = analyzeBreaks(aa.segments);
+                const ppa = ppaMap.get(String(aa.employeeId)) || null;
+                aa.analysis = analyzeBreaks(aa.segments, ppa);
             });
             if (!isScanning) return;
 
@@ -1500,8 +1693,10 @@
             setStatus('Calculating thresholds...', '#8e44ad');
             const thresholds = calculateThresholds(aaList);
 
-            // Step 7: Render results
+            // Step 7: Render results (reset manager filter for the new scan)
             scanResults = aaList;
+            selectedManagers = null;
+            managerSearchTerm = '';
             renderResults(aaList, thresholds);
 
             setStatus(`Scan complete — ${aaList.length} associates analyzed`, '#27ae60');
@@ -1523,6 +1718,44 @@
 
     let currentFilter = 'all';
     let currentSort = { col: 'idleTime', dir: 'desc' };
+    // Manager filter state: null = all managers shown; otherwise a Set of
+    // manager names that are currently selected.
+    let selectedManagers = null;
+    let managerSearchTerm = '';
+
+    // Managers present in the current scan (sorted, unique, non-empty).
+    function getManagerNames(aaList) {
+        const set = new Set();
+        (aaList || []).forEach(aa => {
+            const m = (aa.manager || '').trim();
+            if (m) set.add(m);
+        });
+        return Array.from(set).sort((a, b) => a.localeCompare(b));
+    }
+
+    // Rows passing the active filter button (category), before manager filter.
+    function applyCategoryFilter(aaList) {
+        switch (currentFilter) {
+            case 'bottomJPH': return aaList.filter(a => a.isBottomJPH);
+            case 'breakOffenders': return aaList.filter(a => a.analysis && a.analysis.isBreakOffender);
+            case 'flagged': return aaList.filter(a => a.isHighlighted);
+            default: return [...aaList];
+        }
+    }
+
+    // Rows visible after BOTH the category filter and the manager filter.
+    // Used by both the table renderer and the CSV export so they stay in sync.
+    function getVisibleRows(aaList) {
+        let rows = applyCategoryFilter(aaList);
+        if (selectedManagers) {
+            rows = rows.filter(aa => {
+                const m = (aa.manager || '').trim();
+                // Rows without a manager stay visible (can't be filtered out).
+                return !m || selectedManagers.has(m);
+            });
+        }
+        return rows;
+    }
 
     function renderResults(aaList, thresholds) {
         const resultsDiv = document.getElementById('idash-results');
@@ -1532,15 +1765,17 @@
         const avgJPH = aaList.reduce((s, a) => s + (a.jph || 0), 0) / aaList.length;
         const flaggedCount = aaList.filter(a => a.isHighlighted).length;
         const breakOffenders = aaList.filter(a => a.analysis && a.analysis.isBreakOffender).length;
+        const missedFS = aaList.filter(a => a.analysis && a.analysis.missedFastStart).length;
+        const missedSF = aaList.filter(a => a.analysis && a.analysis.missedStrongFinish).length;
 
         document.getElementById('idash-summary').innerHTML = `
             <div class="idash-summary-card"><div class="num">${aaList.length}</div><div class="label">Total AAs</div></div>
-            <div class="idash-summary-card"><div class="num">${avgJPH.toFixed(1)}</div><div class="label">Avg JPH</div></div>
-            <div class="idash-summary-card"><div class="num" style="color:#e74c3c">${thresholds.bottomJPH.length}</div><div class="label">Bottom ${settings.percentileThreshold}% JPH</div></div>
             <div class="idash-summary-card"><div class="num" style="color:#f39c12">${breakOffenders}</div><div class="label">Break Offenders</div></div>
+            <div class="idash-summary-card"><div class="num" style="color:#8e44ad">${missedFS}</div><div class="label">Missed Fast Start</div></div>
+            <div class="idash-summary-card"><div class="num" style="color:#2980b9">${missedSF}</div><div class="label">Missed Strong Finish</div></div>
         `;
 
-        // Filters
+        // Category filter buttons
         document.getElementById('idash-filters').innerHTML = `
             <button class="idash-filter-btn ${currentFilter === 'all' ? 'active' : ''}" data-filter="all">All (${aaList.length})</button>
             <button class="idash-filter-btn ${currentFilter === 'bottomJPH' ? 'active' : ''}" data-filter="bottomJPH">Bottom ${settings.percentileThreshold}% JPH (${thresholds.bottomJPH.length})</button>
@@ -1555,19 +1790,95 @@
             };
         });
 
+        // Manager filter panel
+        renderManagerFilter(aaList, thresholds);
+
         // Render table
         renderTable(aaList);
     }
 
+    // ── Live Manager Filter (adapted from Track4) ──
+    function renderManagerFilter(aaList, thresholds) {
+        const host = document.getElementById('idash-manager-filter');
+        if (!host) return;
+        const managers = getManagerNames(aaList);
+        if (!managers.length) { host.innerHTML = ''; host.style.display = 'none'; return; }
+        host.style.display = 'block';
+
+        // Initialize selection to "all" the first time.
+        if (selectedManagers === null) selectedManagers = new Set(managers);
+
+        const selCount = managers.filter(m => selectedManagers.has(m)).length;
+        let summaryText;
+        if (selCount === managers.length) summaryText = `Showing all managers (${managers.length})`;
+        else if (selCount === 0) summaryText = 'No managers selected';
+        else summaryText = `Showing ${selCount} of ${managers.length} managers`;
+
+        const term = managerSearchTerm.trim().toLowerCase();
+        const chips = managers.map(m => {
+            const checked = selectedManagers.has(m);
+            const hidden = term && !m.toLowerCase().includes(term);
+            return `<label class="idash-mgr-chip ${checked ? 'is-selected' : ''}" data-mgr="${escapeHtml(m)}" style="${hidden ? 'display:none' : ''}">
+                <input type="checkbox" ${checked ? 'checked' : ''} data-mgr-cb="${escapeHtml(m)}">
+                <span>${escapeHtml(m)}</span>
+            </label>`;
+        }).join('');
+
+        host.innerHTML = `
+            <div class="idash-mgr-head">
+                <div>
+                    <div class="idash-mgr-title">Manager Filter</div>
+                    <div class="idash-mgr-caption">Filter results by manager instantly — no rescan</div>
+                </div>
+                <div class="idash-mgr-badge">${managers.length} managers</div>
+            </div>
+            <div class="idash-mgr-toolbar">
+                <input type="text" class="idash-mgr-search" placeholder="Search manager name..." value="${escapeHtml(managerSearchTerm)}">
+                <div class="idash-mgr-controls">
+                    <button class="idash-mgr-btn is-primary" data-mgr-action="all">All</button>
+                    <button class="idash-mgr-btn is-secondary" data-mgr-action="clear">Clear</button>
+                </div>
+            </div>
+            <div class="idash-mgr-summary">${summaryText}</div>
+            <div class="idash-mgr-list">${chips}</div>
+        `;
+
+        // Wire search (preserve caret by only re-rendering chips visibility)
+        const search = host.querySelector('.idash-mgr-search');
+        search.oninput = () => {
+            managerSearchTerm = search.value;
+            const t = managerSearchTerm.trim().toLowerCase();
+            host.querySelectorAll('.idash-mgr-chip').forEach(chip => {
+                const name = (chip.getAttribute('data-mgr') || '').toLowerCase();
+                chip.style.display = (!t || name.includes(t)) ? '' : 'none';
+            });
+        };
+
+        host.querySelectorAll('[data-mgr-cb]').forEach(cb => {
+            cb.onchange = () => {
+                const name = cb.getAttribute('data-mgr-cb');
+                if (cb.checked) selectedManagers.add(name);
+                else selectedManagers.delete(name);
+                renderManagerFilter(aaList, thresholds);
+                renderTable(aaList);
+            };
+        });
+
+        host.querySelector('[data-mgr-action="all"]').onclick = () => {
+            selectedManagers = new Set(managers);
+            renderManagerFilter(aaList, thresholds);
+            renderTable(aaList);
+        };
+        host.querySelector('[data-mgr-action="clear"]').onclick = () => {
+            selectedManagers = new Set();
+            renderManagerFilter(aaList, thresholds);
+            renderTable(aaList);
+        };
+    }
+
     function renderTable(aaList) {
-        // Apply filter
-        let filtered;
-        switch (currentFilter) {
-            case 'bottomJPH': filtered = aaList.filter(a => a.isBottomJPH); break;
-            case 'breakOffenders': filtered = aaList.filter(a => a.analysis && a.analysis.isBreakOffender); break;
-            case 'flagged': filtered = aaList.filter(a => a.isHighlighted); break;
-            default: filtered = [...aaList];
-        }
+        // Apply category + manager filters
+        let filtered = getVisibleRows(aaList);
 
         // Column definitions for the reworked layout.
         // type: 'string' -> localeCompare sort; 'number' -> numeric sort.
@@ -1702,7 +2013,14 @@
             'Idle Time (min)', 'Location', 'Instances >15 min', 'Instances >30 min',
             'Gaps >15m Timestamps'];
 
-        const rows = scanResults.map(aa => {
+        // Export only the rows currently visible (respects category + manager filters).
+        const visibleRows = getVisibleRows(scanResults);
+        if (!visibleRows.length) {
+            setStatus('No visible rows to export (check filters)', '#e74c3c');
+            return;
+        }
+
+        const rows = visibleRows.map(aa => {
             const a = aa.analysis || {};
             const ts15 = (a.idleTimestamps15 || []).map(t =>
                 `${formatTimeShort(t.start)}-${formatTimeShort(t.end)}(${t.duration.toFixed(0)}m)`
