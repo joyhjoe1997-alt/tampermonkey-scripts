@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Idle Time Dashboard
 // @namespace    http://tampermonkey.net/
-// @version      1.7
+// @version      1.8
 // @description  Standalone idle time dashboard — time-aware metrics (only flags phases that have started), new fields: Clock In, First Scan, First Scan After Break 1, Last Scan
 // @author       joyhjoe
 // @match        https://fclm-portal-dub.dub.proxy.amazon.com/*
@@ -28,7 +28,7 @@
     // SECTION 1: CONFIGURATION & DEFAULTS
     // ═══════════════════════════════════════════════════════════════
 
-    const VERSION = '1.7';
+    const VERSION = '1.8';
     const BASE_URL = location.origin; // Auto-detect: works on both fclm-portal.amazon.com and fclm-portal-dub.dub.proxy.amazon.com
 
     // ── Enrichment config (login + station lookup, ported from Track4) ──
@@ -1530,31 +1530,6 @@
         .idle-time-cell { font-size: 11px; vertical-align: middle; white-space: nowrap; }
         .transfer-time-cell { display: flex; align-items: center; white-space: nowrap; max-width: 120px; }
         .transfer-time-display { display: inline-block; margin-right: 3px; }
-        .transfer-summary-button {
-            position: fixed; top: 20px; right: 20px; background-color: #0066cc; color: #fff;
-            border: none; border-radius: 5px; padding: 10px 20px; cursor: pointer;
-            z-index: 1000; font-weight: bold;
-        }
-        .transfer-summary-modal {
-            display: none; position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
-            background-color: #fff; padding: 20px; border-radius: 5px; box-shadow: 0 2px 10px rgba(0,0,0,.2);
-            z-index: 1000001; max-height: 80vh; overflow-y: auto; min-width: 600px;
-        }
-        .transfer-summary-modal.show { display: block; }
-        .modal-backdrop {
-            display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%;
-            background-color: rgba(0,0,0,.5); z-index: 1000000;
-        }
-        .modal-backdrop.show { display: block; }
-        .transfer-summary-header { font-size: 18px; font-weight: bold; margin-bottom: 15px; padding-bottom: 10px; border-bottom: 1px solid #ddd; }
-        .transfer-summary-content { margin-bottom: 15px; }
-        .transfer-detail-item { padding: 8px; border-bottom: 1px solid #eee; margin-bottom: 10px; }
-        .transfer-detail-item:nth-child(odd) { background-color: #f9f9f9; }
-        .transfer-miss { color: red; margin-left: 15px; padding: 3px 0; }
-        .close-modal-button { position: absolute; top: 10px; right: 10px; background: none; border: none; font-size: 20px; cursor: pointer; }
-        .total-misses { font-size: 16px; font-weight: bold; margin-bottom: 15px; padding: 10px; background-color: #f0f0f0; border-radius: 5px; text-align: center; }
-        .manager-section { margin-bottom: 20px; padding: 10px; border: 1px solid #ddd; border-radius: 5px; }
-        .manager-header { font-size: 16px; font-weight: bold; margin-bottom: 10px; padding-bottom: 5px; border-bottom: 2px solid #0066cc; color: #0066cc; }
         .transfer-details {
             display: none; position: absolute; background-color: #fff; border: 1px solid #ddd;
             padding: 10px; box-shadow: 0 2px 5px rgba(0,0,0,.2); z-index: 1000; font-size: 12px; min-width: 150px;
@@ -2370,9 +2345,6 @@
     //   Plus Transfer Misses Summary modal + Night Shift quick-fill button.
     // ═══════════════════════════════════════════════════════════════
 
-    const employeeMisses = new Map();
-    const processedLogins = new Set();
-
     // Department definitions (process -> department mapping)
     const departments = {
         P2R: { name: 'P2R', processes: [
@@ -2528,13 +2500,7 @@
         const managerCell = row.querySelector('td:nth-child(4)');
         const manager = managerCell ? managerCell.textContent.trim() : 'Unknown';
 
-        if (loginName && missCount > 0 && !processedLogins.has(loginName)) {
-            employeeMisses.set(loginName, {
-                loginName, missCount, totalTime: totalMinutes, manager,
-                details: validTransfers.map(t => ({ from: t.from, to: t.to, time: t.idleTime, minutes: ip_parseTransferTimeToMinutes(t.idleTime) }))
-            });
-            processedLogins.add(loginName);
-        }
+        // (Transfer miss tracking removed — summary modal no longer shown)
 
         const timeDisplay = document.createElement('span');
         timeDisplay.textContent = missCount > 0 ? ip_formatMinutesToTime(totalMinutes) : '-';
@@ -2603,84 +2569,6 @@
                 headerRow.appendChild(th);
             });
         });
-    }
-
-    function ip_createTransferSummaryButton() {
-        const button = document.createElement('button');
-        button.className = 'transfer-summary-button';
-        button.textContent = 'Transfer Misses Summary';
-        const modal = document.createElement('div');
-        modal.className = 'transfer-summary-modal';
-        const backdrop = document.createElement('div');
-        backdrop.className = 'modal-backdrop';
-        const closeButton = document.createElement('button');
-        closeButton.className = 'close-modal-button';
-        closeButton.textContent = '\u00d7';
-        modal.appendChild(closeButton);
-        const header = document.createElement('div');
-        header.className = 'transfer-summary-header';
-        header.textContent = 'Transfer Misses Summary';
-        modal.appendChild(header);
-        const content = document.createElement('div');
-        content.className = 'transfer-summary-content';
-        modal.appendChild(content);
-        button.onclick = ip_updateAndShowModal;
-        closeButton.onclick = () => { modal.classList.remove('show'); backdrop.classList.remove('show'); };
-        backdrop.onclick = closeButton.onclick;
-        document.body.appendChild(button);
-        document.body.appendChild(modal);
-        document.body.appendChild(backdrop);
-    }
-
-    function ip_updateAndShowModal() {
-        const modal = document.querySelector('.transfer-summary-modal');
-        const backdrop = document.querySelector('.modal-backdrop');
-        const content = modal.querySelector('.transfer-summary-content');
-        content.innerHTML = '';
-        const managerGroups = new Map();
-        employeeMisses.forEach((data) => {
-            const manager = data.manager;
-            if (!managerGroups.has(manager)) managerGroups.set(manager, []);
-            managerGroups.get(manager).push({ ...data });
-        });
-        let totalMisses = 0;
-        employeeMisses.forEach(data => { totalMisses += data.missCount; });
-        const totalMissesDiv = document.createElement('div');
-        totalMissesDiv.className = 'total-misses';
-        totalMissesDiv.textContent = `Total Transfer Misses: ${totalMisses}`;
-        content.appendChild(totalMissesDiv);
-        const sortedManagers = Array.from(managerGroups.entries()).sort((a, b) => {
-            const ma = a[1].reduce((s, e) => s + e.missCount, 0), mb = b[1].reduce((s, e) => s + e.missCount, 0);
-            return mb - ma;
-        });
-        const wh = settings.warehouseId || 'EMA4';
-        sortedManagers.forEach(([manager, employees]) => {
-            const managerSection = document.createElement('div');
-            managerSection.className = 'manager-section';
-            const managerHeader = document.createElement('div');
-            managerHeader.className = 'manager-header';
-            managerHeader.textContent = `Manager: ${manager}`;
-            managerSection.appendChild(managerHeader);
-            employees.sort((a, b) => b.totalTime - a.totalTime);
-            employees.forEach(({ loginName, missCount, details, totalTime }) => {
-                if (missCount <= 0) return;
-                const detailItem = document.createElement('div');
-                detailItem.className = 'transfer-detail-item';
-                let detailsHtml = `
-                    <strong>Login:</strong> <a href="${BASE_URL}/employee/timeDetails?warehouseId=${wh}&employeeId=${loginName}" target="_blank">${loginName}</a><br>
-                    <strong>Total Misses:</strong> ${missCount}<br>
-                    <strong>Total Transfer Time:</strong> ${ip_formatMinutesToTime(totalTime)}<br>
-                    <strong>Transfer Details:</strong>`;
-                details.filter(t => ip_parseTransferTimeToMinutes(t.time) > 10).forEach(t => {
-                    detailsHtml += `<div class="transfer-miss">${t.from} \u2192 ${t.to} (${t.time})</div>`;
-                });
-                detailItem.innerHTML = detailsHtml;
-                managerSection.appendChild(detailItem);
-            });
-            content.appendChild(managerSection);
-        });
-        modal.classList.add('show');
-        backdrop.classList.add('show');
     }
 
     // Fetch + inject columns for one AA row (mirrors idle-time.user.js getTime)
@@ -2771,13 +2659,97 @@
         });
     }
 
+    // Night Shift quick-fill button — fills the FCLM date/time form fields
+    // with 18:15 → 04:45 and auto-detects the correct start/end date based
+    // on the current time. Shows on all matched FCLM pages.
+    function createNightShiftButton() {
+        // Don't add twice
+        if (document.getElementById('idash-night-shift-btn')) return;
+        const btn = document.createElement('button');
+        btn.id = 'idash-night-shift-btn';
+        btn.textContent = '\uD83C\uDF19 Night Shift (18:15 \u2192 04:45)';
+        btn.style.cssText = [
+            'position:fixed', 'bottom:24px', 'right:24px',
+            'background:linear-gradient(135deg,#1a1a2e,#16213e)',
+            'color:#fff', 'border:none', 'border-radius:8px',
+            'padding:10px 16px', 'cursor:pointer', 'z-index:999998',
+            'font:700 13px "Segoe UI",sans-serif',
+            'box-shadow:0 4px 14px rgba(0,0,0,.35)',
+            'transition:transform .12s ease,box-shadow .12s ease'
+        ].join(';');
+        btn.onmouseenter = () => {
+            btn.style.transform = 'translateY(-2px)';
+            btn.style.boxShadow = '0 8px 20px rgba(0,0,0,.4)';
+        };
+        btn.onmouseleave = () => {
+            btn.style.transform = '';
+            btn.style.boxShadow = '0 4px 14px rgba(0,0,0,.35)';
+        };
+
+        btn.onclick = () => {
+            const now = new Date();
+            const hour = now.getHours();
+            let startDate, endDate;
+
+            // 18:00–23:59 → tonight starting, ends tomorrow morning
+            // 00:00–04:59 → started last night, ends today
+            // Otherwise (daytime) → default to upcoming night shift
+            if (hour >= 18) {
+                startDate = new Date(now);
+                endDate   = new Date(now);
+                endDate.setDate(endDate.getDate() + 1);
+            } else if (hour < 5) {
+                startDate = new Date(now);
+                startDate.setDate(startDate.getDate() - 1);
+                endDate = new Date(now);
+            } else {
+                startDate = new Date(now);
+                endDate   = new Date(now);
+                endDate.setDate(endDate.getDate() + 1);
+            }
+
+            const fmt = d =>
+                d.getFullYear() + '/' +
+                String(d.getMonth() + 1).padStart(2, '0') + '/' +
+                String(d.getDate()).padStart(2, '0');
+
+            // Select Intraday span type if the radio exists
+            const intradayRadio = document.querySelector('input[name="spanType"][value="Intraday"]');
+            if (intradayRadio) { intradayRadio.checked = true; intradayRadio.click(); }
+
+            // Fill start date/hour/minute
+            const sdEl = document.getElementById('startDateIntraday');
+            const shEl = document.getElementById('startHourIntraday');
+            const smEl = document.getElementById('startMinuteIntraday');
+            if (sdEl) sdEl.value = fmt(startDate);
+            if (shEl) shEl.value = '18';
+            if (smEl) smEl.value = '15';
+
+            // Fill end date/hour/minute
+            const edEl = document.getElementById('endDateIntraday');
+            const ehEl = document.getElementById('endHourIntraday');
+            const emEl = document.getElementById('endMinuteIntraday');
+            if (edEl) edEl.value = fmt(endDate);
+            if (ehEl) ehEl.value = '4';
+            if (emEl) emEl.value = '45';
+
+            // Visual feedback
+            const original = btn.textContent;
+            btn.textContent = `\u2713 Set! (${fmt(startDate)} \u2192 ${fmt(endDate)})`;
+            btn.style.background = 'linear-gradient(135deg,#27ae60,#1e8449)';
+            setTimeout(() => {
+                btn.textContent = original;
+                btn.style.background = 'linear-gradient(135deg,#1a1a2e,#16213e)';
+            }, 3000);
+        };
+
+        document.body.appendChild(btn);
+    }
+
     // Run the in-page enhancement (auto on functionRollup page)
     function runInPageEnhancement() {
         if (!location.pathname.includes('/reports/functionRollup')) return;
         if (document.querySelector('th[data-custom]')) return; // already injected
-        employeeMisses.clear();
-        processedLogins.clear();
-        ip_createTransferSummaryButton();
         ip_addColumnHeaders();
 
         const tables = document.querySelectorAll("table[id^=function]");
@@ -2805,6 +2777,8 @@
         loadSettings();
         buildPanel();
         populateSettingsUI();
+        // Night shift quick-fill button on all matched FCLM pages
+        try { createNightShiftButton(); } catch (e) { console.error('[IdleDash] night shift btn error:', e); }
         // Auto-populate the FCLM table with idle-time columns on the functionRollup page
         try { runInPageEnhancement(); } catch (e) { console.error('[IdleDash] enhancement error:', e); }
         console.log('[IdleDash] Idle Time Dashboard v' + VERSION + ' loaded');
