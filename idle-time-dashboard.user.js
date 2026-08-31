@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Idle Time Dashboard
 // @namespace    http://tampermonkey.net/
-// @version      1.4
-// @description  Standalone idle time dashboard for FCLM portal — idle time, break misuse, missed fast start / strong finish (PPA clock punches), login + station enrichment, live manager filter. Bug fixes: null-safe DOM reads, HTTP status checks, minute-accurate shift detection.
+// @version      1.5
+// @description  Standalone idle time dashboard — time-aware metrics (only flags phases that have started), new fields: Clock In, First Scan, First Scan After Break 1, Last Scan
 // @author       joyhjoe
 // @match        https://fclm-portal-dub.dub.proxy.amazon.com/*
 // @match        https://fclm-portal.amazon.com/*
@@ -28,7 +28,7 @@
     // SECTION 1: CONFIGURATION & DEFAULTS
     // ═══════════════════════════════════════════════════════════════
 
-    const VERSION = '1.4';
+    const VERSION = '1.5';
     const BASE_URL = location.origin; // Auto-detect: works on both fclm-portal.amazon.com and fclm-portal-dub.dub.proxy.amazon.com
 
     // ── Enrichment config (login + station lookup, ported from Track4) ──
@@ -222,6 +222,43 @@
             return `${fmtDate(startDate)}  ${fmtTime(startDate)} – ${fmtTime(endDate)}`;
         }
         return `${fmtDate(startDate)} ${fmtTime(startDate)} – ${fmtDate(endDate)} ${fmtTime(endDate)}`;
+    }
+
+    // Returns which shift phases have already started/completed as of right now.
+    // Used to suppress metrics that haven't happened yet during live scans.
+    //
+    // Logic:
+    //   - If the shift end has already passed → all phases are active (historical scan).
+    //   - Otherwise, a phase is active only if its start window has been reached.
+    //
+    // Returns: { fastStart, break1, break2, strongFinish }  (each boolean)
+    function getActivePhases() {
+        const now = Date.now();
+        const { startDate, endDate } = getShiftDates();
+        const breakWindows = getBreakWindows();
+
+        // If we're past the shift end, everything is relevant (historical data).
+        const shiftComplete = now >= endDate.getTime();
+        if (shiftComplete) {
+            return { fastStart: true, break1: true, break2: true, strongFinish: true };
+        }
+
+        // Fast Start window begins at shift start — always active once the scan runs
+        // (you'd only run the script during or after the shift).
+        const fastStart = now >= startDate.getTime();
+
+        // Break phases become relevant once the break window has started.
+        const break1 = now >= breakWindows.break1.windowStart.getTime();
+        const break2 = now >= breakWindows.break2.windowStart.getTime();
+
+        // Strong Finish is only relevant once we're close to shift end — use
+        // the strong finish start time (shift end minus 30 min) as the threshold.
+        // Since we don't have an explicit "strongStart" setting here, derive it
+        // as 30 minutes before shift end.
+        const strongFinishThreshold = endDate.getTime() - 30 * 60000;
+        const strongFinish = now >= strongFinishThreshold;
+
+        return { fastStart, break1, break2, strongFinish };
     }
 
     function formatDateForUrl(date) {
@@ -1042,40 +1079,63 @@
         const break1ExcessTotal = Math.max(0, break1IdleMinutes - breakWindows.break1.scheduledDuration);
         const break2ExcessTotal = Math.max(0, break2IdleMinutes - breakWindows.break2.scheduledDuration);
 
-        // ── Fast Start / Strong Finish (from activity segment timestamps) ──
-        // firstActivity = earliest segment start, lastActivity = latest segment end.
-        let firstActivity = null;
-        let lastActivity = null;
+        // Clock punches (when available) give a more accurate first/last reference.
+        const clockIn  = ppa && ppa.clockIn  ? ppa.clockIn  : null;
+        const clockOut = ppa && ppa.clockOut ? ppa.clockOut : null;
+
+        // ── New timing fields ──────────────────────────────────────────
+        // firstScan: earliest activity segment start in the whole shift
+        // lastScan:  latest  activity segment end   in the whole shift
+        // firstScanAfterBreak1: earliest segment start at or after break1End
+        const break1End = breakWindows.break1.breakEnd;
+
+        let firstScan = null;
+        let lastScan  = null;
+        let firstScanAfterBreak1 = null;
+
         segments.forEach(seg => {
-            if (seg.start && (!firstActivity || seg.start < firstActivity)) firstActivity = seg.start;
-            if (seg.end && (!lastActivity || seg.end > lastActivity)) lastActivity = seg.end;
+            if (seg.start) {
+                if (!firstScan || seg.start < firstScan) firstScan = seg.start;
+                if (!lastScan  || seg.end   > lastScan)  lastScan  = seg.end;
+                // First scan at or after the scheduled break 1 end time
+                if (seg.start >= break1End) {
+                    if (!firstScanAfterBreak1 || seg.start < firstScanAfterBreak1) {
+                        firstScanAfterBreak1 = seg.start;
+                    }
+                }
+            }
         });
 
-        // Clock punches (when available) give a more accurate first/last reference.
-        const clockIn = ppa && ppa.clockIn ? ppa.clockIn : null;
-        const clockOut = ppa && ppa.clockOut ? ppa.clockOut : null;
+        // Keep firstActivity/lastActivity names for internal Fast/Strong Finish use
+        const firstActivity = firstScan;
+        const lastActivity  = lastScan;
+
+        // ── Phase awareness ────────────────────────────────────────────
+        // Only flag metrics for phases that have actually happened yet.
+        const phases = getActivePhases();
 
         // Missed Fast Start = first activity begins more than 15 min after the
         // reference start. Prefer real clock-in; fall back to configured shift start.
         const FAST_START_TOLERANCE_MS = 15 * 60000;
         const fastRef = clockIn || shiftDates.startDate;
-        const missedFastStart = !!firstActivity &&
+        const missedFastStart = phases.fastStart && !!firstActivity &&
             (firstActivity.getTime() - fastRef.getTime()) > FAST_START_TOLERANCE_MS;
 
         // Missed Strong Finish = last activity ends before the reference end.
         // Prefer real clock-out; fall back to configured shift end.
         const strongRef = clockOut || shiftDates.endDate;
-        const missedStrongFinish = !!lastActivity &&
+        const missedStrongFinish = phases.strongFinish && !!lastActivity &&
             lastActivity.getTime() < strongRef.getTime();
 
-        const isBreakAbuse = break1Misuse || break2Misuse;
+        // Break abuse only counts if the break window has passed.
+        const isBreakAbuse = (phases.break1 && break1Misuse) || (phases.break2 && break2Misuse);
         const isIdleTime = nonBreakIdleMinutes > threshold;
 
-        // ── Behavioral Type (joined with " / ", "Normal" if none) ──
+        // ── Behavioral Type (only include phases that have started) ────
         const behaviors = [];
-        if (isBreakAbuse) behaviors.push('Break Abuse');
-        if (isIdleTime) behaviors.push('Idle Time');
-        if (missedFastStart) behaviors.push('Missed Fast Start');
+        if (isBreakAbuse)       behaviors.push('Break Abuse');
+        if (isIdleTime)         behaviors.push('Idle Time');
+        if (missedFastStart)    behaviors.push('Missed Fast Start');
         if (missedStrongFinish) behaviors.push('Missed Strong Finish');
         const behavioralType = behaviors.length ? behaviors.join(' / ') : 'Normal';
 
@@ -1096,10 +1156,13 @@
             lastActivity,
             clockIn,
             clockOut,
+            firstScan,
+            lastScan,
+            firstScanAfterBreak1,
             missedFastStart,
             missedStrongFinish,
             behavioralType,
-            isBreakOffender: break1Misuse || break2Misuse || nonBreakIdleMinutes > threshold
+            isBreakOffender: (phases.break1 && break1Misuse) || (phases.break2 && break2Misuse) || nonBreakIdleMinutes > threshold
         };
     }
 
@@ -2008,33 +2071,47 @@
         // Apply category + manager filters
         let filtered = getVisibleRows(aaList);
 
-        // Column definitions for the reworked layout.
-        // type: 'string' -> localeCompare sort; 'number' -> numeric sort.
+        // Determine which phases are active so we can dim/hide irrelevant columns.
+        const phases = getActivePhases();
+
+        // Column definitions. type: 'string' -> localeCompare; 'number' -> numeric; 'time' -> numeric (ms).
         const columns = [
-            { key: 'login', label: 'Login', type: 'string' },
-            { key: 'manager', label: 'Logging Manager', type: 'string' },
-            { key: 'behavioralType', label: 'Behavioral Type', type: 'string' },
-            { key: 'idleTime', label: 'Idle Time (min)', type: 'number' },
-            { key: 'location', label: 'Location', type: 'string' },
-            { key: 'idle15', label: 'Instances >15 min', type: 'number' },
-            { key: 'idle30', label: 'Instances >30 min', type: 'number' }
+            { key: 'login',                  label: 'Login',                    type: 'string' },
+            { key: 'manager',                label: 'Logging Manager',          type: 'string' },
+            { key: 'behavioralType',         label: 'Behavioral Type',          type: 'string' },
+            { key: 'idleTime',               label: 'Idle Time (min)',          type: 'number' },
+            { key: 'location',               label: 'Location',                 type: 'string' },
+            { key: 'idle15',                 label: 'Instances >15 min',        type: 'number' },
+            { key: 'idle30',                 label: 'Instances >30 min',        type: 'number' },
+            { key: 'clockIn',                label: 'Clock In',                 type: 'time',   phase: 'fastStart' },
+            { key: 'firstScan',              label: 'First Scan',               type: 'time',   phase: 'fastStart' },
+            { key: 'firstScanAfterBreak1',   label: 'First Scan After Break 1', type: 'time',   phase: 'break1' },
+            { key: 'lastScan',               label: 'Last Scan',                type: 'time',   phase: 'strongFinish' }
         ];
+
+        // Filter out columns whose phase hasn't started yet.
+        const activeColumns = columns.filter(c => !c.phase || phases[c.phase]);
 
         const colValue = (aa, key) => {
             const a = aa.analysis || {};
             switch (key) {
-                case 'login': return aa.login || '';
-                case 'manager': return aa.manager || '';
-                case 'behavioralType': return a.behavioralType || '';
-                case 'location': return aa.station || '';
-                case 'idleTime': return a.nonBreakIdleMinutes || 0;
-                case 'idle15': return a.idleTimestamps15?.length || 0;
-                case 'idle30': return a.idleTimestamps30?.length || 0;
+                case 'login':                return aa.login || '';
+                case 'manager':              return aa.manager || '';
+                case 'behavioralType':       return a.behavioralType || '';
+                case 'location':             return aa.station || '';
+                case 'idleTime':             return a.nonBreakIdleMinutes || 0;
+                case 'idle15':               return a.idleTimestamps15?.length || 0;
+                case 'idle30':               return a.idleTimestamps30?.length || 0;
+                case 'clockIn':              return a.clockIn  ? a.clockIn.getTime()  : 0;
+                case 'firstScan':            return a.firstScan ? a.firstScan.getTime() : 0;
+                case 'firstScanAfterBreak1': return a.firstScanAfterBreak1 ? a.firstScanAfterBreak1.getTime() : 0;
+                case 'lastScan':             return a.lastScan  ? a.lastScan.getTime()  : 0;
                 default: return '';
             }
         };
 
-        const sortCol = columns.find(c => c.key === currentSort.col);
+        const sortCol = activeColumns.find(c => c.key === currentSort.col)
+            || columns.find(c => c.key === currentSort.col);
         const sortType = sortCol ? sortCol.type : 'number';
 
         // Apply sort
@@ -2054,7 +2131,7 @@
         };
 
         let html = '<table class="idash-table"><thead><tr>';
-        columns.forEach(col => {
+        activeColumns.forEach(col => {
             html += `<th data-sort="${col.key}">${col.label}${arrow(col.key)}</th>`;
         });
         html += '</tr></thead><tbody>';
@@ -2066,7 +2143,7 @@
             else if (aa.isBottomJPH) rowClass = 'row-bottom-jph';
             else if (aa.isTopBreakOffender) rowClass = 'row-break-offender';
 
-            // Login cell — link to the associate's timeDetails when we have an ID.
+            // Login cell — link to timeDetails when we have a href.
             const loginText = aa.login || aa.employeeId || '\u2013';
             const loginCell = aa.timeDetailsHref
                 ? `<a href="${escapeHtml(aa.timeDetailsHref)}" target="_blank" title="${escapeHtml(aa.name || '')}">${escapeHtml(loginText)}</a>`
@@ -2075,7 +2152,7 @@
             const behavioralType = a.behavioralType || 'Normal';
             const isNormal = behavioralType === 'Normal';
 
-            // Instances >15 / >30 with hover timestamps
+            // Instances with hover timestamps
             const idle15Count = a.idleTimestamps15?.length || 0;
             const idle30Count = a.idleTimestamps30?.length || 0;
             const buildTitle = (list) => (list || []).map(t =>
@@ -2083,18 +2160,38 @@
             ).join('\n');
             const idle15Title = buildTitle(a.idleTimestamps15);
             const idle30Title = buildTitle(a.idleTimestamps30);
-            const idle15Str = idle15Count > 0 ? String(idle15Count) : '\u2713';
-            const idle30Str = idle30Count > 0 ? String(idle30Count) : '\u2713';
 
-            html += `<tr class="${rowClass}">
-                <td>${loginCell}</td>
-                <td>${escapeHtml(aa.manager || '\u2013')}</td>
-                <td style="color:${isNormal ? '#27ae60' : '#e74c3c'};font-weight:600">${escapeHtml(behavioralType)}</td>
-                <td>${(a.nonBreakIdleMinutes || 0).toFixed(1)}</td>
-                <td>${escapeHtml(aa.station || '\u2013')}</td>
-                <td title="${escapeHtml(idle15Title)}" style="color:${idle15Count > 0 ? '#e74c3c' : '#27ae60'}">${idle15Str}</td>
-                <td title="${escapeHtml(idle30Title)}" style="color:${idle30Count > 0 ? '#e74c3c' : '#27ae60'}">${idle30Str}</td>
-            </tr>`;
+            // Build cells for each active column
+            const cells = activeColumns.map(col => {
+                switch (col.key) {
+                    case 'login':
+                        return `<td>${loginCell}</td>`;
+                    case 'manager':
+                        return `<td>${escapeHtml(aa.manager || '\u2013')}</td>`;
+                    case 'behavioralType':
+                        return `<td style="color:${isNormal ? '#27ae60' : '#e74c3c'};font-weight:600">${escapeHtml(behavioralType)}</td>`;
+                    case 'idleTime':
+                        return `<td>${(a.nonBreakIdleMinutes || 0).toFixed(1)}</td>`;
+                    case 'location':
+                        return `<td>${escapeHtml(aa.station || '\u2013')}</td>`;
+                    case 'idle15':
+                        return `<td title="${escapeHtml(idle15Title)}" style="color:${idle15Count > 0 ? '#e74c3c' : '#27ae60'}">${idle15Count > 0 ? idle15Count : '\u2713'}</td>`;
+                    case 'idle30':
+                        return `<td title="${escapeHtml(idle30Title)}" style="color:${idle30Count > 0 ? '#e74c3c' : '#27ae60'}">${idle30Count > 0 ? idle30Count : '\u2713'}</td>`;
+                    case 'clockIn':
+                        return `<td>${a.clockIn ? formatTimeShort(a.clockIn) : '\u2013'}</td>`;
+                    case 'firstScan':
+                        return `<td>${a.firstScan ? formatTimeShort(a.firstScan) : '\u2013'}</td>`;
+                    case 'firstScanAfterBreak1':
+                        return `<td>${a.firstScanAfterBreak1 ? formatTimeShort(a.firstScanAfterBreak1) : '\u2013'}</td>`;
+                    case 'lastScan':
+                        return `<td>${a.lastScan ? formatTimeShort(a.lastScan) : '\u2013'}</td>`;
+                    default:
+                        return '<td>\u2013</td>';
+                }
+            }).join('');
+
+            html += `<tr class="${rowClass}">${cells}</tr>`;
         });
 
         html += '</tbody></table>';
@@ -2137,9 +2234,16 @@
             return;
         }
 
+        const phases = getActivePhases();
+
         const headers = ['Login', 'Employee ID', 'Logging Manager', 'Behavioral Type',
             'Idle Time (min)', 'Location', 'Instances >15 min', 'Instances >30 min',
             'Gaps >15m Timestamps'];
+
+        // Add timing columns only for phases that have started.
+        if (phases.fastStart) headers.push('Clock In', 'First Scan');
+        if (phases.break1)    headers.push('First Scan After Break 1');
+        if (phases.strongFinish) headers.push('Last Scan');
 
         // Export only the rows currently visible (respects category + manager filters).
         const visibleRows = getVisibleRows(scanResults);
@@ -2153,7 +2257,7 @@
             const ts15 = (a.idleTimestamps15 || []).map(t =>
                 `${formatTimeShort(t.start)}-${formatTimeShort(t.end)}(${t.duration.toFixed(0)}m)`
             ).join('; ');
-            return [
+            const row = [
                 aa.login || '',
                 aa.employeeId || '',
                 aa.manager || '',
@@ -2163,7 +2267,18 @@
                 (a.idleTimestamps15 || []).length,
                 (a.idleTimestamps30 || []).length,
                 ts15
-            ].map(v => `"${String(v).replace(/"/g, '""')}"`).join(',');
+            ];
+            if (phases.fastStart) {
+                row.push(a.clockIn   ? formatTimeShort(a.clockIn)   : '');
+                row.push(a.firstScan ? formatTimeShort(a.firstScan) : '');
+            }
+            if (phases.break1) {
+                row.push(a.firstScanAfterBreak1 ? formatTimeShort(a.firstScanAfterBreak1) : '');
+            }
+            if (phases.strongFinish) {
+                row.push(a.lastScan ? formatTimeShort(a.lastScan) : '');
+            }
+            return row.map(v => `"${String(v).replace(/"/g, '""')}"`).join(',');
         });
 
         const csv = headers.join(',') + '\n' + rows.join('\n');
