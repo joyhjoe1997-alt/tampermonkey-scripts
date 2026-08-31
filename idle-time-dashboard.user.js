@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Idle Time Dashboard
 // @namespace    http://tampermonkey.net/
-// @version      1.5
+// @version      1.6
 // @description  Standalone idle time dashboard — time-aware metrics (only flags phases that have started), new fields: Clock In, First Scan, First Scan After Break 1, Last Scan
 // @author       joyhjoe
 // @match        https://fclm-portal-dub.dub.proxy.amazon.com/*
@@ -28,7 +28,7 @@
     // SECTION 1: CONFIGURATION & DEFAULTS
     // ═══════════════════════════════════════════════════════════════
 
-    const VERSION = '1.5';
+    const VERSION = '1.6';
     const BASE_URL = location.origin; // Auto-detect: works on both fclm-portal.amazon.com and fclm-portal-dub.dub.proxy.amazon.com
 
     // ── Enrichment config (login + station lookup, ported from Track4) ──
@@ -1035,22 +1035,29 @@
             if (nonBreakPortion > 0) {
                 nonBreakIdleMinutes += nonBreakPortion;
 
-                // Track non-break idle segments exceeding thresholds
-                if (nonBreakPortion > 15) {
-                    idleTimestamps15.push({
-                        start: seg.start,
-                        end: seg.end,
-                        duration: nonBreakPortion,
-                        process: seg.process
-                    });
-                }
-                if (nonBreakPortion > 30) {
-                    idleTimestamps30.push({
-                        start: seg.start,
-                        end: seg.end,
-                        duration: nonBreakPortion,
-                        process: seg.process
-                    });
+                // For timestamp recording, only include this idle segment if it
+                // falls substantially outside BOTH break windows (break 1 & break 2).
+                // We check that the segment's non-break portion is meaningful — i.e.
+                // the idle time isn't mostly accounted for by a break window.
+                const isInsideBreak1 = overlap1 / segDuration > 0.5;
+                const isInsideBreak2 = overlap2 / segDuration > 0.5;
+                if (!isInsideBreak1 && !isInsideBreak2) {
+                    if (nonBreakPortion > 15) {
+                        idleTimestamps15.push({
+                            start: seg.start,
+                            end: seg.end,
+                            duration: nonBreakPortion,
+                            process: seg.process
+                        });
+                    }
+                    if (nonBreakPortion > 30) {
+                        idleTimestamps30.push({
+                            start: seg.start,
+                            end: seg.end,
+                            duration: nonBreakPortion,
+                            process: seg.process
+                        });
+                    }
                 }
             }
 
@@ -1084,24 +1091,33 @@
         const clockOut = ppa && ppa.clockOut ? ppa.clockOut : null;
 
         // ── New timing fields ──────────────────────────────────────────
-        // firstScan: earliest activity segment start in the whole shift
-        // lastScan:  latest  activity segment end   in the whole shift
+        // firstScan:            earliest activity segment start in the whole shift
+        // lastScan:             latest  activity segment end   in the whole shift
         // firstScanAfterBreak1: earliest segment start at or after break1End
-        const break1End = breakWindows.break1.breakEnd;
+        // lastScanBeforeBreak1: latest   segment end   at or before break1Start
+        const break1Start = breakWindows.break1.breakStart;
+        const break1End   = breakWindows.break1.breakEnd;
 
-        let firstScan = null;
-        let lastScan  = null;
-        let firstScanAfterBreak1 = null;
+        let firstScan             = null;
+        let lastScan              = null;
+        let firstScanAfterBreak1  = null;
+        let lastScanBeforeBreak1  = null;
 
         segments.forEach(seg => {
-            if (seg.start) {
-                if (!firstScan || seg.start < firstScan) firstScan = seg.start;
-                if (!lastScan  || seg.end   > lastScan)  lastScan  = seg.end;
-                // First scan at or after the scheduled break 1 end time
-                if (seg.start >= break1End) {
-                    if (!firstScanAfterBreak1 || seg.start < firstScanAfterBreak1) {
-                        firstScanAfterBreak1 = seg.start;
-                    }
+            if (!seg.start) return;
+            // Overall first/last across the whole shift
+            if (!firstScan || seg.start < firstScan) firstScan = seg.start;
+            if (!lastScan  || seg.end   > lastScan)  lastScan  = seg.end;
+            // Last scan that finishes before break 1 starts
+            if (seg.end <= break1Start) {
+                if (!lastScanBeforeBreak1 || seg.end > lastScanBeforeBreak1) {
+                    lastScanBeforeBreak1 = seg.end;
+                }
+            }
+            // First scan at or after the scheduled break 1 end time
+            if (seg.start >= break1End) {
+                if (!firstScanAfterBreak1 || seg.start < firstScanAfterBreak1) {
+                    firstScanAfterBreak1 = seg.start;
                 }
             }
         });
@@ -1158,6 +1174,7 @@
             clockOut,
             firstScan,
             lastScan,
+            lastScanBeforeBreak1,
             firstScanAfterBreak1,
             missedFastStart,
             missedStrongFinish,
@@ -2083,10 +2100,11 @@
             { key: 'location',               label: 'Location',                 type: 'string' },
             { key: 'idle15',                 label: 'Instances >15 min',        type: 'number' },
             { key: 'idle30',                 label: 'Instances >30 min',        type: 'number' },
-            { key: 'clockIn',                label: 'Clock In',                 type: 'time',   phase: 'fastStart' },
-            { key: 'firstScan',              label: 'First Scan',               type: 'time',   phase: 'fastStart' },
-            { key: 'firstScanAfterBreak1',   label: 'First Scan After Break 1', type: 'time',   phase: 'break1' },
-            { key: 'lastScan',               label: 'Last Scan',                type: 'time',   phase: 'strongFinish' }
+            { key: 'clockIn',                label: 'Clock In',                  type: 'time',   phase: 'fastStart' },
+            { key: 'firstScan',              label: 'First Scan',                type: 'time',   phase: 'fastStart' },
+            { key: 'lastScanBeforeBreak1',   label: 'Last Scan Before Break 1',  type: 'time',   phase: 'break1' },
+            { key: 'firstScanAfterBreak1',   label: 'First Scan After Break 1',  type: 'time',   phase: 'break1' },
+            { key: 'lastScan',               label: 'Last Scan',                 type: 'time',   phase: 'strongFinish' }
         ];
 
         // Filter out columns whose phase hasn't started yet.
@@ -2104,6 +2122,7 @@
                 case 'idle30':               return a.idleTimestamps30?.length || 0;
                 case 'clockIn':              return a.clockIn  ? a.clockIn.getTime()  : 0;
                 case 'firstScan':            return a.firstScan ? a.firstScan.getTime() : 0;
+                case 'lastScanBeforeBreak1': return a.lastScanBeforeBreak1 ? a.lastScanBeforeBreak1.getTime() : 0;
                 case 'firstScanAfterBreak1': return a.firstScanAfterBreak1 ? a.firstScanAfterBreak1.getTime() : 0;
                 case 'lastScan':             return a.lastScan  ? a.lastScan.getTime()  : 0;
                 default: return '';
@@ -2182,6 +2201,8 @@
                         return `<td>${a.clockIn ? formatTimeShort(a.clockIn) : '\u2013'}</td>`;
                     case 'firstScan':
                         return `<td>${a.firstScan ? formatTimeShort(a.firstScan) : '\u2013'}</td>`;
+                    case 'lastScanBeforeBreak1':
+                        return `<td>${a.lastScanBeforeBreak1 ? formatTimeShort(a.lastScanBeforeBreak1) : '\u2013'}</td>`;
                     case 'firstScanAfterBreak1':
                         return `<td>${a.firstScanAfterBreak1 ? formatTimeShort(a.firstScanAfterBreak1) : '\u2013'}</td>`;
                     case 'lastScan':
@@ -2242,7 +2263,7 @@
 
         // Add timing columns only for phases that have started.
         if (phases.fastStart) headers.push('Clock In', 'First Scan');
-        if (phases.break1)    headers.push('First Scan After Break 1');
+        if (phases.break1)    headers.push('Last Scan Before Break 1', 'First Scan After Break 1');
         if (phases.strongFinish) headers.push('Last Scan');
 
         // Export only the rows currently visible (respects category + manager filters).
@@ -2273,7 +2294,8 @@
                 row.push(a.firstScan ? formatTimeShort(a.firstScan) : '');
             }
             if (phases.break1) {
-                row.push(a.firstScanAfterBreak1 ? formatTimeShort(a.firstScanAfterBreak1) : '');
+                row.push(a.lastScanBeforeBreak1  ? formatTimeShort(a.lastScanBeforeBreak1)  : '');
+                row.push(a.firstScanAfterBreak1  ? formatTimeShort(a.firstScanAfterBreak1)  : '');
             }
             if (phases.strongFinish) {
                 row.push(a.lastScan ? formatTimeShort(a.lastScan) : '');
