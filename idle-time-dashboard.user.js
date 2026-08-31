@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Idle Time Dashboard
 // @namespace    http://tampermonkey.net/
-// @version      1.2
+// @version      1.3
 // @description  Standalone idle time dashboard for FCLM portal — idle time, break misuse, missed fast start / strong finish (via PPA clock punches), login + station enrichment, live manager filter
 // @author       joyhjoe
 // @match        https://fclm-portal-dub.dub.proxy.amazon.com/*
@@ -28,7 +28,7 @@
     // SECTION 1: CONFIGURATION & DEFAULTS
     // ═══════════════════════════════════════════════════════════════
 
-    const VERSION = '1.2';
+    const VERSION = '1.3';
     const BASE_URL = location.origin; // Auto-detect: works on both fclm-portal.amazon.com and fclm-portal-dub.dub.proxy.amazon.com
 
     // ── Enrichment config (login + station lookup, ported from Track4) ──
@@ -39,6 +39,7 @@
     const ENRICH_SCC_REGIONS = ['na', 'eu'];
 
     const DEFAULT_SETTINGS = {
+        shiftDate: '',          // '' = auto-detect from current date/time
         shiftStart: '18:15',
         shiftEnd: '04:45',
         break1Start: '22:15',
@@ -154,35 +155,58 @@
     }
 
     function getShiftDates() {
-        // Build start/end Date objects accounting for overnight shift
-        const now = new Date();
-        const hour = now.getHours();
+        // Build start/end Date objects accounting for overnight shift.
+        // If settings.shiftDate is set (YYYY-MM-DD), use that as the base date
+        // for the shift start; otherwise auto-detect from the current time.
         const shiftStart = parseTime(settings.shiftStart);
         const shiftEnd = parseTime(settings.shiftEnd);
 
         let startDate, endDate;
 
-        if (hour >= shiftStart.h) {
-            // Currently in evening portion of shift
-            startDate = new Date(now);
-            endDate = new Date(now);
-            endDate.setDate(endDate.getDate() + 1);
-        } else if (hour < shiftEnd.h + 1) {
-            // Currently in early morning portion of shift
-            startDate = new Date(now);
-            startDate.setDate(startDate.getDate() - 1);
-            endDate = new Date(now);
+        if (settings.shiftDate && /^\d{4}-\d{2}-\d{2}$/.test(settings.shiftDate)) {
+            // Explicit date override: parse as local date.
+            const [y, mo, d] = settings.shiftDate.split('-').map(Number);
+            startDate = new Date(y, mo - 1, d, shiftStart.h, shiftStart.m, 0, 0);
+            endDate = new Date(y, mo - 1, d, shiftEnd.h, shiftEnd.m, 0, 0);
+            // Overnight: end is next calendar day.
+            if (shiftEnd.h * 60 + shiftEnd.m <= shiftStart.h * 60 + shiftStart.m) {
+                endDate.setDate(endDate.getDate() + 1);
+            }
         } else {
-            // Daytime — default to upcoming night shift
-            startDate = new Date(now);
-            endDate = new Date(now);
-            endDate.setDate(endDate.getDate() + 1);
+            // Auto-detect from current time.
+            const now = new Date();
+            const hour = now.getHours();
+
+            if (hour >= shiftStart.h) {
+                startDate = new Date(now);
+                endDate = new Date(now);
+                endDate.setDate(endDate.getDate() + 1);
+            } else if (hour < shiftEnd.h + 1) {
+                startDate = new Date(now);
+                startDate.setDate(startDate.getDate() - 1);
+                endDate = new Date(now);
+            } else {
+                startDate = new Date(now);
+                endDate = new Date(now);
+                endDate.setDate(endDate.getDate() + 1);
+            }
+
+            startDate.setHours(shiftStart.h, shiftStart.m, 0, 0);
+            endDate.setHours(shiftEnd.h, shiftEnd.m, 0, 0);
         }
 
-        startDate.setHours(shiftStart.h, shiftStart.m, 0, 0);
-        endDate.setHours(shiftEnd.h, shiftEnd.m, 0, 0);
-
         return { startDate, endDate };
+    }
+
+    // Human-readable label for the active scanning window (for the UI banner).
+    function getShiftWindowLabel() {
+        const { startDate, endDate } = getShiftDates();
+        const fmtDate = d => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+        const fmtTime = d => `${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;
+        if (fmtDate(startDate) === fmtDate(endDate)) {
+            return `${fmtDate(startDate)}  ${fmtTime(startDate)} – ${fmtTime(endDate)}`;
+        }
+        return `${fmtDate(startDate)} ${fmtTime(startDate)} – ${fmtDate(endDate)} ${fmtTime(endDate)}`;
     }
 
     function formatDateForUrl(date) {
@@ -218,6 +242,53 @@
             return parts[0] + parts[1] / 60;
         }
         return 0;
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // SECTION 3A: PROCESS PAGE SCANNER
+    //   Scans the live DOM for function/process tables and returns
+    //   a list of {id, name, tableEl} objects representing each
+    //   detectable process on the current functionRollup page.
+    // ═══════════════════════════════════════════════════════════════
+
+    // Try to extract a human-readable process name from the table or its
+    // nearest heading.  Falls back to the table id.
+    function getTableProcessName(table) {
+        // Strategy 1: look for a <caption> element
+        const caption = table.querySelector('caption');
+        if (caption) return caption.textContent.trim();
+
+        // Strategy 2: look for a heading immediately before the table
+        let el = table.previousElementSibling;
+        while (el) {
+            const tag = el.tagName.toLowerCase();
+            if (/^h[1-6]$/.test(tag) || tag === 'div' || tag === 'p') {
+                const txt = el.textContent.trim();
+                if (txt.length > 0 && txt.length < 80) return txt;
+            }
+            el = el.previousElementSibling;
+        }
+
+        // Strategy 3: look for a heading inside a common parent container
+        const parent = table.closest('.function-container, .report-section, [id*="function"]') || table.parentElement;
+        if (parent) {
+            const h = parent.querySelector('h1,h2,h3,h4,h5,h6');
+            if (h) return h.textContent.trim();
+        }
+
+        // Strategy 4: derive from the table id (e.g. "functionTable-Pick-123")
+        return table.id ? table.id.replace(/^function[-_]?/i, '').replace(/[-_]/g, ' ').trim() : 'Unknown Process';
+    }
+
+    // Return detected processes from the current page.
+    // Each entry: { name, tableId, tableEl }
+    function detectPageProcesses() {
+        const tables = Array.from(document.querySelectorAll('table[id^=function]'));
+        return tables.map(table => ({
+            name: getTableProcessName(table),
+            tableId: table.id,
+            tableEl: table
+        })).filter(p => p.tableEl.querySelector('tbody tr a[href*="employeeId"]'));
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -610,8 +681,13 @@
     }
 
     // ═══════════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════
     // SECTION 4: FETCH AA LIST + JPH FROM functionRollup
     // ═══════════════════════════════════════════════════════════════
+
+    // null = scan all detected tables; Set<string> = only scan tables whose
+    // id is in the set.  Populated by the process selector panel.
+    let selectedProcessIds = null;
 
     async function fetchAAList() {
         setStatus('Fetching AA list from functionRollup...', '#3498db');
@@ -631,19 +707,29 @@
 
         const doc = new DOMParser().parseFromString(html, 'text/html');
 
-        const tables = doc.querySelectorAll('table[id^=function]');
+        let tables = Array.from(doc.querySelectorAll('table[id^=function]'));
         if (tables.length === 0) {
             throw new Error('No function tables found on functionRollup page. Check shift times and warehouse ID.');
+        }
+
+        // Filter to selected processes if a specific selection is active.
+        if (selectedProcessIds && selectedProcessIds.size > 0) {
+            tables = tables.filter(t => selectedProcessIds.has(t.id));
+            if (!tables.length) {
+                throw new Error('None of the selected processes were found on the page. Try refreshing.');
+            }
         }
 
         const aaList = [];
         const seen = new Set();
 
         tables.forEach(table => {
-            // Find JPH column index from header
+            const processLabel = getTableProcessName(table) || table.id || 'Unknown';
+            // Find JPH + manager column indices from header
             const headers = table.querySelectorAll('thead th, thead td');
             let jphColIdx = -1;
             let mgrColIdx = -1;
+            let funcColIdx = -1;
             headers.forEach((th, idx) => {
                 const text = th.textContent.trim().toLowerCase();
                 if (text === 'jph' || text === 'uph' || text.includes('jobs per hour') || text.includes('units per hour')) {
@@ -651,6 +737,9 @@
                 }
                 if (text === 'manager' || text.includes('manager') || text.includes('supervisor')) {
                     mgrColIdx = idx;
+                }
+                if (text.includes('function') || text.includes('process') || text.includes('activity')) {
+                    funcColIdx = idx;
                 }
             });
 
@@ -670,6 +759,7 @@
                 const name = link.textContent.trim();
                 let jph = 0;
                 let manager = '';
+                let functionName = processLabel;
 
                 const cells = row.querySelectorAll('td');
                 if (jphColIdx >= 0 && cells[jphColIdx]) {
@@ -678,11 +768,15 @@
                 if (mgrColIdx >= 0 && cells[mgrColIdx]) {
                     manager = cells[mgrColIdx].textContent.trim();
                 }
+                if (funcColIdx >= 0 && cells[funcColIdx]) {
+                    const fn = cells[funcColIdx].textContent.trim();
+                    if (fn) functionName = fn;
+                }
 
-                // Also try to extract from the timeDetails link for later use
+                // Build timeDetails href for direct linking
                 const timeDetailsHref = href.includes('timeDetails') ? href : null;
 
-                aaList.push({ employeeId, name, jph, manager, timeDetailsHref });
+                aaList.push({ employeeId, name, jph, manager, functionName, timeDetailsHref });
             });
         });
 
@@ -1557,6 +1651,7 @@
 
     function readSettingsFromUI() {
         settings.warehouseId = document.getElementById('idash-warehouse').value.trim() || 'EMA4';
+        settings.shiftDate = document.getElementById('idash-shift-date').value || '';
         settings.shiftStart = document.getElementById('idash-shift-start').value.trim() || '18:15';
         settings.shiftEnd = document.getElementById('idash-shift-end').value.trim() || '04:45';
         settings.break1Start = document.getElementById('idash-break1-start').value.trim() || '22:15';
@@ -1573,6 +1668,7 @@
     function populateSettingsUI() {
         const el = id => document.getElementById(id);
         if (el('idash-warehouse')) el('idash-warehouse').value = settings.warehouseId;
+        if (el('idash-shift-date')) el('idash-shift-date').value = settings.shiftDate || '';
         if (el('idash-shift-start')) el('idash-shift-start').value = settings.shiftStart;
         if (el('idash-shift-end')) el('idash-shift-end').value = settings.shiftEnd;
         if (el('idash-break1-start')) el('idash-break1-start').value = settings.break1Start;
