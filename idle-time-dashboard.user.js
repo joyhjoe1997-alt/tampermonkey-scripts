@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Idle Time Dashboard
 // @namespace    http://tampermonkey.net/
-// @version      1.3
-// @description  Standalone idle time dashboard for FCLM portal — idle time, break misuse, missed fast start / strong finish (via PPA clock punches), login + station enrichment, live manager filter
+// @version      1.4
+// @description  Standalone idle time dashboard for FCLM portal — idle time, break misuse, missed fast start / strong finish (PPA clock punches), login + station enrichment, live manager filter. Bug fixes: null-safe DOM reads, HTTP status checks, minute-accurate shift detection.
 // @author       joyhjoe
 // @match        https://fclm-portal-dub.dub.proxy.amazon.com/*
 // @match        https://fclm-portal.amazon.com/*
@@ -28,7 +28,7 @@
     // SECTION 1: CONFIGURATION & DEFAULTS
     // ═══════════════════════════════════════════════════════════════
 
-    const VERSION = '1.3';
+    const VERSION = '1.4';
     const BASE_URL = location.origin; // Auto-detect: works on both fclm-portal.amazon.com and fclm-portal-dub.dub.proxy.amazon.com
 
     // ── Enrichment config (login + station lookup, ported from Track4) ──
@@ -101,8 +101,17 @@
                     'Cache-Control': 'no-cache'
                 },
                 timeout: timeout,
-                onload(r) { resolve(r.responseText); },
-                onerror(e) { reject(new Error('Network error: ' + (e.statusText || 'unknown'))); },
+                onload(r) {
+                    if (r.status >= 200 && r.status < 300) {
+                        resolve(r.responseText);
+                    } else if (r.status === 0) {
+                        // Status 0 in GM context means success with no explicit code (common for same-origin)
+                        resolve(r.responseText);
+                    } else {
+                        reject(new Error(`HTTP ${r.status} for ${url}`));
+                    }
+                },
+                onerror(e) { reject(new Error('Network error: ' + (e.error || e.statusText || 'connection failed'))); },
                 ontimeout() { reject(new Error('Request timed out')); }
             });
         });
@@ -133,9 +142,10 @@
     }
 
     function parseTime(timeStr) {
-        // Parse "HH:MM" to {h, m} object
+        // Parse "HH:MM" to {h, m} object — safe fallback if value is missing
+        if (!timeStr || typeof timeStr !== 'string' || !timeStr.includes(':')) return { h: 0, m: 0 };
         const [h, m] = timeStr.split(':').map(Number);
-        return { h, m };
+        return { h: isNaN(h) ? 0 : h, m: isNaN(m) ? 0 : m };
     }
 
     function timeToMinutes(timeStr) {
@@ -173,21 +183,26 @@
                 endDate.setDate(endDate.getDate() + 1);
             }
         } else {
-            // Auto-detect from current time.
-            const now = new Date();
-            const hour = now.getHours();
+            // Auto-detect from current time using minute-accurate comparison.
+            const now  = new Date();
+            const nowMinutes = now.getHours() * 60 + now.getMinutes();
+            const startMinutes = shiftStart.h * 60 + shiftStart.m;
+            const endMinutes   = shiftEnd.h   * 60 + shiftEnd.m;
 
-            if (hour >= shiftStart.h) {
+            if (nowMinutes >= startMinutes) {
+                // We're in the evening portion of the shift (or between shifts daytime)
                 startDate = new Date(now);
-                endDate = new Date(now);
+                endDate   = new Date(now);
                 endDate.setDate(endDate.getDate() + 1);
-            } else if (hour < shiftEnd.h + 1) {
+            } else if (endMinutes > nowMinutes) {
+                // We're in the early-morning portion (after midnight, before shift end)
                 startDate = new Date(now);
                 startDate.setDate(startDate.getDate() - 1);
-                endDate = new Date(now);
+                endDate   = new Date(now);
             } else {
+                // Between shift end and shift start — default to upcoming night shift
                 startDate = new Date(now);
-                endDate = new Date(now);
+                endDate   = new Date(now);
                 endDate.setDate(endDate.getDate() + 1);
             }
 
@@ -702,7 +717,7 @@
             const startStr = encodeURIComponent(formatDateForUrl(startDate));
             const endStr = encodeURIComponent(formatDateForUrl(endDate));
             const url = `${BASE_URL}/reports/functionRollup?warehouseId=${settings.warehouseId}&spanType=Intraday&startTime=${startStr}&endTime=${endStr}`;
-            html = await gmFetch(url, 15000);
+            html = await gmFetch(url, 45000);
         }
 
         const doc = new DOMParser().parseFromString(html, 'text/html');
@@ -1622,8 +1637,14 @@
         // Start scan
         document.getElementById('idash-start-btn').onclick = () => {
             if (isScanning) return;
-            readSettingsFromUI();
-            saveSettings();
+            try {
+                readSettingsFromUI();
+                saveSettings();
+            } catch (e) {
+                console.error('[IdleDash] Error reading settings:', e);
+                setStatus('Settings error: ' + e.message, '#e74c3c');
+                return;
+            }
             runPipeline();
         };
 
@@ -1653,19 +1674,24 @@
     }
 
     function readSettingsFromUI() {
-        settings.warehouseId = document.getElementById('idash-warehouse').value.trim() || 'EMA4';
-        settings.shiftDate = (document.getElementById('idash-shift-date') || {}).value || '';
-        settings.shiftStart = document.getElementById('idash-shift-start').value.trim() || '18:15';
-        settings.shiftEnd = document.getElementById('idash-shift-end').value.trim() || '04:45';
-        settings.break1Start = document.getElementById('idash-break1-start').value.trim() || '22:15';
-        settings.break1End = document.getElementById('idash-break1-end').value.trim() || '22:45';
-        settings.break2Start = document.getElementById('idash-break2-start').value.trim() || '02:15';
-        settings.break2End = document.getElementById('idash-break2-end').value.trim() || '02:45';
-        settings.bufferMinutes = parseInt(document.getElementById('idash-buffer').value) || 3;
-        settings.breakMisuseThreshold = parseInt(document.getElementById('idash-threshold').value) || 15;
-        settings.percentileThreshold = parseInt(document.getElementById('idash-percentile').value) || 8;
-        settings.concurrencyLimit = parseInt(document.getElementById('idash-concurrency').value) || 10;
-        settings.shiftPreset = document.getElementById('idash-preset').value;
+        // Helper: safely read a value from an element — returns fallback if element is null
+        const val = (id, fallback = '') => {
+            const el = document.getElementById(id);
+            return el ? el.value : fallback;
+        };
+        settings.warehouseId          = val('idash-warehouse', 'EMA4').trim() || 'EMA4';
+        settings.shiftDate            = val('idash-shift-date', '');
+        settings.shiftStart           = val('idash-shift-start', '18:15').trim() || '18:15';
+        settings.shiftEnd             = val('idash-shift-end', '04:45').trim() || '04:45';
+        settings.break1Start          = val('idash-break1-start', '22:15').trim() || '22:15';
+        settings.break1End            = val('idash-break1-end', '22:45').trim() || '22:45';
+        settings.break2Start          = val('idash-break2-start', '02:15').trim() || '02:15';
+        settings.break2End            = val('idash-break2-end', '02:45').trim() || '02:45';
+        settings.bufferMinutes        = parseInt(val('idash-buffer', '3'))        || 3;
+        settings.breakMisuseThreshold = parseInt(val('idash-threshold', '15'))    || 15;
+        settings.percentileThreshold  = parseInt(val('idash-percentile', '8'))    || 8;
+        settings.concurrencyLimit     = parseInt(val('idash-concurrency', '10'))  || 10;
+        settings.shiftPreset          = val('idash-preset', 'night');
     }
 
     function populateSettingsUI() {
@@ -1724,17 +1750,20 @@
         if (isScanning) return;
         isScanning = true;
 
-        const startBtn = document.getElementById('idash-start-btn');
-        const stopBtn = document.getElementById('idash-stop-btn');
+        const startBtn  = document.getElementById('idash-start-btn');
+        const stopBtn   = document.getElementById('idash-stop-btn');
         const exportBtn = document.getElementById('idash-export-btn');
-        startBtn.disabled = true;
-        stopBtn.disabled = false;
-        exportBtn.disabled = true;
-        resetProgress();
-
-        document.getElementById('idash-results').style.display = 'none';
 
         try {
+            // Safely update button states INSIDE the try block so isScanning
+            // is always reset in finally even if DOM elements are missing.
+            if (startBtn)  startBtn.disabled  = true;
+            if (stopBtn)   stopBtn.disabled   = false;
+            if (exportBtn) exportBtn.disabled = true;
+            resetProgress();
+
+            const resultsDiv = document.getElementById('idash-results');
+            if (resultsDiv) resultsDiv.style.display = 'none';
             // Step 1: Fetch AA list
             const aaList = await fetchAAList();
             if (!isScanning) return;
@@ -1799,15 +1828,15 @@
             renderResults(aaList, thresholds);
 
             setStatus(`Scan complete — ${aaList.length} associates analyzed`, '#27ae60');
-            exportBtn.disabled = false;
+            if (exportBtn) exportBtn.disabled = false;
 
         } catch (error) {
             console.error('[IdleDash] Pipeline error:', error);
-            setStatus('Error: ' + error.message, '#e74c3c');
+            setStatus('Error: ' + (error && error.message ? error.message : String(error)), '#e74c3c');
         } finally {
             isScanning = false;
-            startBtn.disabled = false;
-            stopBtn.disabled = true;
+            if (startBtn)  startBtn.disabled  = false;
+            if (stopBtn)   stopBtn.disabled   = true;
         }
     }
 
