@@ -1494,6 +1494,9 @@
                                     <option value="custom">Custom</option>
                                 </select>
                             </label>
+                            <label>Shift Date (leave blank = today)
+                                <input id="idash-shift-date" type="date" value="${settings.shiftDate || ''}">
+                            </label>
                             <label>Warehouse ID
                                 <input id="idash-warehouse" type="text" value="${settings.warehouseId}">
                             </label>
@@ -1651,7 +1654,7 @@
 
     function readSettingsFromUI() {
         settings.warehouseId = document.getElementById('idash-warehouse').value.trim() || 'EMA4';
-        settings.shiftDate = document.getElementById('idash-shift-date').value || '';
+        settings.shiftDate = (document.getElementById('idash-shift-date') || {}).value || '';
         settings.shiftStart = document.getElementById('idash-shift-start').value.trim() || '18:15';
         settings.shiftEnd = document.getElementById('idash-shift-end').value.trim() || '04:45';
         settings.break1Start = document.getElementById('idash-break1-start').value.trim() || '22:15';
