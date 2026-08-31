@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Idle Time Dashboard
 // @namespace    http://tampermonkey.net/
-// @version      1.8
+// @version      1.9
 // @description  Standalone idle time dashboard — time-aware metrics (only flags phases that have started), new fields: Clock In, First Scan, First Scan After Break 1, Last Scan
 // @author       joyhjoe
 // @match        https://fclm-portal-dub.dub.proxy.amazon.com/*
@@ -28,7 +28,7 @@
     // SECTION 1: CONFIGURATION & DEFAULTS
     // ═══════════════════════════════════════════════════════════════
 
-    const VERSION = '1.8';
+    const VERSION = '1.9';
     const BASE_URL = location.origin; // Auto-detect: works on both fclm-portal.amazon.com and fclm-portal-dub.dub.proxy.amazon.com
 
     // ── Enrichment config (login + station lookup, ported from Track4) ──
@@ -1098,10 +1098,15 @@
         const clockOut = ppa && ppa.clockOut ? ppa.clockOut : null;
 
         // ── New timing fields ──────────────────────────────────────────
-        // firstScan:            earliest activity segment start in the whole shift
-        // lastScan:             latest  activity segment end   in the whole shift
-        // firstScanAfterBreak1: earliest segment start at or after break1End
-        // lastScanBeforeBreak1: latest   segment end   at or before break1Start
+        // KEY INSIGHT: idle segments (gaps) tell us when scanning STOPPED and RESUMED:
+        //   seg.start = when they stopped scanning (went idle)
+        //   seg.end   = when they resumed scanning (ended idle)
+        //
+        // So the correct derivations are:
+        //   firstScan             = seg.end   of earliest gap = first actual scan
+        //   lastScan              = seg.start of latest  gap = last  actual scan
+        //   lastScanBeforeBreak1  = seg.start of latest  gap ending before break1Start
+        //   firstScanAfterBreak1  = seg.end   of earliest gap starting at/after break1End
         const break1Start = breakWindows.break1.breakStart;
         const break1End   = breakWindows.break1.breakEnd;
 
@@ -1112,19 +1117,20 @@
 
         segments.forEach(seg => {
             if (!seg.start) return;
-            // Overall first/last across the whole shift
-            if (!firstScan || seg.start < firstScan) firstScan = seg.start;
-            if (!lastScan  || seg.end   > lastScan)  lastScan  = seg.end;
-            // Last scan that finishes before break 1 starts
+            // firstScan = end of earliest idle gap = moment they first scanned
+            if (!firstScan || seg.end < firstScan) firstScan = seg.end;
+            // lastScan  = start of latest idle gap = moment they last scanned
+            if (!lastScan  || seg.start > lastScan) lastScan  = seg.start;
+            // Last scan before break: seg.start of latest gap whose end is before break starts
             if (seg.end <= break1Start) {
-                if (!lastScanBeforeBreak1 || seg.end > lastScanBeforeBreak1) {
-                    lastScanBeforeBreak1 = seg.end;
+                if (!lastScanBeforeBreak1 || seg.start > lastScanBeforeBreak1) {
+                    lastScanBeforeBreak1 = seg.start;
                 }
             }
-            // First scan at or after the scheduled break 1 end time
+            // First scan after break: seg.end of earliest gap whose start is at/after break end
             if (seg.start >= break1End) {
-                if (!firstScanAfterBreak1 || seg.start < firstScanAfterBreak1) {
-                    firstScanAfterBreak1 = seg.start;
+                if (!firstScanAfterBreak1 || seg.end < firstScanAfterBreak1) {
+                    firstScanAfterBreak1 = seg.end;
                 }
             }
         });
