@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Idle Time Dashboard
 // @namespace    http://tampermonkey.net/
-// @version      1.6
+// @version      1.7
 // @description  Standalone idle time dashboard — time-aware metrics (only flags phases that have started), new fields: Clock In, First Scan, First Scan After Break 1, Last Scan
 // @author       joyhjoe
 // @match        https://fclm-portal-dub.dub.proxy.amazon.com/*
@@ -28,7 +28,7 @@
     // SECTION 1: CONFIGURATION & DEFAULTS
     // ═══════════════════════════════════════════════════════════════
 
-    const VERSION = '1.6';
+    const VERSION = '1.7';
     const BASE_URL = location.origin; // Auto-detect: works on both fclm-portal.amazon.com and fclm-portal-dub.dub.proxy.amazon.com
 
     // ── Enrichment config (login + station lookup, ported from Track4) ──
@@ -70,15 +70,22 @@
             settings = { ...DEFAULT_SETTINGS };
         }
 
-        // Auto-detect from current URL params if on functionRollup page
-        if (location.pathname.includes('/reports/functionRollup')) {
-            const params = new URLSearchParams(location.search);
-            if (params.get('warehouseId')) settings.warehouseId = params.get('warehouseId');
-            if (params.get('startHourIntraday') && params.get('startMinuteIntraday')) {
-                settings.shiftStart = String(params.get('startHourIntraday')).padStart(2, '0') + ':' + String(params.get('startMinuteIntraday')).padStart(2, '0');
-            }
-            if (params.get('endHourIntraday') && params.get('endMinuteIntraday')) {
-                settings.shiftEnd = String(params.get('endHourIntraday')).padStart(2, '0') + ':' + String(params.get('endMinuteIntraday')).padStart(2, '0');
+        // Auto-detect from current URL params (works on any FCLM intraday page)
+        const params = new URLSearchParams(location.search);
+        if (params.get('warehouseId')) settings.warehouseId = params.get('warehouseId');
+        if (params.get('startHourIntraday') && params.get('startMinuteIntraday')) {
+            settings.shiftStart = String(params.get('startHourIntraday')).padStart(2, '0') + ':' + String(params.get('startMinuteIntraday')).padStart(2, '0');
+        }
+        if (params.get('endHourIntraday') && params.get('endMinuteIntraday')) {
+            settings.shiftEnd = String(params.get('endHourIntraday')).padStart(2, '0') + ':' + String(params.get('endMinuteIntraday')).padStart(2, '0');
+        }
+        // Parse the shift start date from the URL (format: YYYY/MM/DD or YYYY%2FMM%2FDD)
+        const rawDate = params.get('startDateIntraday');
+        if (rawDate) {
+            // URL decode and normalise separators to dash
+            const normalised = decodeURIComponent(rawDate).replace(/\//g, '-');
+            if (/^\d{4}-\d{2}-\d{2}$/.test(normalised)) {
+                settings.shiftDate = normalised;
             }
         }
     }
@@ -1469,6 +1476,14 @@
             text-transform: uppercase;
             letter-spacing: .03em;
         }
+        .idash-card-clickable {
+            cursor: pointer;
+            transition: transform .12s ease, box-shadow .12s ease;
+        }
+        .idash-card-clickable:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 20px rgba(44,62,80,.12);
+        }
         .idash-filters {
             display: flex;
             gap: 4px;
@@ -1582,15 +1597,15 @@
                 <div class="idash-section">
                     <div class="idash-section-title" id="idash-settings-toggle">\u2699 Settings <span style="font-weight:400;font-size:10px">(click to toggle)</span></div>
                     <div class="idash-collapse" id="idash-settings-content">
+                        <div id="idash-shift-date-badge" style="margin-bottom:8px;padding:5px 9px;border-radius:8px;background:linear-gradient(180deg,rgba(52,152,219,.1),rgba(52,152,219,.05));border:1px solid rgba(52,152,219,.2);font:600 11px 'Segoe UI';color:#2471a3;">
+                            📅 Shift date: <span id="idash-date-display">${settings.shiftDate ? settings.shiftDate : 'auto-detect from page URL'}</span>
+                        </div>
                         <div class="idash-settings-grid">
                             <label>Shift Preset
                                 <select id="idash-preset">
                                     <option value="night">Night (18:15–04:45)</option>
                                     <option value="custom">Custom</option>
                                 </select>
-                            </label>
-                            <label>Shift Date (leave blank = today)
-                                <input id="idash-shift-date" type="date" value="${settings.shiftDate || ''}">
                             </label>
                             <label>Warehouse ID
                                 <input id="idash-warehouse" type="text" value="${settings.warehouseId}">
@@ -1760,7 +1775,7 @@
             return el ? el.value : fallback;
         };
         settings.warehouseId          = val('idash-warehouse', 'EMA4').trim() || 'EMA4';
-        settings.shiftDate            = val('idash-shift-date', '');
+        // shiftDate is read from the FCLM page URL in loadSettings — not editable in the UI
         settings.shiftStart           = val('idash-shift-start', '18:15').trim() || '18:15';
         settings.shiftEnd             = val('idash-shift-end', '04:45').trim() || '04:45';
         settings.break1Start          = val('idash-break1-start', '22:15').trim() || '22:15';
@@ -1776,8 +1791,10 @@
 
     function populateSettingsUI() {
         const el = id => document.getElementById(id);
+        // Update the read-only shift date badge
+        const dateBadge = el('idash-date-display');
+        if (dateBadge) dateBadge.textContent = settings.shiftDate || 'auto-detect from page URL';
         if (el('idash-warehouse')) el('idash-warehouse').value = settings.warehouseId;
-        if (el('idash-shift-date')) el('idash-shift-date').value = settings.shiftDate || '';
         if (el('idash-shift-start')) el('idash-shift-start').value = settings.shiftStart;
         if (el('idash-shift-end')) el('idash-shift-end').value = settings.shiftEnd;
         if (el('idash-break1-start')) el('idash-break1-start').value = settings.break1Start;
@@ -1944,10 +1961,12 @@
     // Rows passing the active filter button (category), before manager filter.
     function applyCategoryFilter(aaList) {
         switch (currentFilter) {
-            case 'bottomJPH': return aaList.filter(a => a.isBottomJPH);
-            case 'breakOffenders': return aaList.filter(a => a.analysis && a.analysis.isBreakOffender);
-            case 'flagged': return aaList.filter(a => a.isHighlighted);
-            default: return [...aaList];
+            case 'bottomJPH':         return aaList.filter(a => a.isBottomJPH);
+            case 'breakOffenders':    return aaList.filter(a => a.analysis && a.analysis.isBreakOffender);
+            case 'missedFastStart':   return aaList.filter(a => a.analysis && a.analysis.missedFastStart);
+            case 'missedStrongFinish':return aaList.filter(a => a.analysis && a.analysis.missedStrongFinish);
+            case 'flagged':           return aaList.filter(a => a.isHighlighted);
+            default:                  return [...aaList];
         }
     }
 
@@ -1970,18 +1989,41 @@
         resultsDiv.style.display = 'block';
 
         // Summary cards
-        const avgJPH = aaList.reduce((s, a) => s + (a.jph || 0), 0) / aaList.length;
-        const flaggedCount = aaList.filter(a => a.isHighlighted).length;
+        const flaggedCount   = aaList.filter(a => a.isHighlighted).length;
         const breakOffenders = aaList.filter(a => a.analysis && a.analysis.isBreakOffender).length;
-        const missedFS = aaList.filter(a => a.analysis && a.analysis.missedFastStart).length;
-        const missedSF = aaList.filter(a => a.analysis && a.analysis.missedStrongFinish).length;
+        const missedFS       = aaList.filter(a => a.analysis && a.analysis.missedFastStart).length;
+        const missedSF       = aaList.filter(a => a.analysis && a.analysis.missedStrongFinish).length;
 
+        // Summary cards — Total AAs is display-only; the other three are
+        // clickable toggles that work like the filter buttons below.
+        const cardActive = (f) => currentFilter === f ? 'style="box-shadow:0 0 0 2px #3498db;border-color:#3498db;"' : '';
         document.getElementById('idash-summary').innerHTML = `
-            <div class="idash-summary-card"><div class="num">${aaList.length}</div><div class="label">Total AAs</div></div>
-            <div class="idash-summary-card"><div class="num" style="color:#f39c12">${breakOffenders}</div><div class="label">Break Offenders</div></div>
-            <div class="idash-summary-card"><div class="num" style="color:#8e44ad">${missedFS}</div><div class="label">Missed Fast Start</div></div>
-            <div class="idash-summary-card"><div class="num" style="color:#2980b9">${missedSF}</div><div class="label">Missed Strong Finish</div></div>
+            <div class="idash-summary-card">
+                <div class="num">${aaList.length}</div>
+                <div class="label">Total AAs</div>
+            </div>
+            <div class="idash-summary-card idash-card-clickable" data-filter="breakOffenders" ${cardActive('breakOffenders')} title="Click to filter">
+                <div class="num" style="color:#f39c12">${breakOffenders}</div>
+                <div class="label">Break Offenders</div>
+            </div>
+            <div class="idash-summary-card idash-card-clickable" data-filter="missedFastStart" ${cardActive('missedFastStart')} title="Click to filter">
+                <div class="num" style="color:#8e44ad">${missedFS}</div>
+                <div class="label">Missed Fast Start</div>
+            </div>
+            <div class="idash-summary-card idash-card-clickable" data-filter="missedStrongFinish" ${cardActive('missedStrongFinish')} title="Click to filter">
+                <div class="num" style="color:#2980b9">${missedSF}</div>
+                <div class="label">Missed Strong Finish</div>
+            </div>
         `;
+
+        // Wire card clicks — toggle: click active card to go back to All
+        document.querySelectorAll('.idash-card-clickable').forEach(card => {
+            card.onclick = () => {
+                const f = card.dataset.filter;
+                currentFilter = (currentFilter === f) ? 'all' : f;
+                renderResults(aaList, thresholds);
+            };
+        });
 
         // Category filter buttons
         document.getElementById('idash-filters').innerHTML = `
@@ -2756,6 +2798,10 @@
     // ═══════════════════════════════════════════════════════════════
 
     function init() {
+        // Don't show the dashboard on individual AA timeDetails pages —
+        // it's irrelevant there and clutters the view.
+        if (location.pathname.includes('/employee/timeDetails')) return;
+
         loadSettings();
         buildPanel();
         populateSettingsUI();
