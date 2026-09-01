@@ -1,7 +1,7 @@
-// ==UserScript==
+﻿// ==UserScript==
 // @name         Idle Time Dashboard
 // @namespace    http://tampermonkey.net/
-// @version      3.0
+// @version      3.1
 // @description  Standalone idle time dashboard — time-aware metrics (only flags phases that have started), new fields: Clock In, First Scan, First Scan After Break 1, Last Scan
 // @author       joyhjoe
 // @match        https://fclm-portal-dub.dub.proxy.amazon.com/*
@@ -28,7 +28,7 @@
     // SECTION 1: CONFIGURATION & DEFAULTS
     // ═══════════════════════════════════════════════════════════════
 
-    const VERSION = '3.0';
+    const VERSION = '3.1';
     const BASE_URL = location.origin; // Auto-detect: works on both fclm-portal.amazon.com and fclm-portal-dub.dub.proxy.amazon.com
 
     // ── Enrichment config (login + station lookup, ported from Track4) ──
@@ -1257,10 +1257,12 @@
             const sorted = acts.slice().sort((a, b) => a.start - b.start);
 
             sorted.forEach(act => {
-                // Only consider rows inside the clocked-in window
-                if (act.start < shiftStartRef || act.end > shiftEndRef) return;
+                // Only apply a lower bound (clockIn) to exclude pre-shift rows.
+                // Do NOT apply an upper bound — AAs who leave early would have
+                // post-break rows excluded if we bounded by clockOut/shiftEnd.
+                if (act.start < shiftStartRef) return;
 
-                // firstScan: earliest activity start within clocked-in window
+                // firstScan: earliest activity start at or after clock-in
                 if (!firstScan || act.start < firstScan) firstScan = act.start;
 
                 // lastScan: latest activity end within clocked-in window
@@ -1284,14 +1286,12 @@
             });
         } else {
             // Fallback when no activity rows: derive from idle segment boundaries.
-            // idle seg.end   = when scanning resumed  → use as firstScan proxy
-            // idle seg.start = when scanning stopped  → use as lastScan proxy
             segments.forEach(seg => {
                 if (!seg.start) return;
-                if (seg.end >= shiftStartRef && seg.end <= shiftEndRef) {
-                    if (!firstScan || seg.end < firstScan) firstScan = seg.end;
-                }
-                if (seg.start >= shiftStartRef && seg.start <= shiftEndRef) {
+                // Lower bound only — same rationale as acts block above
+                if (seg.end < shiftStartRef) return;
+                if (!firstScan || seg.end < firstScan) firstScan = seg.end;
+                if (seg.start >= shiftStartRef) {
                     if (!lastScan || seg.start > lastScan) lastScan = seg.start;
                 }
                 if (seg.end <= break1Start) {
