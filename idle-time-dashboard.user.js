@@ -1,7 +1,7 @@
-// ==UserScript==
+﻿// ==UserScript==
 // @name         Idle Time Dashboard
 // @namespace    http://tampermonkey.net/
-// @version      2.3
+// @version      2.4
 // @description  Standalone idle time dashboard — time-aware metrics (only flags phases that have started), new fields: Clock In, First Scan, First Scan After Break 1, Last Scan
 // @author       joyhjoe
 // @match        https://fclm-portal-dub.dub.proxy.amazon.com/*
@@ -28,7 +28,7 @@
     // SECTION 1: CONFIGURATION & DEFAULTS
     // ═══════════════════════════════════════════════════════════════
 
-    const VERSION = '2.3';
+    const VERSION = '2.4';
     const BASE_URL = location.origin; // Auto-detect: works on both fclm-portal.amazon.com and fclm-portal-dub.dub.proxy.amazon.com
 
     // ── Enrichment config (login + station lookup, ported from Track4) ──
@@ -1015,6 +1015,43 @@
     }
 
 
+    // Parses OffClock/UnPaid rows from a timeDetails page to get the AA's
+    // actual break times (which may differ from the configured break window).
+    // Returns array of { start: Date, end: Date } sorted by start time.
+    function parseBreakSegments(html) {
+        if (!html) return [];
+        const doc = new DOMParser().parseFromString(html, 'text/html');
+        const shiftDates = getShiftDates();
+        const breaks = [];
+
+        const allRows = doc.querySelectorAll('tr');
+        allRows.forEach(row => {
+            if (row.querySelector('.editable')) return;
+            if (row.classList.contains('edited')) return;
+            const cells = row.querySelectorAll('td');
+            if (cells.length < 2) return;
+            const processName = (cells[0] ? cells[0].textContent.trim() : '');
+            // Only pick up OffClock/UnPaid rows (the actual break)
+            if (!/^OffClock/i.test(processName)) return;
+            // Find timestamp cell
+            let timeCell = null;
+            for (let i = 0; i < cells.length; i++) {
+                if (cells[i].textContent.match(/\d{2}\/\d{2}-\d{2}:\d{2}:\d{2}/)) {
+                    timeCell = cells[i]; break;
+                }
+            }
+            if (!timeCell) return;
+            const timestamps = timeCell.textContent.match(/(\d{2}\/\d{2}-\d{2}:\d{2}:\d{2})/g);
+            if (!timestamps || timestamps.length < 2) return;
+            const startTime = timestampToDate(timestamps[0], shiftDates);
+            const endTime   = timestampToDate(timestamps[1], shiftDates);
+            if (!startTime || !endTime || isNaN(startTime) || isNaN(endTime)) return;
+            breaks.push({ start: startTime, end: endTime });
+        });
+
+        return breaks.sort((a, b) => a.start - b.start);
+    }
+
     // ═══════════════════════════════════════════════════════════════
     // SECTION 7: BREAK EXCLUSION + BREAK MISUSE DETECTION
     // ═══════════════════════════════════════════════════════════════
@@ -1071,7 +1108,7 @@
         return (overlapEnd - overlapStart) / 60000;
     }
 
-    function analyzeBreaks(segments, ppa, activitySegments) {
+    function analyzeBreaks(segments, ppa, activitySegments, breakSegments) {
         const breakWindows = getBreakWindows();
         const threshold = settings.breakMisuseThreshold;
         const shiftDates = getShiftDates();
@@ -1171,8 +1208,12 @@
         //   lastScan              = seg.start of latest  gap = last  actual scan
         //   lastScanBeforeBreak1  = seg.start of latest  gap ending before break1Start
         //   firstScanAfterBreak1  = seg.end   of earliest gap starting at/after break1End
-        const break1Start = breakWindows.break1.breakStart;
-        const break1End   = breakWindows.break1.breakEnd;
+        // Use the AA's actual OffClock/UnPaid row as break 1 boundaries when available.
+        // Fall back to the configured break window if no actual break row was found.
+        const actualBreaks = Array.isArray(breakSegments) ? breakSegments : [];
+        const actualBreak1 = actualBreaks.length > 0 ? actualBreaks[0] : null;
+        const break1Start = actualBreak1 ? actualBreak1.start : breakWindows.break1.breakStart;
+        const break1End   = actualBreak1 ? actualBreak1.end   : breakWindows.break1.breakEnd;
 
         let firstScan             = null;
         let lastScan              = null;
@@ -1284,6 +1325,8 @@
             lastScan,
             lastScanBeforeBreak1,
             firstScanAfterBreak1,
+            actualBreak1Start: actualBreak1 ? actualBreak1.start : null,
+            actualBreak1End:   actualBreak1 ? actualBreak1.end   : null,
             missedFastStart,
             missedStrongFinish,
             behavioralType,
@@ -1954,9 +1997,11 @@
                 if (result && result.html) {
                     aa.segments = parseIdleSegments(result.html);
                     aa.activitySegments = parseActivitySegments(result.html);
+                    aa.breakSegments = parseBreakSegments(result.html);
                 } else {
                     aa.segments = [];
                     aa.activitySegments = [];
+                    aa.breakSegments = [];
                 }
             });
             if (!isScanning) return;
@@ -1976,7 +2021,7 @@
             setStatus('Analyzing break patterns...', '#e67e22');
             aaList.forEach(aa => {
                 const ppa = ppaMap.get(String(aa.employeeId)) || null;
-                aa.analysis = analyzeBreaks(aa.segments, ppa, aa.activitySegments || []);
+                aa.analysis = analyzeBreaks(aa.segments, ppa, aa.activitySegments || [], aa.breakSegments || []);
             });
             if (!isScanning) return;
 
@@ -2224,6 +2269,7 @@
             { key: 'idle30',                 label: 'Instances >30 min',        type: 'number' },
             { key: 'clockIn',                label: 'Clock In',                  type: 'time',   phase: 'fastStart' },
             { key: 'firstScan',              label: 'First Scan',                type: 'time',   phase: 'fastStart' },
+            { key: 'break1Time',             label: 'Break 1',                   type: 'string', phase: 'break1' },
             { key: 'lastScanBeforeBreak1',   label: 'Last Scan Before Break 1',  type: 'time',   phase: 'break1' },
             { key: 'firstScanAfterBreak1',   label: 'First Scan After Break 1',  type: 'time',   phase: 'break1' },
             { key: 'lastScan',               label: 'Last Scan',                 type: 'time',   phase: 'strongFinish' }
@@ -2242,6 +2288,7 @@
                 case 'idleTime':             return a.nonBreakIdleMinutes || 0;
                 case 'idle15':               return a.idleTimestamps15?.length || 0;
                 case 'idle30':               return a.idleTimestamps30?.length || 0;
+                case 'break1Time':           return a.actualBreak1Start ? a.actualBreak1Start.getTime() : 0;
                 case 'clockIn':              return a.clockIn  ? a.clockIn.getTime()  : 0;
                 case 'firstScan':            return a.firstScan ? a.firstScan.getTime() : 0;
                 case 'lastScanBeforeBreak1': return a.lastScanBeforeBreak1 ? a.lastScanBeforeBreak1.getTime() : 0;
@@ -2319,6 +2366,10 @@
                         return `<td title="${escapeHtml(idle15Title)}" style="color:${idle15Count > 0 ? '#e74c3c' : '#27ae60'}">${idle15Count > 0 ? idle15Count : '\u2713'}</td>`;
                     case 'idle30':
                         return `<td title="${escapeHtml(idle30Title)}" style="color:${idle30Count > 0 ? '#e74c3c' : '#27ae60'}">${idle30Count > 0 ? idle30Count : '\u2713'}</td>`;
+                    case 'break1Time':
+                        return a.actualBreak1Start && a.actualBreak1End
+                            ? `<td style="color:#e67e22;font-weight:600">${formatTimeShort(a.actualBreak1Start)}\u2013${formatTimeShort(a.actualBreak1End)}</td>`
+                            : `<td>\u2013</td>`;
                     case 'clockIn':
                         return `<td>${a.clockIn ? formatTimeShort(a.clockIn) : '\u2013'}</td>`;
                     case 'firstScan':
@@ -2385,7 +2436,7 @@
 
         // Add timing columns only for phases that have started.
         if (phases.fastStart) headers.push('Clock In', 'First Scan');
-        if (phases.break1)    headers.push('Last Scan Before Break 1', 'First Scan After Break 1');
+        if (phases.break1)    headers.push('Break 1', 'Last Scan Before Break 1', 'First Scan After Break 1');
         if (phases.strongFinish) headers.push('Last Scan');
 
         // Export only the rows currently visible (respects category + manager filters).
@@ -2416,6 +2467,9 @@
                 row.push(a.firstScan ? formatTimeShort(a.firstScan) : '');
             }
             if (phases.break1) {
+                row.push(a.actualBreak1Start && a.actualBreak1End
+                    ? `${formatTimeShort(a.actualBreak1Start)}-${formatTimeShort(a.actualBreak1End)}`
+                    : '');
                 row.push(a.lastScanBeforeBreak1  ? formatTimeShort(a.lastScanBeforeBreak1)  : '');
                 row.push(a.firstScanAfterBreak1  ? formatTimeShort(a.firstScanAfterBreak1)  : '');
             }
