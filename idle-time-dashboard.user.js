@@ -1,4 +1,4 @@
-// ==UserScript==
+﻿// ==UserScript==
 // @name         Idle Time Dashboard
 // @namespace    http://tampermonkey.net/
 // @version      2.1
@@ -1186,11 +1186,12 @@
             : null;
 
         if (acts) {
-            // Last activity row whose start is before break1Start
+            // Last scan before break = END of the last activity row that started before break1Start
+            // (act.end = the moment they submitted their last scan before going on break)
             acts.forEach(act => {
                 if (act.start < break1Start) {
-                    if (!lastScanBeforeBreak1 || act.start > lastScanBeforeBreak1) {
-                        lastScanBeforeBreak1 = act.start;
+                    if (!lastScanBeforeBreak1 || act.end > lastScanBeforeBreak1) {
+                        lastScanBeforeBreak1 = act.end;
                     }
                 }
             });
