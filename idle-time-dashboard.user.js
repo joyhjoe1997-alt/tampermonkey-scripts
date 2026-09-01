@@ -1,7 +1,7 @@
-﻿// ==UserScript==
+// ==UserScript==
 // @name         Idle Time Dashboard
 // @namespace    http://tampermonkey.net/
-// @version      2.8
+// @version      2.9
 // @description  Standalone idle time dashboard — time-aware metrics (only flags phases that have started), new fields: Clock In, First Scan, First Scan After Break 1, Last Scan
 // @author       joyhjoe
 // @match        https://fclm-portal-dub.dub.proxy.amazon.com/*
@@ -28,7 +28,7 @@
     // SECTION 1: CONFIGURATION & DEFAULTS
     // ═══════════════════════════════════════════════════════════════
 
-    const VERSION = '2.8';
+    const VERSION = '2.9';
     const BASE_URL = location.origin; // Auto-detect: works on both fclm-portal.amazon.com and fclm-portal-dub.dub.proxy.amazon.com
 
     // ── Enrichment config (login + station lookup, ported from Track4) ──
@@ -1217,56 +1217,65 @@
         const clockIn  = ppa && ppa.clockIn  ? ppa.clockIn  : null;
         const clockOut = ppa && ppa.clockOut ? ppa.clockOut : null;
 
-        // ── New timing fields ──────────────────────────────────────────
-        // KEY INSIGHT: idle segments (gaps) tell us when scanning STOPPED and RESUMED:
-        //   seg.start = when they stopped scanning (went idle)
-        //   seg.end   = when they resumed scanning (ended idle)
-        //
-        // So the correct derivations are:
-        //   firstScan             = seg.end   of earliest gap = first actual scan
-        //   lastScan              = seg.start of latest  gap = last  actual scan
-        //   lastScanBeforeBreak1  = seg.start of latest  gap ending before break1Start
-        //   firstScanAfterBreak1  = seg.end   of earliest gap starting at/after break1End
-        // Use the AA's actual OffClock/UnPaid row as break 1 boundaries when available.
-        // Fall back to the configured break window if no actual break row was found.
+        // ── Actual break boundaries ────────────────────────────────────
+        // Use the AA's detected OffClock/UnPaid row as break 1.
+        // Fall back to configured break window if none found.
         const actualBreaks = Array.isArray(breakSegments) ? breakSegments : [];
         const actualBreak1 = actualBreaks.length > 0 ? actualBreaks[0] : null;
         const break1Start = actualBreak1 ? actualBreak1.start : breakWindows.break1.breakStart;
         const break1End   = actualBreak1 ? actualBreak1.end   : breakWindows.break1.breakEnd;
+
+        // ── Timing fields ──────────────────────────────────────────────
+        // All scan times are derived directly from activitySegments (the real
+        // non-editable on-task rows from the timeDetails page). These are the
+        // actual task rows — no inference from idle gaps needed.
+        //
+        // Rules:
+        //   firstScan            = start of the FIRST activity row that is within
+        //                          the clocked-in window (>= clockIn if available)
+        //   lastScan             = end   of the LAST  activity row that is within
+        //                          the clocked-in window (<= clockOut if available)
+        //   lastScanBeforeBreak1 = end   of the LAST  activity row whose end is
+        //                          at or before break1Start
+        //   firstScanAfterBreak1 = start of the FIRST activity row whose start is
+        //                          at or after break1End
 
         let firstScan             = null;
         let lastScan              = null;
         let firstScanAfterBreak1  = null;
         let lastScanBeforeBreak1  = null;
 
-        // firstScan / lastScan: derived from idle gap boundaries (seg.end = resumed scanning,
-        // seg.start = stopped scanning) — already correct from v1.9 fix.
-        segments.forEach(seg => {
-            if (!seg.start) return;
-            if (!firstScan || seg.end < firstScan) firstScan = seg.end;
-            if (!lastScan  || seg.start > lastScan) lastScan  = seg.start;
-        });
+        const acts = Array.isArray(activitySegments) ? activitySegments : [];
 
-        // lastScanBeforeBreak1 / firstScanAfterBreak1: use actual ACTIVITY rows (non-editable
-        // on-task rows) when available — these are the real scan events, not idle gaps.
-        // Fall back to idle-segment derivation if no activity rows are available.
-        const acts = Array.isArray(activitySegments) && activitySegments.length
-            ? activitySegments
-            : null;
+        // Effective shift boundaries: prefer real clock punches, fall back to
+        // configured shift window.
+        const shiftStartRef = clockIn  || shiftDates.startDate;
+        const shiftEndRef   = clockOut || shiftDates.endDate;
 
-        if (acts) {
-            // Last scan before break = END of the last activity row that finished
-            // at or before break1Start. Using act.end <= break1Start ensures we catch
-            // tasks that end exactly when break begins (e.g. task ends 22:15, break starts 22:15).
-            acts.forEach(act => {
+        if (acts.length > 0) {
+            // Sort activity rows by start time for predictable iteration
+            const sorted = acts.slice().sort((a, b) => a.start - b.start);
+
+            sorted.forEach(act => {
+                // Only consider rows inside the clocked-in window
+                if (act.start < shiftStartRef || act.end > shiftEndRef) return;
+
+                // firstScan: earliest activity start within clocked-in window
+                if (!firstScan || act.start < firstScan) firstScan = act.start;
+
+                // lastScan: latest activity end within clocked-in window
+                if (!lastScan || act.end > lastScan) lastScan = act.end;
+
+                // lastScanBeforeBreak1: end of last activity that finishes
+                // at or before break start
                 if (act.end <= break1Start) {
                     if (!lastScanBeforeBreak1 || act.end > lastScanBeforeBreak1) {
                         lastScanBeforeBreak1 = act.end;
                     }
                 }
-            });
-            // First activity row whose start is at or after break1End
-            acts.forEach(act => {
+
+                // firstScanAfterBreak1: start of first activity that begins
+                // at or after break end
                 if (act.start >= break1End) {
                     if (!firstScanAfterBreak1 || act.start < firstScanAfterBreak1) {
                         firstScanAfterBreak1 = act.start;
@@ -1274,20 +1283,29 @@
                 }
             });
         } else {
-            // Fallback: use idle segment boundaries
+            // Fallback when no activity rows: derive from idle segment boundaries.
+            // idle seg.end   = when scanning resumed  → use as firstScan proxy
+            // idle seg.start = when scanning stopped  → use as lastScan proxy
             segments.forEach(seg => {
                 if (!seg.start) return;
+                if (seg.end >= shiftStartRef && seg.end <= shiftEndRef) {
+                    if (!firstScan || seg.end < firstScan) firstScan = seg.end;
+                }
+                if (seg.start >= shiftStartRef && seg.start <= shiftEndRef) {
+                    if (!lastScan || seg.start > lastScan) lastScan = seg.start;
+                }
                 if (seg.end <= break1Start) {
-                    if (!lastScanBeforeBreak1 || seg.start > lastScanBeforeBreak1) {
-                        lastScanBeforeBreak1 = seg.start;
+                    if (!lastScanBeforeBreak1 || seg.end > lastScanBeforeBreak1) {
+                        lastScanBeforeBreak1 = seg.end;
                     }
                 }
                 if (seg.start >= break1End) {
-                    if (!firstScanAfterBreak1 || seg.end < firstScanAfterBreak1) {
-                        firstScanAfterBreak1 = seg.end;
+                    if (!firstScanAfterBreak1 || seg.start < firstScanAfterBreak1) {
+                        firstScanAfterBreak1 = seg.start;
                     }
                 }
             });
+        }
         }
 
         // Keep firstActivity/lastActivity names for internal Fast/Strong Finish use
