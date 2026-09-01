@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Idle Time Dashboard
 // @namespace    http://tampermonkey.net/
-// @version      1.9
+// @version      2.0
 // @description  Standalone idle time dashboard — time-aware metrics (only flags phases that have started), new fields: Clock In, First Scan, First Scan After Break 1, Last Scan
 // @author       joyhjoe
 // @match        https://fclm-portal-dub.dub.proxy.amazon.com/*
@@ -28,7 +28,7 @@
     // SECTION 1: CONFIGURATION & DEFAULTS
     // ═══════════════════════════════════════════════════════════════
 
-    const VERSION = '1.9';
+    const VERSION = '2.0';
     const BASE_URL = location.origin; // Auto-detect: works on both fclm-portal.amazon.com and fclm-portal-dub.dub.proxy.amazon.com
 
     // ── Enrichment config (login + station lookup, ported from Track4) ──
@@ -2776,15 +2776,17 @@
     // ═══════════════════════════════════════════════════════════════
 
     function init() {
-        // Don't show the dashboard on individual AA timeDetails pages —
+        // Night shift quick-fill button appears on ALL matched FCLM pages,
+        // including individual AA timeDetails pages.
+        try { createNightShiftButton(); } catch (e) { console.error('[IdleDash] night shift btn error:', e); }
+
+        // Don't show the full dashboard panel on individual AA timeDetails pages —
         // it's irrelevant there and clutters the view.
         if (location.pathname.includes('/employee/timeDetails')) return;
 
         loadSettings();
         buildPanel();
         populateSettingsUI();
-        // Night shift quick-fill button on all matched FCLM pages
-        try { createNightShiftButton(); } catch (e) { console.error('[IdleDash] night shift btn error:', e); }
         // Auto-populate the FCLM table with idle-time columns on the functionRollup page
         try { runInPageEnhancement(); } catch (e) { console.error('[IdleDash] enhancement error:', e); }
         console.log('[IdleDash] Idle Time Dashboard v' + VERSION + ' loaded');
