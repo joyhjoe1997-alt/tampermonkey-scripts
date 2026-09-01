@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         Idle Time Dashboard
 // @namespace    http://tampermonkey.net/
-// @version      2.1
+// @version      2.2
 // @description  Standalone idle time dashboard — time-aware metrics (only flags phases that have started), new fields: Clock In, First Scan, First Scan After Break 1, Last Scan
 // @author       joyhjoe
 // @match        https://fclm-portal-dub.dub.proxy.amazon.com/*
@@ -28,7 +28,7 @@
     // SECTION 1: CONFIGURATION & DEFAULTS
     // ═══════════════════════════════════════════════════════════════
 
-    const VERSION = '2.1';
+    const VERSION = '2.2';
     const BASE_URL = location.origin; // Auto-detect: works on both fclm-portal.amazon.com and fclm-portal-dub.dub.proxy.amazon.com
 
     // ── Enrichment config (login + station lookup, ported from Track4) ──
@@ -962,20 +962,29 @@
         const shiftDates = getShiftDates();
         const activityRows = [];
 
-        // All rows in the time-detail table
+        // Patterns that identify non-task rows to SKIP:
+        // OffClock/Unpaid  = break / unpaid time
+        // OnClock/Paid     = the shift wrapper row (not a task)
+        // Empty process    = header/footer rows
+        const SKIP_PROCESS = /^(OffClock|OnClock|Off\s*Clock|On\s*Clock)/i;
+
         const allRows = doc.querySelectorAll('tr');
         allRows.forEach(row => {
             // Skip editable (idle) rows and already-edited rows
             if (row.querySelector('.editable')) return;
             if (row.classList.contains('edited')) return;
 
-            // Must have at least one timestamp in MM/DD-HH:MM:SS format
+            // Must have at least one timestamp
             const rowText = row.textContent || '';
             if (!rowText.match(/\d{2}\/\d{2}-\d{2}:\d{2}:\d{2}/)) return;
 
-            // Skip header/footer rows (no meaningful process text)
             const cells = row.querySelectorAll('td');
             if (cells.length < 2) return;
+
+            // cells[0] is the process/task name — skip clock-in/out and break rows
+            const processName = (cells[0] ? cells[0].textContent.trim() : '');
+            if (!processName) return;
+            if (SKIP_PROCESS.test(processName)) return;
 
             // Find the cell containing timestamps
             let timeCell = null;
@@ -995,10 +1004,10 @@
 
             const endTime = timestamps.length >= 2
                 ? timestampToDate(timestamps[1], shiftDates)
-                : new Date(startTime.getTime() + 60000); // fallback: 1 min
+                : new Date(startTime.getTime() + 60000);
 
             if (endTime && !isNaN(endTime)) {
-                activityRows.push({ start: startTime, end: endTime });
+                activityRows.push({ start: startTime, end: endTime, process: processName });
             }
         });
 
