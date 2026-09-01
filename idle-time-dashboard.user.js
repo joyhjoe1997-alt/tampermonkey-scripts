@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         Idle Time Dashboard
 // @namespace    http://tampermonkey.net/
-// @version      2.4
+// @version      2.5
 // @description  Standalone idle time dashboard — time-aware metrics (only flags phases that have started), new fields: Clock In, First Scan, First Scan After Break 1, Last Scan
 // @author       joyhjoe
 // @match        https://fclm-portal-dub.dub.proxy.amazon.com/*
@@ -28,7 +28,7 @@
     // SECTION 1: CONFIGURATION & DEFAULTS
     // ═══════════════════════════════════════════════════════════════
 
-    const VERSION = '2.4';
+    const VERSION = '2.5';
     const BASE_URL = location.origin; // Auto-detect: works on both fclm-portal.amazon.com and fclm-portal-dub.dub.proxy.amazon.com
 
     // ── Enrichment config (login + station lookup, ported from Track4) ──
@@ -1026,14 +1026,18 @@
 
         const allRows = doc.querySelectorAll('tr');
         allRows.forEach(row => {
-            if (row.querySelector('.editable')) return;
+            // NOTE: do NOT skip .editable rows here — OffClock/UnPaid rows can
+            // have the .editable class. Only skip already-edited rows.
             if (row.classList.contains('edited')) return;
+
             const cells = row.querySelectorAll('td');
             if (cells.length < 2) return;
             const processName = (cells[0] ? cells[0].textContent.trim() : '');
+
             // Only pick up OffClock/UnPaid rows (the actual break)
             if (!/^OffClock/i.test(processName)) return;
-            // Find timestamp cell
+
+            // Find the cell containing two timestamps
             let timeCell = null;
             for (let i = 0; i < cells.length; i++) {
                 if (cells[i].textContent.match(/\d{2}\/\d{2}-\d{2}:\d{2}:\d{2}/)) {
@@ -1041,11 +1045,14 @@
                 }
             }
             if (!timeCell) return;
+
             const timestamps = timeCell.textContent.match(/(\d{2}\/\d{2}-\d{2}:\d{2}:\d{2})/g);
             if (!timestamps || timestamps.length < 2) return;
+
             const startTime = timestampToDate(timestamps[0], shiftDates);
             const endTime   = timestampToDate(timestamps[1], shiftDates);
             if (!startTime || !endTime || isNaN(startTime) || isNaN(endTime)) return;
+
             breaks.push({ start: startTime, end: endTime });
         });
 
