@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         Idle Time Dashboard
 // @namespace    http://tampermonkey.net/
-// @version      2.5
+// @version      2.6
 // @description  Standalone idle time dashboard — time-aware metrics (only flags phases that have started), new fields: Clock In, First Scan, First Scan After Break 1, Last Scan
 // @author       joyhjoe
 // @match        https://fclm-portal-dub.dub.proxy.amazon.com/*
@@ -28,7 +28,7 @@
     // SECTION 1: CONFIGURATION & DEFAULTS
     // ═══════════════════════════════════════════════════════════════
 
-    const VERSION = '2.5';
+    const VERSION = '2.6';
     const BASE_URL = location.origin; // Auto-detect: works on both fclm-portal.amazon.com and fclm-portal-dub.dub.proxy.amazon.com
 
     // ── Enrichment config (login + station lookup, ported from Track4) ──
@@ -986,24 +986,20 @@
             if (!processName) return;
             if (SKIP_PROCESS.test(processName)) return;
 
-            // Find the cell containing timestamps
-            let timeCell = null;
-            for (let i = 0; i < cells.length; i++) {
-                if (cells[i].textContent.match(/\d{2}\/\d{2}-\d{2}:\d{2}:\d{2}/)) {
-                    timeCell = cells[i];
-                    break;
-                }
-            }
-            if (!timeCell) return;
+            // Collect timestamps from ALL cells — FCLM puts start and end in
+            // separate columns, so a single-cell search finds only one timestamp.
+            const allTs = [];
+            cells.forEach(cell => {
+                const m = cell.textContent.match(/(\d{2}\/\d{2}-\d{2}:\d{2}:\d{2})/g);
+                if (m) allTs.push(...m);
+            });
+            if (!allTs.length) return;
 
-            const timestamps = timeCell.textContent.match(/(\d{2}\/\d{2}-\d{2}:\d{2}:\d{2})/g);
-            if (!timestamps || !timestamps.length) return;
-
-            const startTime = timestampToDate(timestamps[0], shiftDates);
+            const startTime = timestampToDate(allTs[0], shiftDates);
             if (!startTime || isNaN(startTime)) return;
 
-            const endTime = timestamps.length >= 2
-                ? timestampToDate(timestamps[1], shiftDates)
+            const endTime = allTs.length >= 2
+                ? timestampToDate(allTs[1], shiftDates)
                 : new Date(startTime.getTime() + 60000);
 
             if (endTime && !isNaN(endTime)) {
@@ -1037,20 +1033,16 @@
             // Only pick up OffClock/UnPaid rows (the actual break)
             if (!/^OffClock/i.test(processName)) return;
 
-            // Find the cell containing two timestamps
-            let timeCell = null;
-            for (let i = 0; i < cells.length; i++) {
-                if (cells[i].textContent.match(/\d{2}\/\d{2}-\d{2}:\d{2}:\d{2}/)) {
-                    timeCell = cells[i]; break;
-                }
-            }
-            if (!timeCell) return;
+            // Collect timestamps from ALL cells — start and end are in separate columns.
+            const allTs = [];
+            cells.forEach(cell => {
+                const m = cell.textContent.match(/(\d{2}\/\d{2}-\d{2}:\d{2}:\d{2})/g);
+                if (m) allTs.push(...m);
+            });
+            if (allTs.length < 2) return;
 
-            const timestamps = timeCell.textContent.match(/(\d{2}\/\d{2}-\d{2}:\d{2}:\d{2})/g);
-            if (!timestamps || timestamps.length < 2) return;
-
-            const startTime = timestampToDate(timestamps[0], shiftDates);
-            const endTime   = timestampToDate(timestamps[1], shiftDates);
+            const startTime = timestampToDate(allTs[0], shiftDates);
+            const endTime   = timestampToDate(allTs[1], shiftDates);
             if (!startTime || !endTime || isNaN(startTime) || isNaN(endTime)) return;
 
             breaks.push({ start: startTime, end: endTime });
