@@ -1,7 +1,7 @@
-﻿// ==UserScript==
+// ==UserScript==
 // @name         Idle Time Dashboard
 // @namespace    http://tampermonkey.net/
-// @version      2.6
+// @version      2.7
 // @description  Standalone idle time dashboard — time-aware metrics (only flags phases that have started), new fields: Clock In, First Scan, First Scan After Break 1, Last Scan
 // @author       joyhjoe
 // @match        https://fclm-portal-dub.dub.proxy.amazon.com/*
@@ -28,7 +28,7 @@
     // SECTION 1: CONFIGURATION & DEFAULTS
     // ═══════════════════════════════════════════════════════════════
 
-    const VERSION = '2.6';
+    const VERSION = '2.7';
     const BASE_URL = location.origin; // Auto-detect: works on both fclm-portal.amazon.com and fclm-portal-dub.dub.proxy.amazon.com
 
     // ── Enrichment config (login + station lookup, ported from Track4) ──
@@ -1020,17 +1020,19 @@
         const shiftDates = getShiftDates();
         const breaks = [];
 
+        // A real break must be INSIDE the shift window and short (≤ 90 min).
+        // This filters out pre-shift idle (e.g. 332 min before clock-in) and
+        // post-shift unpaid time (e.g. 196 min after last scan).
+        const MAX_BREAK_MINUTES = 90;
+
         const allRows = doc.querySelectorAll('tr');
         allRows.forEach(row => {
-            // NOTE: do NOT skip .editable rows here — OffClock/UnPaid rows can
-            // have the .editable class. Only skip already-edited rows.
+            // Do NOT skip .editable rows — OffClock/UnPaid rows can be editable.
             if (row.classList.contains('edited')) return;
 
             const cells = row.querySelectorAll('td');
             if (cells.length < 2) return;
             const processName = (cells[0] ? cells[0].textContent.trim() : '');
-
-            // Only pick up OffClock/UnPaid rows (the actual break)
             if (!/^OffClock/i.test(processName)) return;
 
             // Collect timestamps from ALL cells — start and end are in separate columns.
@@ -1044,6 +1046,14 @@
             const startTime = timestampToDate(allTs[0], shiftDates);
             const endTime   = timestampToDate(allTs[1], shiftDates);
             if (!startTime || !endTime || isNaN(startTime) || isNaN(endTime)) return;
+
+            // Filter: must be inside the shift window
+            if (startTime < shiftDates.startDate) return;
+            if (endTime > shiftDates.endDate) return;
+
+            // Filter: must be a realistic break duration (not pre/post-shift unpaid blocks)
+            const durationMinutes = (endTime - startTime) / 60000;
+            if (durationMinutes > MAX_BREAK_MINUTES) return;
 
             breaks.push({ start: startTime, end: endTime });
         });
