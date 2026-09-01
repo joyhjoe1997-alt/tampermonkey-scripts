@@ -1,7 +1,7 @@
-// ==UserScript==
+﻿// ==UserScript==
 // @name         Idle Time Dashboard
 // @namespace    http://tampermonkey.net/
-// @version      2.7
+// @version      2.8
 // @description  Standalone idle time dashboard — time-aware metrics (only flags phases that have started), new fields: Clock In, First Scan, First Scan After Break 1, Last Scan
 // @author       joyhjoe
 // @match        https://fclm-portal-dub.dub.proxy.amazon.com/*
@@ -28,7 +28,7 @@
     // SECTION 1: CONFIGURATION & DEFAULTS
     // ═══════════════════════════════════════════════════════════════
 
-    const VERSION = '2.7';
+    const VERSION = '2.8';
     const BASE_URL = location.origin; // Auto-detect: works on both fclm-portal.amazon.com and fclm-portal-dub.dub.proxy.amazon.com
 
     // ── Enrichment config (login + station lookup, ported from Track4) ──
@@ -786,11 +786,12 @@
             const processLabel = getTableProcessName(table) || table.id || 'Unknown';
             // Find JPH + manager column indices from header
             const headers = table.querySelectorAll('thead th, thead td');
-            let jphColIdx = -1;
-            let mgrColIdx = -1;
-            let funcColIdx = -1;
+            let jphColIdx    = -1;
+            let mgrColIdx    = -1;
+            let funcColIdx   = -1;
+            let paidColIdx   = -1;
             headers.forEach((th, idx) => {
-                const text = th.textContent.trim().toLowerCase();
+                const text = th.textContent.trim().toLowerCase().replace(/[^a-z0-9\s]/g, '').trim();
                 if (text === 'jph' || text === 'uph' || text.includes('jobs per hour') || text.includes('units per hour')) {
                     jphColIdx = idx;
                 }
@@ -799,6 +800,10 @@
                 }
                 if (text.includes('function') || text.includes('process') || text.includes('activity')) {
                     funcColIdx = idx;
+                }
+                // "Total" column under Paid Hours -- matches "total" header (sort arrows stripped)
+                if (text === 'total' && paidColIdx === -1) {
+                    paidColIdx = idx;
                 }
             });
 
@@ -819,6 +824,7 @@
                 let jph = 0;
                 let manager = '';
                 let functionName = processLabel;
+                let paidHours = null;
 
                 const cells = row.querySelectorAll('td');
                 if (jphColIdx >= 0 && cells[jphColIdx]) {
@@ -831,11 +837,15 @@
                     const fn = cells[funcColIdx].textContent.trim();
                     if (fn) functionName = fn;
                 }
+                if (paidColIdx >= 0 && cells[paidColIdx]) {
+                    const v = parseFloat(cells[paidColIdx].textContent.trim());
+                    if (!isNaN(v)) paidHours = v;
+                }
 
                 // Build timeDetails href for direct linking
                 const timeDetailsHref = href.includes('timeDetails') ? href : null;
 
-                aaList.push({ employeeId, name, jph, manager, functionName, timeDetailsHref });
+                aaList.push({ employeeId, name, jph, manager, functionName, paidHours, timeDetailsHref });
             });
         });
 
@@ -2273,6 +2283,7 @@
             { key: 'manager',                label: 'Logging Manager',          type: 'string' },
             { key: 'behavioralType',         label: 'Behavioral Type',          type: 'string' },
             { key: 'idleTime',               label: 'Idle Time (min)',          type: 'number' },
+            { key: 'paidHours',              label: 'Hours Worked',             type: 'number' },
             { key: 'location',               label: 'Location',                 type: 'string' },
             { key: 'idle15',                 label: 'Instances >15 min',        type: 'number' },
             { key: 'idle30',                 label: 'Instances >30 min',        type: 'number' },
@@ -2295,6 +2306,7 @@
                 case 'behavioralType':       return a.behavioralType || '';
                 case 'location':             return aa.station || '';
                 case 'idleTime':             return a.nonBreakIdleMinutes || 0;
+                case 'paidHours':            return aa.paidHours != null ? aa.paidHours : -1;
                 case 'idle15':               return a.idleTimestamps15?.length || 0;
                 case 'idle30':               return a.idleTimestamps30?.length || 0;
                 case 'break1Time':           return a.actualBreak1Start ? a.actualBreak1Start.getTime() : 0;
@@ -2369,6 +2381,10 @@
                         return `<td style="color:${isNormal ? '#27ae60' : '#e74c3c'};font-weight:600">${escapeHtml(behavioralType)}</td>`;
                     case 'idleTime':
                         return `<td>${(a.nonBreakIdleMinutes || 0).toFixed(1)}</td>`;
+                    case 'paidHours':
+                        return aa.paidHours != null
+                            ? `<td style="font-weight:600;color:#27ae60">${aa.paidHours.toFixed(2)}</td>`
+                            : `<td>\u2013</td>`;
                     case 'location':
                         return `<td>${escapeHtml(aa.station || '\u2013')}</td>`;
                     case 'idle15':
@@ -2440,7 +2456,7 @@
         const phases = getActivePhases();
 
         const headers = ['Login', 'Employee ID', 'Logging Manager', 'Behavioral Type',
-            'Idle Time (min)', 'Location', 'Instances >15 min', 'Instances >30 min',
+            'Idle Time (min)', 'Hours Worked', 'Location', 'Instances >15 min', 'Instances >30 min',
             'Gaps >15m Timestamps'];
 
         // Add timing columns only for phases that have started.
@@ -2467,6 +2483,7 @@
                 a.behavioralType || 'Normal',
                 (a.nonBreakIdleMinutes || 0).toFixed(1),
                 aa.station || '',
+                aa.paidHours != null ? aa.paidHours.toFixed(2) : '',
                 (a.idleTimestamps15 || []).length,
                 (a.idleTimestamps30 || []).length,
                 ts15
