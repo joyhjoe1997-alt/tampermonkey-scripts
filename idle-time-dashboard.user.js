@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Idle Time Dashboard
 // @namespace    http://tampermonkey.net/
-// @version      2.0
+// @version      2.1
 // @description  Standalone idle time dashboard — time-aware metrics (only flags phases that have started), new fields: Clock In, First Scan, First Scan After Break 1, Last Scan
 // @author       joyhjoe
 // @match        https://fclm-portal-dub.dub.proxy.amazon.com/*
@@ -28,7 +28,7 @@
     // SECTION 1: CONFIGURATION & DEFAULTS
     // ═══════════════════════════════════════════════════════════════
 
-    const VERSION = '2.0';
+    const VERSION = '2.1';
     const BASE_URL = location.origin; // Auto-detect: works on both fclm-portal.amazon.com and fclm-portal-dub.dub.proxy.amazon.com
 
     // ── Enrichment config (login + station lookup, ported from Track4) ──
@@ -951,6 +951,61 @@
         return segments;
     }
 
+    // Parses the NON-EDITABLE (on-task / active) rows from a timeDetails page.
+    // These rows represent periods when the associate was actually scanning —
+    // the complement of idle segments. Used to find first/last actual scans
+    // relative to break windows.
+    // Returns array of { start: Date, end: Date } objects.
+    function parseActivitySegments(html) {
+        if (!html) return [];
+        const doc = new DOMParser().parseFromString(html, 'text/html');
+        const shiftDates = getShiftDates();
+        const activityRows = [];
+
+        // All rows in the time-detail table
+        const allRows = doc.querySelectorAll('tr');
+        allRows.forEach(row => {
+            // Skip editable (idle) rows and already-edited rows
+            if (row.querySelector('.editable')) return;
+            if (row.classList.contains('edited')) return;
+
+            // Must have at least one timestamp in MM/DD-HH:MM:SS format
+            const rowText = row.textContent || '';
+            if (!rowText.match(/\d{2}\/\d{2}-\d{2}:\d{2}:\d{2}/)) return;
+
+            // Skip header/footer rows (no meaningful process text)
+            const cells = row.querySelectorAll('td');
+            if (cells.length < 2) return;
+
+            // Find the cell containing timestamps
+            let timeCell = null;
+            for (let i = 0; i < cells.length; i++) {
+                if (cells[i].textContent.match(/\d{2}\/\d{2}-\d{2}:\d{2}:\d{2}/)) {
+                    timeCell = cells[i];
+                    break;
+                }
+            }
+            if (!timeCell) return;
+
+            const timestamps = timeCell.textContent.match(/(\d{2}\/\d{2}-\d{2}:\d{2}:\d{2})/g);
+            if (!timestamps || !timestamps.length) return;
+
+            const startTime = timestampToDate(timestamps[0], shiftDates);
+            if (!startTime || isNaN(startTime)) return;
+
+            const endTime = timestamps.length >= 2
+                ? timestampToDate(timestamps[1], shiftDates)
+                : new Date(startTime.getTime() + 60000); // fallback: 1 min
+
+            if (endTime && !isNaN(endTime)) {
+                activityRows.push({ start: startTime, end: endTime });
+            }
+        });
+
+        return activityRows;
+    }
+
+
     // ═══════════════════════════════════════════════════════════════
     // SECTION 7: BREAK EXCLUSION + BREAK MISUSE DETECTION
     // ═══════════════════════════════════════════════════════════════
@@ -1007,7 +1062,7 @@
         return (overlapEnd - overlapStart) / 60000;
     }
 
-    function analyzeBreaks(segments, ppa) {
+    function analyzeBreaks(segments, ppa, activitySegments) {
         const breakWindows = getBreakWindows();
         const threshold = settings.breakMisuseThreshold;
         const shiftDates = getShiftDates();
@@ -1115,25 +1170,54 @@
         let firstScanAfterBreak1  = null;
         let lastScanBeforeBreak1  = null;
 
+        // firstScan / lastScan: derived from idle gap boundaries (seg.end = resumed scanning,
+        // seg.start = stopped scanning) — already correct from v1.9 fix.
         segments.forEach(seg => {
             if (!seg.start) return;
-            // firstScan = end of earliest idle gap = moment they first scanned
             if (!firstScan || seg.end < firstScan) firstScan = seg.end;
-            // lastScan  = start of latest idle gap = moment they last scanned
             if (!lastScan  || seg.start > lastScan) lastScan  = seg.start;
-            // Last scan before break: seg.start of latest gap whose end is before break starts
-            if (seg.end <= break1Start) {
-                if (!lastScanBeforeBreak1 || seg.start > lastScanBeforeBreak1) {
-                    lastScanBeforeBreak1 = seg.start;
-                }
-            }
-            // First scan after break: seg.end of earliest gap whose start is at/after break end
-            if (seg.start >= break1End) {
-                if (!firstScanAfterBreak1 || seg.end < firstScanAfterBreak1) {
-                    firstScanAfterBreak1 = seg.end;
-                }
-            }
         });
+
+        // lastScanBeforeBreak1 / firstScanAfterBreak1: use actual ACTIVITY rows (non-editable
+        // on-task rows) when available — these are the real scan events, not idle gaps.
+        // Fall back to idle-segment derivation if no activity rows are available.
+        const acts = Array.isArray(activitySegments) && activitySegments.length
+            ? activitySegments
+            : null;
+
+        if (acts) {
+            // Last activity row whose start is before break1Start
+            acts.forEach(act => {
+                if (act.start < break1Start) {
+                    if (!lastScanBeforeBreak1 || act.start > lastScanBeforeBreak1) {
+                        lastScanBeforeBreak1 = act.start;
+                    }
+                }
+            });
+            // First activity row whose start is at or after break1End
+            acts.forEach(act => {
+                if (act.start >= break1End) {
+                    if (!firstScanAfterBreak1 || act.start < firstScanAfterBreak1) {
+                        firstScanAfterBreak1 = act.start;
+                    }
+                }
+            });
+        } else {
+            // Fallback: use idle segment boundaries
+            segments.forEach(seg => {
+                if (!seg.start) return;
+                if (seg.end <= break1Start) {
+                    if (!lastScanBeforeBreak1 || seg.start > lastScanBeforeBreak1) {
+                        lastScanBeforeBreak1 = seg.start;
+                    }
+                }
+                if (seg.start >= break1End) {
+                    if (!firstScanAfterBreak1 || seg.end < firstScanAfterBreak1) {
+                        firstScanAfterBreak1 = seg.end;
+                    }
+                }
+            });
+        }
 
         // Keep firstActivity/lastActivity names for internal Fast/Strong Finish use
         const firstActivity = firstScan;
@@ -1856,8 +1940,10 @@
                 const result = timeDetailsResults[idx];
                 if (result && result.html) {
                     aa.segments = parseIdleSegments(result.html);
+                    aa.activitySegments = parseActivitySegments(result.html);
                 } else {
                     aa.segments = [];
+                    aa.activitySegments = [];
                 }
             });
             if (!isScanning) return;
@@ -1877,7 +1963,7 @@
             setStatus('Analyzing break patterns...', '#e67e22');
             aaList.forEach(aa => {
                 const ppa = ppaMap.get(String(aa.employeeId)) || null;
-                aa.analysis = analyzeBreaks(aa.segments, ppa);
+                aa.analysis = analyzeBreaks(aa.segments, ppa, aa.activitySegments || []);
             });
             if (!isScanning) return;
 
