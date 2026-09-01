@@ -1,7 +1,7 @@
-﻿// ==UserScript==
+// ==UserScript==
 // @name         Idle Time Dashboard
 // @namespace    http://tampermonkey.net/
-// @version      2.2
+// @version      2.3
 // @description  Standalone idle time dashboard — time-aware metrics (only flags phases that have started), new fields: Clock In, First Scan, First Scan After Break 1, Last Scan
 // @author       joyhjoe
 // @match        https://fclm-portal-dub.dub.proxy.amazon.com/*
@@ -28,7 +28,7 @@
     // SECTION 1: CONFIGURATION & DEFAULTS
     // ═══════════════════════════════════════════════════════════════
 
-    const VERSION = '2.2';
+    const VERSION = '2.3';
     const BASE_URL = location.origin; // Auto-detect: works on both fclm-portal.amazon.com and fclm-portal-dub.dub.proxy.amazon.com
 
     // ── Enrichment config (login + station lookup, ported from Track4) ──
@@ -1195,10 +1195,11 @@
             : null;
 
         if (acts) {
-            // Last scan before break = END of the last activity row that started before break1Start
-            // (act.end = the moment they submitted their last scan before going on break)
+            // Last scan before break = END of the last activity row that finished
+            // at or before break1Start. Using act.end <= break1Start ensures we catch
+            // tasks that end exactly when break begins (e.g. task ends 22:15, break starts 22:15).
             acts.forEach(act => {
-                if (act.start < break1Start) {
+                if (act.end <= break1Start) {
                     if (!lastScanBeforeBreak1 || act.end > lastScanBeforeBreak1) {
                         lastScanBeforeBreak1 = act.end;
                     }
@@ -1337,6 +1338,7 @@
             right: 20px;
             z-index: 999999;
             width: 420px;
+            min-width: 320px;
             max-height: 90vh;
             background: #fff;
             border: 2px solid #2c3e50;
@@ -1346,9 +1348,10 @@
             overflow: hidden;
             display: flex;
             flex-direction: column;
+            resize: both;
         }
         #idle-dash-panel.expanded {
-            width: 900px;
+            width: min(1400px, 95vw);
         }
         /* Collapsed = compact pill so it does not cover the page UI */
         #idle-dash-panel.collapsed {
@@ -1385,7 +1388,7 @@
         #idle-dash-body {
             padding: 10px 12px;
             overflow-y: auto;
-            max-height: calc(90vh - 50px);
+            max-height: calc(100% - 50px);
             flex: 1;
         }
         .idash-section { margin-bottom: 10px; }
