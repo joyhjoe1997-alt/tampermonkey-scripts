@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         Idle Time Dashboard
 // @namespace    http://tampermonkey.net/
-// @version      3.5
+// @version      3.6
 // @description  Standalone idle time dashboard — time-aware metrics (only flags phases that have started), new fields: Clock In, First Scan, First Scan After Break 1, Last Scan
 // @author       joyhjoe
 // @match        https://fclm-portal-dub.dub.proxy.amazon.com/*
@@ -28,7 +28,7 @@
     // SECTION 1: CONFIGURATION & DEFAULTS
     // ═══════════════════════════════════════════════════════════════
 
-    const VERSION = '3.5';
+    const VERSION = '3.6';
     const BASE_URL = location.origin; // Auto-detect: works on both fclm-portal.amazon.com and fclm-portal-dub.dub.proxy.amazon.com
 
     // ── Enrichment config (login + station lookup, ported from Track4) ──
@@ -784,14 +784,38 @@
 
         tables.forEach(table => {
             const processLabel = getTableProcessName(table) || table.id || 'Unknown';
-            // Find JPH + manager column indices from header
-            const headers = table.querySelectorAll('thead th, thead td');
+            // The functionRollup table has a TWO-ROW header: row 1 has group
+            // headers (e.g. "Paid Hours" with colspan), row 2 has the leaf
+            // sub-headers ("Small","Medium","Large","HeavyBulky","Total").
+            // Only the LAST header row aligns 1:1 with body <td> cells, so we
+            // must use that row's index positions for column detection.
+            const headerRows = table.querySelectorAll('thead tr');
+            const groupRow = headerRows.length > 1 ? headerRows[headerRows.length - 2] : null;
+            const leafRow  = headerRows.length ? headerRows[headerRows.length - 1] : null;
+            const leafCells = leafRow ? leafRow.querySelectorAll('th, td') : [];
+
             let jphColIdx    = -1;
             let mgrColIdx    = -1;
             let funcColIdx   = -1;
             let paidColIdx   = -1;
-            let seenPaidGroup = false; // track when we've passed a "Paid Hours" group header
-            headers.forEach((th, idx) => {
+
+            // Determine the column-index range spanned by the "Paid Hours" group
+            // header (if present) so we can find its "Total" leaf column.
+            let paidGroupStart = -1, paidGroupEnd = -1;
+            if (groupRow) {
+                let colCursor = 0;
+                groupRow.querySelectorAll('th, td').forEach(cell => {
+                    const span = parseInt(cell.getAttribute('colspan') || '1', 10) || 1;
+                    const gtext = cell.textContent.trim().toLowerCase().replace(/[^a-z0-9\s]/g, '').trim();
+                    if (gtext.includes('paid') && gtext.includes('hour')) {
+                        paidGroupStart = colCursor;
+                        paidGroupEnd = colCursor + span - 1;
+                    }
+                    colCursor += span;
+                });
+            }
+
+            leafCells.forEach((th, idx) => {
                 const text = th.textContent.trim().toLowerCase().replace(/[^a-z0-9\s]/g, '').trim();
                 if (text === 'jph' || text === 'uph' || text.includes('jobs per hour') || text.includes('units per hour')) {
                     jphColIdx = idx;
@@ -802,17 +826,25 @@
                 if (text.includes('function') || text.includes('process') || text.includes('activity')) {
                     funcColIdx = idx;
                 }
-                // Detect "Paid Hours" group header, then pick the "Total" sub-header that follows
-                if (text.includes('paid') || text.includes('paid hours')) {
-                    seenPaidGroup = true;
-                }
-                if (text === 'total' && seenPaidGroup && paidColIdx === -1) {
+                // "Total" leaf column that falls within the Paid Hours group span
+                if (text === 'total' && paidColIdx === -1 &&
+                    paidGroupStart >= 0 && idx >= paidGroupStart && idx <= paidGroupEnd) {
                     paidColIdx = idx;
                 }
             });
-            // Fallback: if no paid-group total found, take the first "total" column
+            // Fallback 1: any "total" leaf column that comes before JPH (paid hours
+            // total sits left of the units/jobs columns on the functionRollup report)
             if (paidColIdx === -1) {
-                headers.forEach((th, idx) => {
+                leafCells.forEach((th, idx) => {
+                    const text = th.textContent.trim().toLowerCase().replace(/[^a-z0-9\s]/g, '').trim();
+                    if (text === 'total' && paidColIdx === -1 && (jphColIdx === -1 || idx < jphColIdx)) {
+                        paidColIdx = idx;
+                    }
+                });
+            }
+            // Fallback 2: first "total" leaf column of any kind
+            if (paidColIdx === -1) {
+                leafCells.forEach((th, idx) => {
                     const text = th.textContent.trim().toLowerCase().replace(/[^a-z0-9\s]/g, '').trim();
                     if (text === 'total' && paidColIdx === -1) paidColIdx = idx;
                 });
@@ -2396,6 +2428,7 @@
             { key: 'login',                  label: 'Login',                    type: 'string' },
             { key: 'manager',                label: 'Logging Manager',          type: 'string' },
             { key: 'behavioralType',         label: 'Behavioral Type',          type: 'string' },
+            { key: 'idleTime',               label: 'Idle Time (min)',          type: 'number' },
             { key: 'paidHours',              label: 'Hours Worked',             type: 'number' },
             { key: 'location',               label: 'Location',                 type: 'string' },
             { key: 'idle15',                 label: 'Instances >15 min',        type: 'number' },
