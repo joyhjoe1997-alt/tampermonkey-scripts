@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         Idle Time Dashboard
 // @namespace    http://tampermonkey.net/
-// @version      3.2
+// @version      3.3
 // @description  Standalone idle time dashboard — time-aware metrics (only flags phases that have started), new fields: Clock In, First Scan, First Scan After Break 1, Last Scan
 // @author       joyhjoe
 // @match        https://fclm-portal-dub.dub.proxy.amazon.com/*
@@ -28,7 +28,7 @@
     // SECTION 1: CONFIGURATION & DEFAULTS
     // ═══════════════════════════════════════════════════════════════
 
-    const VERSION = '3.2';
+    const VERSION = '3.3';
     const BASE_URL = location.origin; // Auto-detect: works on both fclm-portal.amazon.com and fclm-portal-dub.dub.proxy.amazon.com
 
     // ── Enrichment config (login + station lookup, ported from Track4) ──
@@ -1223,7 +1223,7 @@
         // A break must start at or after the AA's clock-in time — filter out
         // pre-shift OffClock/UnPaid rows (e.g. 18:15–19:15 before a 19:15 clock-in).
         const actualBreaks = (Array.isArray(breakSegments) ? breakSegments : [])
-            .filter(b => b.start >= shiftStartRef);
+            .filter(b => b.start >= (clockIn || shiftDates.startDate));
         const actualBreak1 = actualBreaks.length > 0 ? actualBreaks[0] : null;
         const break1Start = actualBreak1 ? actualBreak1.start : breakWindows.break1.breakStart;
         const break1End   = actualBreak1 ? actualBreak1.end   : breakWindows.break1.breakEnd;
