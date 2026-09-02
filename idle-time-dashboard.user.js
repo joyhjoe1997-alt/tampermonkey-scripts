@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         Idle Time Dashboard
 // @namespace    http://tampermonkey.net/
-// @version      3.6
+// @version      3.7
 // @description  Standalone idle time dashboard — time-aware metrics (only flags phases that have started), new fields: Clock In, First Scan, First Scan After Break 1, Last Scan
 // @author       joyhjoe
 // @match        https://fclm-portal-dub.dub.proxy.amazon.com/*
@@ -28,7 +28,7 @@
     // SECTION 1: CONFIGURATION & DEFAULTS
     // ═══════════════════════════════════════════════════════════════
 
-    const VERSION = '3.6';
+    const VERSION = '3.7';
     const BASE_URL = location.origin; // Auto-detect: works on both fclm-portal.amazon.com and fclm-portal-dub.dub.proxy.amazon.com
 
     // ── Enrichment config (login + station lookup, ported from Track4) ──
@@ -1413,13 +1413,39 @@
         const missedStrongFinish = phases.strongFinish && !!lastActivity &&
             lastActivity.getTime() < strongRef.getTime();
 
-        // Break abuse only counts if the break window has passed.
-        const isBreakAbuse = (phases.break1 && break1Misuse) || (phases.break2 && break2Misuse);
+        // ── Break abuse (3-minute scan-gap rule) ───────────────────────
+        // An AA abuses a break if EITHER side exceeds a 3-minute tolerance:
+        //   left early:   (breakStart - lastScanBeforeBreak) > 3 min
+        //   returned late: (firstScanAfterBreak - breakEnd)   > 3 min
+        const BREAK_TOLERANCE_MS = 3 * 60000;
+
+        function breakGapAbuse(bStart, bEnd, lastBefore, firstAfter) {
+            let leftEarly = false;
+            let returnedLate = false;
+            if (lastBefore && bStart) {
+                leftEarly = (bStart.getTime() - lastBefore.getTime()) > BREAK_TOLERANCE_MS;
+            }
+            if (firstAfter && bEnd) {
+                returnedLate = (firstAfter.getTime() - bEnd.getTime()) > BREAK_TOLERANCE_MS;
+            }
+            return leftEarly || returnedLate;
+        }
+
+        // Break 1 abuse: only when break 1 was actually taken and its phase passed.
+        const break1Abuse = phases.break1 && tookBreak1 &&
+            breakGapAbuse(break1Start, break1End, lastScanBeforeBreak1, firstScanAfterBreak1);
+
+        // Break 2 abuse: when break 2 phase has passed (uses configured window).
+        const break2Abuse = phases.break2 &&
+            breakGapAbuse(break2Start, break2End, lastScanBeforeBreak2, firstScanAfterBreak2);
+
+        const isBreakAbuse = break1Abuse || break2Abuse;
         const isIdleTime = nonBreakIdleMinutes > threshold;
 
         // ── Behavioral Type (only include phases that have started) ────
         const behaviors = [];
-        if (isBreakAbuse)       behaviors.push('Break Abuse');
+        if (break1Abuse)        behaviors.push('1st Break Abuse');
+        if (break2Abuse)        behaviors.push('2nd Break Abuse');
         if (isIdleTime)         behaviors.push('Idle Time');
         if (missedFastStart)    behaviors.push('Missed Fast Start');
         if (missedStrongFinish) behaviors.push('Missed Strong Finish');
@@ -1453,11 +1479,11 @@
             missedFastStart,
             missedStrongFinish,
             behavioralType,
-            // Phase-aware individual break abuse flags (for per-break filter cards)
-            break1Abuse: phases.break1 && break1Misuse,
-            break2Abuse: phases.break2 && break2Misuse,
+            // Per-break abuse flags (3-min scan-gap rule) for the filter cards
+            break1Abuse,
+            break2Abuse,
             isIdleTime,
-            isBreakOffender: (phases.break1 && break1Misuse) || (phases.break2 && break2Misuse) || nonBreakIdleMinutes > threshold
+            isBreakOffender: break1Abuse || break2Abuse || isIdleTime
         };
     }
 
