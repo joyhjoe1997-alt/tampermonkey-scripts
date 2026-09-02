@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         Idle Time Dashboard
 // @namespace    http://tampermonkey.net/
-// @version      3.7
+// @version      3.9
 // @description  Standalone idle time dashboard — time-aware metrics (only flags phases that have started), new fields: Clock In, First Scan, First Scan After Break 1, Last Scan
 // @author       joyhjoe
 // @match        https://fclm-portal-dub.dub.proxy.amazon.com/*
@@ -28,7 +28,7 @@
     // SECTION 1: CONFIGURATION & DEFAULTS
     // ═══════════════════════════════════════════════════════════════
 
-    const VERSION = '3.7';
+    const VERSION = '3.9';
     const BASE_URL = location.origin; // Auto-detect: works on both fclm-portal.amazon.com and fclm-portal-dub.dub.proxy.amazon.com
 
     // ── Enrichment config (login + station lookup, ported from Track4) ──
@@ -784,70 +784,89 @@
 
         tables.forEach(table => {
             const processLabel = getTableProcessName(table) || table.id || 'Unknown';
-            // The functionRollup table has a TWO-ROW header: row 1 has group
-            // headers (e.g. "Paid Hours" with colspan), row 2 has the leaf
-            // sub-headers ("Small","Medium","Large","HeavyBulky","Total").
-            // Only the LAST header row aligns 1:1 with body <td> cells, so we
-            // must use that row's index positions for column detection.
-            const headerRows = table.querySelectorAll('thead tr');
-            const groupRow = headerRows.length > 1 ? headerRows[headerRows.length - 2] : null;
-            const leafRow  = headerRows.length ? headerRows[headerRows.length - 1] : null;
-            const leafCells = leafRow ? leafRow.querySelectorAll('th, td') : [];
+            // The functionRollup table has a TWO-ROW header. Columns like Type,
+            // ID, Name, Manager, Function span BOTH rows (rowspan=2) and live in
+            // row 1. Grouped columns (Paid Hours, NikeStow, ...) put their group
+            // name in row 1 (with colspan) and their leaf sub-headers in row 2.
+            //
+            // The body <td> cells align to the visually-flattened leaf column
+            // order. We must reconstruct that order by walking row 1 and, for any
+            // colspan group cell, substituting its row-2 leaf cells in place.
+            const headerRows = Array.from(table.querySelectorAll('thead tr'));
+            const topRow  = headerRows.length ? headerRows[0] : null;
+            const leafRow = headerRows.length > 1 ? headerRows[1] : null;
+            const topCells  = topRow  ? Array.from(topRow.querySelectorAll('th, td'))  : [];
+            const leafRowCells = leafRow ? Array.from(leafRow.querySelectorAll('th, td')) : [];
+
+            // Build the flattened leaf columns: for each top-row cell, if it has
+            // colspan>1 it is a group — pull that many cells from the leaf row and
+            // tag them with their group name. Otherwise it's a standalone column.
+            const norm = el => (el ? el.textContent : '').trim().toLowerCase().replace(/[^a-z0-9\s]/g, '').trim();
+            const flatCols = []; // { text, group }
+            let leafPtr = 0;
+            topCells.forEach(cell => {
+                const span = parseInt(cell.getAttribute('colspan') || '1', 10) || 1;
+                const label = norm(cell);
+                if (span > 1) {
+                    for (let s = 0; s < span; s++) {
+                        const leaf = leafRowCells[leafPtr++];
+                        flatCols.push({ text: norm(leaf), group: label });
+                    }
+                } else {
+                    flatCols.push({ text: label, group: '' });
+                }
+            });
+            // If the header had no groups (single-row header), flatCols already
+            // equals topCells; if leaf row existed but nothing consumed it, fall
+            // back to leaf row directly.
+            const cols = flatCols.length ? flatCols
+                : leafRowCells.map(c => ({ text: norm(c), group: '' }));
 
             let jphColIdx    = -1;
             let mgrColIdx    = -1;
             let funcColIdx   = -1;
-            let paidColIdx   = -1;
+            let paidColIdx   = -1;   // "Total" leaf under Paid Hours (preferred)
+            let paidSumCols  = [];   // size sub-columns to sum if no Total leaf
 
-            // Determine the column-index range spanned by the "Paid Hours" group
-            // header (if present) so we can find its "Total" leaf column.
-            let paidGroupStart = -1, paidGroupEnd = -1;
-            if (groupRow) {
-                let colCursor = 0;
-                groupRow.querySelectorAll('th, td').forEach(cell => {
-                    const span = parseInt(cell.getAttribute('colspan') || '1', 10) || 1;
-                    const gtext = cell.textContent.trim().toLowerCase().replace(/[^a-z0-9\s]/g, '').trim();
-                    if (gtext.includes('paid') && gtext.includes('hour')) {
-                        paidGroupStart = colCursor;
-                        paidGroupEnd = colCursor + span - 1;
-                    }
-                    colCursor += span;
-                });
-            }
-
-            leafCells.forEach((th, idx) => {
-                const text = th.textContent.trim().toLowerCase().replace(/[^a-z0-9\s]/g, '').trim();
+            cols.forEach((c, idx) => {
+                const text = c.text;
+                const grp  = c.group;
                 if (text === 'jph' || text === 'uph' || text.includes('jobs per hour') || text.includes('units per hour')) {
-                    jphColIdx = idx;
+                    if (jphColIdx === -1) jphColIdx = idx;
                 }
                 if (text === 'manager' || text.includes('manager') || text.includes('supervisor')) {
-                    mgrColIdx = idx;
+                    if (mgrColIdx === -1) mgrColIdx = idx;
                 }
-                if (text.includes('function') || text.includes('process') || text.includes('activity')) {
-                    funcColIdx = idx;
+                if (text === 'name' || text.includes('employee') || text.includes('associate') ||
+                    text.includes('function') || text.includes('process') || text.includes('activity')) {
+                    if (funcColIdx === -1 && (text.includes('function') || text.includes('process') || text.includes('activity'))) {
+                        funcColIdx = idx;
+                    }
                 }
-                // "Total" leaf column that falls within the Paid Hours group span
-                if (text === 'total' && paidColIdx === -1 &&
-                    paidGroupStart >= 0 && idx >= paidGroupStart && idx <= paidGroupEnd) {
-                    paidColIdx = idx;
+                // Paid Hours group columns
+                const inPaidGroup = grp.includes('paid') && grp.includes('hour');
+                if (inPaidGroup) {
+                    if (text === 'total') {
+                        if (paidColIdx === -1) paidColIdx = idx;
+                    } else if (['small', 'medium', 'large', 'heavybulky', 'heavy bulky', 'heavy', 'bulky'].includes(text)) {
+                        paidSumCols.push(idx);
+                    }
                 }
             });
-            // Fallback 1: any "total" leaf column that comes before JPH (paid hours
-            // total sits left of the units/jobs columns on the functionRollup report)
-            if (paidColIdx === -1) {
-                leafCells.forEach((th, idx) => {
-                    const text = th.textContent.trim().toLowerCase().replace(/[^a-z0-9\s]/g, '').trim();
-                    if (text === 'total' && paidColIdx === -1 && (jphColIdx === -1 || idx < jphColIdx)) {
+
+            // Fallback: no Paid Hours group found — use a plain "total" column
+            // (before JPH if possible).
+            if (paidColIdx === -1 && paidSumCols.length === 0) {
+                cols.forEach((c, idx) => {
+                    if (c.text === 'total' && paidColIdx === -1 && (jphColIdx === -1 || idx < jphColIdx)) {
                         paidColIdx = idx;
                     }
                 });
-            }
-            // Fallback 2: first "total" leaf column of any kind
-            if (paidColIdx === -1) {
-                leafCells.forEach((th, idx) => {
-                    const text = th.textContent.trim().toLowerCase().replace(/[^a-z0-9\s]/g, '').trim();
-                    if (text === 'total' && paidColIdx === -1) paidColIdx = idx;
-                });
+                if (paidColIdx === -1) {
+                    cols.forEach((c, idx) => {
+                        if (c.text === 'total' && paidColIdx === -1) paidColIdx = idx;
+                    });
+                }
             }
 
             const rows = table.querySelectorAll('tbody tr');
@@ -880,9 +899,21 @@
                     const fn = cells[funcColIdx].textContent.trim();
                     if (fn) functionName = fn;
                 }
+                // Hours Worked: prefer the Paid Hours "Total" leaf; if there's no
+                // Total leaf, sum the size sub-columns (Small+Medium+Large+HeavyBulky).
                 if (paidColIdx >= 0 && cells[paidColIdx]) {
                     const v = parseFloat(cells[paidColIdx].textContent.trim());
                     if (!isNaN(v)) paidHours = v;
+                } else if (paidSumCols.length) {
+                    let sum = 0;
+                    let any = false;
+                    paidSumCols.forEach(ci => {
+                        if (cells[ci]) {
+                            const v = parseFloat(cells[ci].textContent.trim());
+                            if (!isNaN(v)) { sum += v; any = true; }
+                        }
+                    });
+                    if (any) paidHours = Math.round(sum * 100) / 100;
                 }
 
                 // Build timeDetails href for direct linking
