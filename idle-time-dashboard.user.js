@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         Idle Time Dashboard
 // @namespace    http://tampermonkey.net/
-// @version      3.3
+// @version      3.4
 // @description  Standalone idle time dashboard — time-aware metrics (only flags phases that have started), new fields: Clock In, First Scan, First Scan After Break 1, Last Scan
 // @author       joyhjoe
 // @match        https://fclm-portal-dub.dub.proxy.amazon.com/*
@@ -28,7 +28,7 @@
     // SECTION 1: CONFIGURATION & DEFAULTS
     // ═══════════════════════════════════════════════════════════════
 
-    const VERSION = '3.3';
+    const VERSION = '3.4';
     const BASE_URL = location.origin; // Auto-detect: works on both fclm-portal.amazon.com and fclm-portal-dub.dub.proxy.amazon.com
 
     // ── Enrichment config (login + station lookup, ported from Track4) ──
@@ -790,6 +790,7 @@
             let mgrColIdx    = -1;
             let funcColIdx   = -1;
             let paidColIdx   = -1;
+            let seenPaidGroup = false; // track when we've passed a "Paid Hours" group header
             headers.forEach((th, idx) => {
                 const text = th.textContent.trim().toLowerCase().replace(/[^a-z0-9\s]/g, '').trim();
                 if (text === 'jph' || text === 'uph' || text.includes('jobs per hour') || text.includes('units per hour')) {
@@ -801,11 +802,21 @@
                 if (text.includes('function') || text.includes('process') || text.includes('activity')) {
                     funcColIdx = idx;
                 }
-                // "Total" column under Paid Hours -- matches "total" header (sort arrows stripped)
-                if (text === 'total' && paidColIdx === -1) {
+                // Detect "Paid Hours" group header, then pick the "Total" sub-header that follows
+                if (text.includes('paid') || text.includes('paid hours')) {
+                    seenPaidGroup = true;
+                }
+                if (text === 'total' && seenPaidGroup && paidColIdx === -1) {
                     paidColIdx = idx;
                 }
             });
+            // Fallback: if no paid-group total found, take the first "total" column
+            if (paidColIdx === -1) {
+                headers.forEach((th, idx) => {
+                    const text = th.textContent.trim().toLowerCase().replace(/[^a-z0-9\s]/g, '').trim();
+                    if (text === 'total' && paidColIdx === -1) paidColIdx = idx;
+                });
+            }
 
             const rows = table.querySelectorAll('tbody tr');
             rows.forEach(row => {
@@ -1228,6 +1239,10 @@
         const break1Start = actualBreak1 ? actualBreak1.start : breakWindows.break1.breakStart;
         const break1End   = actualBreak1 ? actualBreak1.end   : breakWindows.break1.breakEnd;
 
+        // Break 2 always uses the configured window (02:15–02:45 by default)
+        const break2Start = breakWindows.break2.breakStart;
+        const break2End   = breakWindows.break2.breakEnd;
+
         // ── Timing fields ──────────────────────────────────────────────
         // All scan times are derived directly from activitySegments (the real
         // non-editable on-task rows from the timeDetails page). These are the
@@ -1247,6 +1262,8 @@
         let lastScan              = null;
         let firstScanAfterBreak1  = null;
         let lastScanBeforeBreak1  = null;
+        let firstScanAfterBreak2  = null;
+        let lastScanBeforeBreak2  = null;
 
         const acts = Array.isArray(activitySegments) ? activitySegments : [];
 
@@ -1286,6 +1303,20 @@
                         firstScanAfterBreak1 = act.start;
                     }
                 }
+
+                // lastScanBeforeBreak2: end of last activity finishing at/before break2 start
+                if (act.end <= break2Start) {
+                    if (!lastScanBeforeBreak2 || act.end > lastScanBeforeBreak2) {
+                        lastScanBeforeBreak2 = act.end;
+                    }
+                }
+
+                // firstScanAfterBreak2: start of first activity beginning at/after break2 end
+                if (act.start >= break2End) {
+                    if (!firstScanAfterBreak2 || act.start < firstScanAfterBreak2) {
+                        firstScanAfterBreak2 = act.start;
+                    }
+                }
             });
         } else {
             // Fallback when no activity rows: derive from idle segment boundaries.
@@ -1305,6 +1336,16 @@
                 if (seg.start >= break1End) {
                     if (!firstScanAfterBreak1 || seg.start < firstScanAfterBreak1) {
                         firstScanAfterBreak1 = seg.start;
+                    }
+                }
+                if (seg.end <= break2Start) {
+                    if (!lastScanBeforeBreak2 || seg.end > lastScanBeforeBreak2) {
+                        lastScanBeforeBreak2 = seg.end;
+                    }
+                }
+                if (seg.start >= break2End) {
+                    if (!firstScanAfterBreak2 || seg.start < firstScanAfterBreak2) {
+                        firstScanAfterBreak2 = seg.start;
                     }
                 }
             });
@@ -1364,11 +1405,17 @@
             lastScan,
             lastScanBeforeBreak1,
             firstScanAfterBreak1,
+            lastScanBeforeBreak2,
+            firstScanAfterBreak2,
             actualBreak1Start: actualBreak1 ? actualBreak1.start : null,
             actualBreak1End:   actualBreak1 ? actualBreak1.end   : null,
             missedFastStart,
             missedStrongFinish,
             behavioralType,
+            // Phase-aware individual break abuse flags (for per-break filter cards)
+            break1Abuse: phases.break1 && break1Misuse,
+            break2Abuse: phases.break2 && break2Misuse,
+            isIdleTime,
             isBreakOffender: (phases.break1 && break1Misuse) || (phases.break2 && break2Misuse) || nonBreakIdleMinutes > threshold
         };
     }
@@ -1637,7 +1684,7 @@
         .idash-mgr-chip span { word-break: break-word; }
         .idash-summary {
             display: grid;
-            grid-template-columns: repeat(4, 1fr);
+            grid-template-columns: repeat(6, 1fr);
             gap: 8px;
             margin-bottom: 12px;
         }
@@ -1668,6 +1715,10 @@
         .idash-card-clickable:hover {
             transform: translateY(-2px);
             box-shadow: 0 8px 20px rgba(44,62,80,.12);
+        }
+        .idash-summary-card.is-active {
+            box-shadow: 0 0 0 2px #3498db, 0 8px 20px rgba(52,152,219,.2);
+            border-color: #3498db;
         }
         .idash-filters {
             display: flex;
@@ -2086,6 +2137,8 @@
             scanResults = aaList;
             selectedManagers = null;
             managerSearchTerm = '';
+            currentFilter = 'all';
+            bottomPctActive = false;
             renderResults(aaList, thresholds);
 
             setStatus(`Scan complete — ${aaList.length} associates analyzed`, '#27ae60');
@@ -2106,7 +2159,8 @@
     // ═══════════════════════════════════════════════════════════════
 
     let currentFilter = 'all';
-    let currentSort = { col: 'idleTime', dir: 'desc' };
+    let bottomPctActive = false; // "Bottom N%" toggle — intersects with the active card
+    let currentSort = { col: 'idle15', dir: 'desc' };
     // Manager filter state: null = all managers shown; otherwise a Set of
     // manager names that are currently selected.
     let selectedManagers = null;
@@ -2126,18 +2180,37 @@
     function applyCategoryFilter(aaList) {
         switch (currentFilter) {
             case 'bottomJPH':         return aaList.filter(a => a.isBottomJPH);
-            case 'breakOffenders':    return aaList.filter(a => a.analysis && a.analysis.isBreakOffender);
+            case 'idleTime':          return aaList.filter(a => a.analysis && a.analysis.isIdleTime);
             case 'missedFastStart':   return aaList.filter(a => a.analysis && a.analysis.missedFastStart);
+            case 'break1Abuse':       return aaList.filter(a => a.analysis && a.analysis.break1Abuse);
+            case 'break2Abuse':       return aaList.filter(a => a.analysis && a.analysis.break2Abuse);
             case 'missedStrongFinish':return aaList.filter(a => a.analysis && a.analysis.missedStrongFinish);
+            case 'breakOffenders':    return aaList.filter(a => a.analysis && a.analysis.isBreakOffender);
             case 'flagged':           return aaList.filter(a => a.isHighlighted);
             default:                  return [...aaList];
         }
     }
 
-    // Rows visible after BOTH the category filter and the manager filter.
+    // Given a set of rows, return the bottom N% by idle time (highest idle = worst).
+    // "Bottom 8%" = the worst-performing 8% by non-break idle minutes.
+    function applyBottomPct(rows) {
+        if (!bottomPctActive || !rows.length) return rows;
+        const pct = (settings.percentileThreshold || 8) / 100;
+        const n = Math.max(1, Math.ceil(rows.length * pct));
+        // Sort by non-break idle descending (worst first) and take top N
+        const sorted = rows.slice().sort((a, b) => {
+            const ia = (a.analysis && a.analysis.nonBreakIdleMinutes) || 0;
+            const ib = (b.analysis && b.analysis.nonBreakIdleMinutes) || 0;
+            return ib - ia;
+        });
+        return sorted.slice(0, n);
+    }
+
+    // Rows visible after category filter + bottom% + manager filter.
     // Used by both the table renderer and the CSV export so they stay in sync.
     function getVisibleRows(aaList) {
         let rows = applyCategoryFilter(aaList);
+        rows = applyBottomPct(rows);
         if (selectedManagers) {
             rows = rows.filter(aa => {
                 const m = (aa.manager || '').trim();
@@ -2152,29 +2225,37 @@
         const resultsDiv = document.getElementById('idash-results');
         resultsDiv.style.display = 'block';
 
-        // Summary cards
-        const flaggedCount   = aaList.filter(a => a.isHighlighted).length;
-        const breakOffenders = aaList.filter(a => a.analysis && a.analysis.isBreakOffender).length;
-        const missedFS       = aaList.filter(a => a.analysis && a.analysis.missedFastStart).length;
-        const missedSF       = aaList.filter(a => a.analysis && a.analysis.missedStrongFinish).length;
+        // Metric counts for the summary cards
+        const idleCount   = aaList.filter(a => a.analysis && a.analysis.isIdleTime).length;
+        const missedFS    = aaList.filter(a => a.analysis && a.analysis.missedFastStart).length;
+        const brk1Count   = aaList.filter(a => a.analysis && a.analysis.break1Abuse).length;
+        const brk2Count   = aaList.filter(a => a.analysis && a.analysis.break2Abuse).length;
+        const missedSF    = aaList.filter(a => a.analysis && a.analysis.missedStrongFinish).length;
 
-        // Summary cards — Total AAs is display-only; the other three are
-        // clickable toggles that work like the filter buttons below.
-        const cardActive = (f) => currentFilter === f ? 'style="box-shadow:0 0 0 2px #3498db;border-color:#3498db;"' : '';
+        // All cards are clickable toggles. Total resets to "all".
+        const cardCls = (f) => 'idash-summary-card idash-card-clickable' + (currentFilter === f ? ' is-active' : '');
         document.getElementById('idash-summary').innerHTML = `
-            <div class="idash-summary-card">
+            <div class="${cardCls('all')}" data-filter="all" title="Show all">
                 <div class="num">${aaList.length}</div>
                 <div class="label">Total AAs</div>
             </div>
-            <div class="idash-summary-card idash-card-clickable" data-filter="breakOffenders" ${cardActive('breakOffenders')} title="Click to filter">
-                <div class="num" style="color:#f39c12">${breakOffenders}</div>
-                <div class="label">Break Offenders</div>
+            <div class="${cardCls('idleTime')}" data-filter="idleTime" title="Click to filter">
+                <div class="num" style="color:#e74c3c">${idleCount}</div>
+                <div class="label">Idle Time</div>
             </div>
-            <div class="idash-summary-card idash-card-clickable" data-filter="missedFastStart" ${cardActive('missedFastStart')} title="Click to filter">
+            <div class="${cardCls('missedFastStart')}" data-filter="missedFastStart" title="Click to filter">
                 <div class="num" style="color:#8e44ad">${missedFS}</div>
                 <div class="label">Missed Fast Start</div>
             </div>
-            <div class="idash-summary-card idash-card-clickable" data-filter="missedStrongFinish" ${cardActive('missedStrongFinish')} title="Click to filter">
+            <div class="${cardCls('break1Abuse')}" data-filter="break1Abuse" title="Click to filter">
+                <div class="num" style="color:#e67e22">${brk1Count}</div>
+                <div class="label">1st Break Abuse</div>
+            </div>
+            <div class="${cardCls('break2Abuse')}" data-filter="break2Abuse" title="Click to filter">
+                <div class="num" style="color:#d35400">${brk2Count}</div>
+                <div class="label">2nd Break Abuse</div>
+            </div>
+            <div class="${cardCls('missedStrongFinish')}" data-filter="missedStrongFinish" title="Click to filter">
                 <div class="num" style="color:#2980b9">${missedSF}</div>
                 <div class="label">Missed Strong Finish</div>
             </div>
@@ -2189,20 +2270,24 @@
             };
         });
 
-        // Category filter buttons
+        // Bottom N% toggle — intersects with whichever card is selected.
+        // e.g. select "Idle Time" + Bottom 8% = worst 8% by idle among idle-flagged AAs.
+        const pct = settings.percentileThreshold || 8;
         document.getElementById('idash-filters').innerHTML = `
-            <button class="idash-filter-btn ${currentFilter === 'all' ? 'active' : ''}" data-filter="all">All (${aaList.length})</button>
-            <button class="idash-filter-btn ${currentFilter === 'bottomJPH' ? 'active' : ''}" data-filter="bottomJPH">Bottom ${settings.percentileThreshold}% JPH (${thresholds.bottomJPH.length})</button>
-            <button class="idash-filter-btn ${currentFilter === 'breakOffenders' ? 'active' : ''}" data-filter="breakOffenders">Break Offenders (${breakOffenders})</button>
-            <button class="idash-filter-btn ${currentFilter === 'flagged' ? 'active' : ''}" data-filter="flagged">Flagged (${flaggedCount})</button>
+            <button class="idash-filter-btn ${bottomPctActive ? 'active' : ''}" id="idash-bottom-pct-btn">
+                ${bottomPctActive ? '\u2713 ' : ''}Bottom ${pct}% (worst by idle)
+            </button>
+            <span style="font:11px 'Segoe UI';color:#7f8c8d;align-self:center;margin-left:6px">
+                ${bottomPctActive ? 'Showing worst ' + pct + '% of the selected group' : 'Toggle to show only the worst ' + pct + '%'}
+            </span>
         `;
-
-        document.querySelectorAll('.idash-filter-btn').forEach(btn => {
-            btn.onclick = () => {
-                currentFilter = btn.dataset.filter;
+        const bottomBtn = document.getElementById('idash-bottom-pct-btn');
+        if (bottomBtn) {
+            bottomBtn.onclick = () => {
+                bottomPctActive = !bottomPctActive;
                 renderResults(aaList, thresholds);
             };
-        });
+        }
 
         // Manager filter panel
         renderManagerFilter(aaList, thresholds);
@@ -2302,7 +2387,6 @@
             { key: 'login',                  label: 'Login',                    type: 'string' },
             { key: 'manager',                label: 'Logging Manager',          type: 'string' },
             { key: 'behavioralType',         label: 'Behavioral Type',          type: 'string' },
-            { key: 'idleTime',               label: 'Idle Time (min)',          type: 'number' },
             { key: 'paidHours',              label: 'Hours Worked',             type: 'number' },
             { key: 'location',               label: 'Location',                 type: 'string' },
             { key: 'idle15',                 label: 'Instances >15 min',        type: 'number' },
@@ -2312,6 +2396,8 @@
             { key: 'break1Time',             label: 'Break 1',                   type: 'string', phase: 'break1' },
             { key: 'lastScanBeforeBreak1',   label: 'Last Scan Before Break 1',  type: 'time',   phase: 'break1' },
             { key: 'firstScanAfterBreak1',   label: 'First Scan After Break 1',  type: 'time',   phase: 'break1' },
+            { key: 'lastScanBeforeBreak2',   label: 'Last Scan Before Break 2',  type: 'time',   phase: 'break2' },
+            { key: 'firstScanAfterBreak2',   label: 'First Scan After Break 2',  type: 'time',   phase: 'break2' },
             { key: 'lastScan',               label: 'Last Scan',                 type: 'time',   phase: 'strongFinish' }
         ];
 
@@ -2334,6 +2420,8 @@
                 case 'firstScan':            return a.firstScan ? a.firstScan.getTime() : 0;
                 case 'lastScanBeforeBreak1': return a.lastScanBeforeBreak1 ? a.lastScanBeforeBreak1.getTime() : 0;
                 case 'firstScanAfterBreak1': return a.firstScanAfterBreak1 ? a.firstScanAfterBreak1.getTime() : 0;
+                case 'lastScanBeforeBreak2': return a.lastScanBeforeBreak2 ? a.lastScanBeforeBreak2.getTime() : 0;
+                case 'firstScanAfterBreak2': return a.firstScanAfterBreak2 ? a.firstScanAfterBreak2.getTime() : 0;
                 case 'lastScan':             return a.lastScan  ? a.lastScan.getTime()  : 0;
                 default: return '';
             }
@@ -2423,6 +2511,10 @@
                         return `<td>${a.lastScanBeforeBreak1 ? formatTimeShort(a.lastScanBeforeBreak1) : '\u2013'}</td>`;
                     case 'firstScanAfterBreak1':
                         return `<td>${a.firstScanAfterBreak1 ? formatTimeShort(a.firstScanAfterBreak1) : '\u2013'}</td>`;
+                    case 'lastScanBeforeBreak2':
+                        return `<td>${a.lastScanBeforeBreak2 ? formatTimeShort(a.lastScanBeforeBreak2) : '\u2013'}</td>`;
+                    case 'firstScanAfterBreak2':
+                        return `<td>${a.firstScanAfterBreak2 ? formatTimeShort(a.firstScanAfterBreak2) : '\u2013'}</td>`;
                     case 'lastScan':
                         return `<td>${a.lastScan ? formatTimeShort(a.lastScan) : '\u2013'}</td>`;
                     default:
@@ -2482,6 +2574,7 @@
         // Add timing columns only for phases that have started.
         if (phases.fastStart) headers.push('Clock In', 'First Scan');
         if (phases.break1)    headers.push('Break 1', 'Last Scan Before Break 1', 'First Scan After Break 1');
+        if (phases.break2)    headers.push('Last Scan Before Break 2', 'First Scan After Break 2');
         if (phases.strongFinish) headers.push('Last Scan');
 
         // Export only the rows currently visible (respects category + manager filters).
@@ -2518,6 +2611,10 @@
                     : '');
                 row.push(a.lastScanBeforeBreak1  ? formatTimeShort(a.lastScanBeforeBreak1)  : '');
                 row.push(a.firstScanAfterBreak1  ? formatTimeShort(a.firstScanAfterBreak1)  : '');
+            }
+            if (phases.break2) {
+                row.push(a.lastScanBeforeBreak2  ? formatTimeShort(a.lastScanBeforeBreak2)  : '');
+                row.push(a.firstScanAfterBreak2  ? formatTimeShort(a.firstScanAfterBreak2)  : '');
             }
             if (phases.strongFinish) {
                 row.push(a.lastScan ? formatTimeShort(a.lastScan) : '');
