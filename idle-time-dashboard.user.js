@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         Idle Time Dashboard
 // @namespace    http://tampermonkey.net/
-// @version      3.9
+// @version      4.0
 // @description  Standalone idle time dashboard — time-aware metrics (only flags phases that have started), new fields: Clock In, First Scan, First Scan After Break 1, Last Scan
 // @author       joyhjoe
 // @match        https://fclm-portal-dub.dub.proxy.amazon.com/*
@@ -28,7 +28,7 @@
     // SECTION 1: CONFIGURATION & DEFAULTS
     // ═══════════════════════════════════════════════════════════════
 
-    const VERSION = '3.9';
+    const VERSION = '4.0';
     const BASE_URL = location.origin; // Auto-detect: works on both fclm-portal.amazon.com and fclm-portal-dub.dub.proxy.amazon.com
 
     // ── Enrichment config (login + station lookup, ported from Track4) ──
@@ -1035,6 +1035,37 @@
         return segments;
     }
 
+    // Extract total worked/paid hours from a timeDetails page.
+    // The green header bar shows e.g. "Hours on Task: 5.63 / 5.63 (100%)".
+    // We take the second number (total paid hours). Falls back to summing
+    // the paid on-clock segments if the header text isn't present.
+    function parsePaidHours(html) {
+        if (!html) return null;
+        // 1) Try the "Hours on Task: X / Y" header text
+        const m = html.match(/Hours\s*on\s*Task[^0-9]*([\d.]+)\s*\/\s*([\d.]+)/i);
+        if (m) {
+            const total = parseFloat(m[2]);
+            if (!isNaN(total)) return Math.round(total * 100) / 100;
+            const onTask = parseFloat(m[1]);
+            if (!isNaN(onTask)) return Math.round(onTask * 100) / 100;
+        }
+        // 2) Fallback: sum durations of paid on-clock segments
+        try {
+            const doc = new DOMParser().parseFromString(html, 'text/html');
+            const paidSegs = doc.querySelectorAll('.clock-seg.on-clock.paid');
+            let totalMin = 0, any = false;
+            paidSegs.forEach(seg => {
+                const row = seg.closest('tr') || seg.parentNode;
+                if (!row) return;
+                const durCell = row.querySelector('.rightAlign');
+                const dur = durCell ? parseDuration(durCell.textContent.trim()) : 0;
+                if (dur > 0) { totalMin += dur; any = true; }
+            });
+            if (any) return Math.round((totalMin / 60) * 100) / 100;
+        } catch (e) {}
+        return null;
+    }
+
     // Parses the NON-EDITABLE (on-task / active) rows from a timeDetails page.
     // These rows represent periods when the associate was actually scanning —
     // the complement of idle segments. Used to find first/last actual scans
@@ -1507,6 +1538,9 @@
             firstScanAfterBreak2,
             actualBreak1Start: actualBreak1 ? actualBreak1.start : null,
             actualBreak1End:   actualBreak1 ? actualBreak1.end   : null,
+            break2StartRef: break2Start,
+            break2EndRef:   break2End,
+            strongRef,
             missedFastStart,
             missedStrongFinish,
             behavioralType,
@@ -2186,6 +2220,10 @@
                     aa.segments = parseIdleSegments(result.html);
                     aa.activitySegments = parseActivitySegments(result.html);
                     aa.breakSegments = parseBreakSegments(result.html);
+                    // Prefer paid hours from the timeDetails "Hours on Task" header;
+                    // only fall back to the functionRollup value if not found.
+                    const phFromDetails = parsePaidHours(result.html);
+                    if (phFromDetails != null) aa.paidHours = phFromDetails;
                 } else {
                     aa.segments = [];
                     aa.activitySegments = [];
@@ -2291,16 +2329,45 @@
 
     // Given a set of rows, return the bottom N% by idle time (highest idle = worst).
     // "Bottom 8%" = the worst-performing 8% by non-break idle minutes.
+    // The "worst" metric used to rank Bottom N% depends on the active card:
+    //   Total               -> Instances >15 min count
+    //   Idle Time           -> non-break idle minutes
+    //   Missed Fast Start   -> gap between clock-in and first scan (minutes)
+    //   1st/2nd Break Abuse -> largest break gap (left-early or late-return, minutes)
+    //   Missed Strong Finish-> gap between last scan and shift end (minutes)
+    function bottomPctScore(aa) {
+        const a = aa.analysis || {};
+        const mins = (from, to) => (from && to) ? Math.max(0, (to.getTime() - from.getTime()) / 60000) : 0;
+        switch (currentFilter) {
+            case 'idleTime':
+                return a.nonBreakIdleMinutes || 0;
+            case 'missedFastStart':
+                return mins(a.clockIn, a.firstScan);
+            case 'break1Abuse': {
+                const early = mins(a.lastScanBeforeBreak1, a.actualBreak1Start);
+                const late  = mins(a.actualBreak1End, a.firstScanAfterBreak1);
+                return Math.max(early, late);
+            }
+            case 'break2Abuse': {
+                const early = mins(a.lastScanBeforeBreak2, a.break2StartRef);
+                const late  = mins(a.break2EndRef, a.firstScanAfterBreak2);
+                return Math.max(early, late);
+            }
+            case 'missedStrongFinish':
+                return mins(a.lastScan, a.strongRef);
+            case 'all':
+            default:
+                // Total view ranks by number of >15 min idle instances
+                return (a.idleTimestamps15 && a.idleTimestamps15.length) || 0;
+        }
+    }
+
     function applyBottomPct(rows) {
         if (!bottomPctActive || !rows.length) return rows;
         const pct = (settings.percentileThreshold || 8) / 100;
         const n = Math.max(1, Math.ceil(rows.length * pct));
-        // Sort by non-break idle descending (worst first) and take top N
-        const sorted = rows.slice().sort((a, b) => {
-            const ia = (a.analysis && a.analysis.nonBreakIdleMinutes) || 0;
-            const ib = (b.analysis && b.analysis.nonBreakIdleMinutes) || 0;
-            return ib - ia;
-        });
+        // Rank by the card-specific worst metric, descending, take top N
+        const sorted = rows.slice().sort((a, b) => bottomPctScore(b) - bottomPctScore(a));
         return sorted.slice(0, n);
     }
 
@@ -2368,15 +2435,22 @@
             };
         });
 
-        // Bottom N% toggle — intersects with whichever card is selected.
-        // e.g. select "Idle Time" + Bottom 8% = worst 8% by idle among idle-flagged AAs.
+        // Bottom N% toggle — ranks by a metric that depends on the active card.
         const pct = settings.percentileThreshold || 8;
+        const bottomMetricLabel = {
+            all:                'instances >15 min',
+            idleTime:           'idle time',
+            missedFastStart:    'fast-start gap',
+            break1Abuse:        'break 1 gap',
+            break2Abuse:        'break 2 gap',
+            missedStrongFinish: 'strong-finish gap'
+        }[currentFilter] || 'instances >15 min';
         document.getElementById('idash-filters').innerHTML = `
             <button class="idash-filter-btn ${bottomPctActive ? 'active' : ''}" id="idash-bottom-pct-btn">
-                ${bottomPctActive ? '\u2713 ' : ''}Bottom ${pct}% (worst by idle)
+                ${bottomPctActive ? '\u2713 ' : ''}Bottom ${pct}% (worst by ${bottomMetricLabel})
             </button>
             <span style="font:11px 'Segoe UI';color:#7f8c8d;align-self:center;margin-left:6px">
-                ${bottomPctActive ? 'Showing worst ' + pct + '% of the selected group' : 'Toggle to show only the worst ' + pct + '%'}
+                ${bottomPctActive ? 'Showing worst ' + pct + '% by ' + bottomMetricLabel : 'Toggle to show only the worst ' + pct + '% by ' + bottomMetricLabel}
             </span>
         `;
         const bottomBtn = document.getElementById('idash-bottom-pct-btn');
@@ -2577,6 +2651,33 @@
             const idle15Title = buildTitle(a.idleTimestamps15);
             const idle30Title = buildTitle(a.idleTimestamps30);
 
+            // Gap-based color: green (ok) -> orange (minor) -> red (major).
+            // Thresholds in minutes.
+            const gapColor = (mins) => {
+                if (mins == null || isNaN(mins)) return '';
+                if (mins > 10) return '#c0392b';   // deep red — major
+                if (mins > 3)  return '#e74c3c';   // red — over tolerance
+                if (mins > 0)  return '#e67e22';   // orange — minor
+                return '#27ae60';                  // green — on time
+            };
+            const gapMins = (from, to) => (from && to) ? Math.max(0, (to.getTime() - from.getTime()) / 60000) : null;
+            // A styled time <td> tinted by a gap size (minutes).
+            const timeCell = (dateVal, gap) => {
+                if (!dateVal) return `<td>\u2013</td>`;
+                const c = gap != null ? gapColor(gap) : '';
+                const style = c ? ` style="color:${c};font-weight:600"` : '';
+                const title = gap != null ? ` title="${gap.toFixed(1)} min gap"` : '';
+                return `<td${style}${title}>${formatTimeShort(dateVal)}</td>`;
+            };
+
+            // Precompute gaps for this AA
+            const fastGap   = gapMins(a.clockIn, a.firstScan);                       // clock-in -> first scan
+            const b1EarlyG  = gapMins(a.lastScanBeforeBreak1, a.actualBreak1Start);  // left break 1 early
+            const b1LateG   = gapMins(a.actualBreak1End, a.firstScanAfterBreak1);    // late back from break 1
+            const b2EarlyG  = gapMins(a.lastScanBeforeBreak2, a.break2StartRef);     // left break 2 early
+            const b2LateG   = gapMins(a.break2EndRef, a.firstScanAfterBreak2);       // late back from break 2
+            const strongGap = gapMins(a.lastScan, a.strongRef);                     // last scan -> shift end
+
             // Build cells for each active column
             const cells = activeColumns.map(col => {
                 switch (col.key) {
@@ -2603,19 +2704,24 @@
                             ? `<td style="color:#e67e22;font-weight:600">${formatTimeShort(a.actualBreak1Start)}\u2013${formatTimeShort(a.actualBreak1End)}</td>`
                             : `<td>\u2013</td>`;
                     case 'clockIn':
+                        // Clock in itself has no gap tint
                         return `<td>${a.clockIn ? formatTimeShort(a.clockIn) : '\u2013'}</td>`;
                     case 'firstScan':
-                        return `<td>${a.firstScan ? formatTimeShort(a.firstScan) : '\u2013'}</td>`;
+                        // Tint by fast-start gap (clock-in -> first scan)
+                        return timeCell(a.firstScan, fastGap);
                     case 'lastScanBeforeBreak1':
-                        return `<td>${a.lastScanBeforeBreak1 ? formatTimeShort(a.lastScanBeforeBreak1) : '\u2013'}</td>`;
+                        // Tint by how early they left before break 1
+                        return timeCell(a.lastScanBeforeBreak1, b1EarlyG);
                     case 'firstScanAfterBreak1':
-                        return `<td>${a.firstScanAfterBreak1 ? formatTimeShort(a.firstScanAfterBreak1) : '\u2013'}</td>`;
+                        // Tint by how late they returned from break 1
+                        return timeCell(a.firstScanAfterBreak1, b1LateG);
                     case 'lastScanBeforeBreak2':
-                        return `<td>${a.lastScanBeforeBreak2 ? formatTimeShort(a.lastScanBeforeBreak2) : '\u2013'}</td>`;
+                        return timeCell(a.lastScanBeforeBreak2, b2EarlyG);
                     case 'firstScanAfterBreak2':
-                        return `<td>${a.firstScanAfterBreak2 ? formatTimeShort(a.firstScanAfterBreak2) : '\u2013'}</td>`;
+                        return timeCell(a.firstScanAfterBreak2, b2LateG);
                     case 'lastScan':
-                        return `<td>${a.lastScan ? formatTimeShort(a.lastScan) : '\u2013'}</td>`;
+                        // Tint by strong-finish gap (last scan -> shift end)
+                        return timeCell(a.lastScan, strongGap);
                     default:
                         return '<td>\u2013</td>';
                 }
