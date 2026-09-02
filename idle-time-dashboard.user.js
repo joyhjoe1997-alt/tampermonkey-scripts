@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         Idle Time Dashboard
 // @namespace    http://tampermonkey.net/
-// @version      3.4
+// @version      3.5
 // @description  Standalone idle time dashboard — time-aware metrics (only flags phases that have started), new fields: Clock In, First Scan, First Scan After Break 1, Last Scan
 // @author       joyhjoe
 // @match        https://fclm-portal-dub.dub.proxy.amazon.com/*
@@ -28,7 +28,7 @@
     // SECTION 1: CONFIGURATION & DEFAULTS
     // ═══════════════════════════════════════════════════════════════
 
-    const VERSION = '3.4';
+    const VERSION = '3.5';
     const BASE_URL = location.origin; // Auto-detect: works on both fclm-portal.amazon.com and fclm-portal-dub.dub.proxy.amazon.com
 
     // ── Enrichment config (login + station lookup, ported from Track4) ──
@@ -1243,6 +1243,12 @@
         const break2Start = breakWindows.break2.breakStart;
         const break2End   = breakWindows.break2.breakEnd;
 
+        // Did the AA actually take break 1? Only then do we compute the
+        // "before/after break 1" scan fields. If they clocked in at break time
+        // or skipped break 1, these stay blank while First Scan / Last Scan /
+        // Break 2 fields still populate normally.
+        const tookBreak1 = !!actualBreak1;
+
         // ── Timing fields ──────────────────────────────────────────────
         // All scan times are derived directly from activitySegments (the real
         // non-editable on-task rows from the timeDetails page). These are the
@@ -1277,10 +1283,11 @@
             const sorted = acts.slice().sort((a, b) => a.start - b.start);
 
             sorted.forEach(act => {
-                // Only apply a lower bound (clockIn) to exclude pre-shift rows.
-                // Do NOT apply an upper bound — AAs who leave early would have
-                // post-break rows excluded if we bounded by clockOut/shiftEnd.
-                if (act.start < shiftStartRef) return;
+                // Lower bound with a 5-min tolerance below clock-in to avoid
+                // excluding the first real scan due to second-level rounding
+                // between the PPA punch and the activity timestamp.
+                // No upper bound — AAs who leave early keep their post-break rows.
+                if (act.start.getTime() < shiftStartRef.getTime() - 5 * 60000) return;
 
                 // firstScan: earliest activity start at or after clock-in
                 if (!firstScan || act.start < firstScan) firstScan = act.start;
@@ -1288,19 +1295,19 @@
                 // lastScan: latest activity end within clocked-in window
                 if (!lastScan || act.end > lastScan) lastScan = act.end;
 
-                // lastScanBeforeBreak1: end of last activity that finishes
-                // at or before break start
-                if (act.end <= break1Start) {
-                    if (!lastScanBeforeBreak1 || act.end > lastScanBeforeBreak1) {
-                        lastScanBeforeBreak1 = act.end;
+                // Break 1 scan fields — only if the AA actually took break 1
+                if (tookBreak1) {
+                    // lastScanBeforeBreak1: end of last activity finishing at/before break start
+                    if (act.end <= break1Start) {
+                        if (!lastScanBeforeBreak1 || act.end > lastScanBeforeBreak1) {
+                            lastScanBeforeBreak1 = act.end;
+                        }
                     }
-                }
-
-                // firstScanAfterBreak1: start of first activity that begins
-                // at or after break end
-                if (act.start >= break1End) {
-                    if (!firstScanAfterBreak1 || act.start < firstScanAfterBreak1) {
-                        firstScanAfterBreak1 = act.start;
+                    // firstScanAfterBreak1: start of first activity beginning at/after break end
+                    if (act.start >= break1End) {
+                        if (!firstScanAfterBreak1 || act.start < firstScanAfterBreak1) {
+                            firstScanAfterBreak1 = act.start;
+                        }
                     }
                 }
 
@@ -1328,14 +1335,16 @@
                 if (seg.start >= shiftStartRef) {
                     if (!lastScan || seg.start > lastScan) lastScan = seg.start;
                 }
-                if (seg.end <= break1Start) {
-                    if (!lastScanBeforeBreak1 || seg.end > lastScanBeforeBreak1) {
-                        lastScanBeforeBreak1 = seg.end;
+                if (tookBreak1) {
+                    if (seg.end <= break1Start) {
+                        if (!lastScanBeforeBreak1 || seg.end > lastScanBeforeBreak1) {
+                            lastScanBeforeBreak1 = seg.end;
+                        }
                     }
-                }
-                if (seg.start >= break1End) {
-                    if (!firstScanAfterBreak1 || seg.start < firstScanAfterBreak1) {
-                        firstScanAfterBreak1 = seg.start;
+                    if (seg.start >= break1End) {
+                        if (!firstScanAfterBreak1 || seg.start < firstScanAfterBreak1) {
+                            firstScanAfterBreak1 = seg.start;
+                        }
                     }
                 }
                 if (seg.end <= break2Start) {
