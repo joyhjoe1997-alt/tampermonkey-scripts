@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Sideline - Multi-Tote Deletion Automation
 // @author       joyhjoe
-// @version      6.0
+// @version      6.1
 // @description  Automated tote processing for AFT Poirot V3 with multi-item price lookup
 // @match        https://aft-poirot-website-dub.dub.proxy.amazon.com/*
 // @icon         https://cdn-icons-png.flaticon.com/512/3687/3687412.png
@@ -12,10 +12,13 @@
 // ==/UserScript==
 
 /**
- * SIDELINE v6.0 - AFT Poirot Tote Automation
+ * SIDELINE v6.1 - AFT Poirot Tote Automation
  *
  * Features:
  *   - Paste tote IDs, auto-processes them sequentially
+ *   - Silent duplicate removal on Load List (persists across reloads)
+ *   - Detects blocking scan errors (e.g. Reverse Logistics) instantly and
+ *     shows a "Cannot Process" skip/stop dialog
  *   - Reads all items (FNSKU/ASIN + qty) from the Change Container page
  *   - Resolves X0 FNSKUs to ASINs via FC Research /results/product API
  *   - Fetches live Amazon.co.uk prices (parallel batches of 3)
@@ -471,6 +474,33 @@
         });
     }
 
+    /** Returns the trimmed text of a visible blocking error banner on the scan
+     *  page, or null. Scoped to exclude our own panel/dialogs. */
+    function getScanError() {
+        for (const alert of document.querySelectorAll('.alert--error')) {
+            if (alert.closest('#pvt-panel, #pvt-cc-dialog, #pvt-hq-dialog, #pvt-skip-dialog, #pvt-error-dialog')) continue;
+            if (alert.offsetParent === null) continue; // not visible
+            const msg = (alert.innerText || alert.textContent || '').trim();
+            if (msg) return msg;
+        }
+        return null;
+    }
+
+    /** Races the Change Container button against an error banner after a scan.
+     *  Resolves with { type: 'change'|'error'|'timeout', el?, message? }. */
+    function waitForChangeOrError(timeout = TIMING.changeTimeout) {
+        return new Promise(resolve => {
+            const start = Date.now();
+            const iv = setInterval(() => {
+                const btn = document.querySelector(SEL.changeContainer);
+                if (btn?.offsetParent != null) { clearInterval(iv); resolve({ type: 'change', el: btn }); return; }
+                const err = getScanError();
+                if (err) { clearInterval(iv); resolve({ type: 'error', message: err }); return; }
+                if (Date.now() - start > timeout) { clearInterval(iv); resolve({ type: 'timeout' }); }
+            }, TIMING.pollInterval);
+        });
+    }
+
     /** Finds and returns the Yes/OK button in the confirmation popup */
     function findYesButton() {
         // Exact selector first
@@ -537,6 +567,30 @@
                 </div>`);
             document.getElementById('pvt-skip-next').onclick = () => { overlay.remove(); resolve('skip'); };
             document.getElementById('pvt-skip-stop').onclick = () => { overlay.remove(); resolve('stop'); };
+        });
+    }
+
+    /** Shows "Cannot Process" dialog when a blocking error banner appears after
+     *  scanning (e.g. Reverse Logistics item). Shows the real error text. */
+    function showCannotProcess(toteId, message) {
+        return new Promise(resolve => {
+            const safeMsg = (message || 'This container cannot be used.')
+                .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+            const overlay = createDialog('pvt-error-dialog', `
+                <div style="background:#fff;border-radius:14px;padding:28px;max-width:440px;width:90%;box-shadow:0 12px 40px rgba(0,0,0,.3);text-align:center">
+                    <div style="font-size:40px">&#9940;</div>
+                    <div style="font-size:17px;font-weight:700;color:#e74c3c;margin:12px 0">Cannot Process</div>
+                    <div style="font-size:14px;color:#2c3e50;line-height:1.6;margin-bottom:16px">
+                        Tote <b>${toteId}</b> returned an error:
+                    </div>
+                    <div style="font-size:13px;color:#c0392b;background:#fdf0ef;border:1px solid #f5c6cb;border-radius:8px;padding:12px;line-height:1.5;margin-bottom:20px;text-align:left">${safeMsg}</div>
+                    <div style="display:flex;gap:10px;justify-content:center">
+                        <button id="pvt-err-next" style="padding:10px 22px;border:none;border-radius:8px;font:600 13px Segoe UI;cursor:pointer;background:#f39c12;color:#fff">Skip to next</button>
+                        <button id="pvt-err-stop" style="padding:10px 22px;border:none;border-radius:8px;font:600 13px Segoe UI;cursor:pointer;background:#e74c3c;color:#fff">Stop</button>
+                    </div>
+                </div>`);
+            document.getElementById('pvt-err-next').onclick = () => { overlay.remove(); resolve('skip'); };
+            document.getElementById('pvt-err-stop').onclick = () => { overlay.remove(); resolve('stop'); };
         });
     }
 
@@ -702,13 +756,32 @@
             renderList();
             pressEnter(scanInput);
 
-            // --- Step 3: Wait for page transition ---
-            await waitForPageLeave();
-
-            // --- Step 4: Wait for Change Container button ---
+            // --- Step 3+4: Detect a blocking error immediately, or wait for the
+            // page to transition to the Change Container button. The error check
+            // runs concurrently so a Reverse Logistics error is caught instantly
+            // instead of waiting out the page-transition timeout. ---
             setStatus('Waiting for Change Container...', '#3498db');
-            const changeBtn = await waitFor(SEL.changeContainer);
-            if (!changeBtn || !autoRunning) { continue; }
+            const outcome = await waitForChangeOrError(TIMING.pageTimeout);
+            if (!autoRunning) { continue; }
+
+            // --- Blocking error (e.g. Reverse Logistics item) ---
+            if (outcome.type === 'error') {
+                setStatus(`Tote ${idx + 1} cannot be processed`, '#e74c3c');
+                const decision = await showCannotProcess(toteId, outcome.message);
+                if (decision === 'stop') { autoRunning = false; clearState(); break; }
+                // Skip: mark handled, advance, reload for a clean DOM + auto-resume
+                doneSet.add(idx);
+                currentIdx++;
+                saveState();
+                renderList();
+                location.reload();
+                return;
+            }
+
+            if (outcome.type === 'timeout') { setStatus('Change Container timeout - retrying', 'orange'); continue; }
+
+            const changeBtn = outcome.el;
+            if (!changeBtn) { continue; }
 
             // Wait for item quantity to be readable (no timeout - wait until loaded)
             let qty = -1;
@@ -865,16 +938,33 @@
         wrap.children[currentIdx]?.scrollIntoView({ block: 'nearest' });
     }
 
+    /** Parses textarea text into a deduped tote list (keeps first occurrence,
+     *  preserves order, case-insensitive). Returns { list, removed }. */
+    function dedupeTotes(text) {
+        const raw = (text || '').split('\n').map(s => s.trim()).filter(Boolean);
+        const seen = new Set();
+        const list = raw.filter(id => {
+            const key = id.toLowerCase();
+            if (seen.has(key)) return false;
+            seen.add(key);
+            return true;
+        });
+        return { list, removed: raw.length - list.length };
+    }
+
     function loadList() {
         const ta = document.getElementById('pvt-ta');
         if (!ta) return;
-        toteList = ta.value.split('\n').map(s => s.trim()).filter(Boolean);
+        const { list, removed } = dedupeTotes(ta.value);
+        toteList = list;
         doneSet = new Set();
         currentIdx = 0;
+        // Persist the deduped list so reloads (skip/auto-resume) stay deduped
+        ta.value = list.join('\n');
         ls.set(LS.list, ta.value);
         clearState();
         renderList();
-        setStatus(`${toteList.length} tote(s) loaded`, '#27ae60');
+        setStatus(`${toteList.length} tote(s) loaded${removed > 0 ? ` (${removed} duplicate${removed === 1 ? '' : 's'} removed)` : ''}`, '#27ae60');
     }
 
     function clearAll() {
@@ -943,8 +1033,13 @@
         // Restore tote list from localStorage
         const saved = ls.get(LS.list);
         if (saved) {
-            document.getElementById('pvt-ta').value = saved;
-            toteList = saved.split('\n').map(s => s.trim()).filter(Boolean);
+            // Dedupe on restore too, so skip/auto-resume reloads never
+            // reintroduce duplicates from a stale saved list.
+            const { list } = dedupeTotes(saved);
+            const deduped = list.join('\n');
+            document.getElementById('pvt-ta').value = deduped;
+            if (deduped !== saved) ls.set(LS.list, deduped);
+            toteList = list;
         }
 
         // Restore run state (supports auto-resume after skip-reload)
