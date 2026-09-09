@@ -5,6 +5,8 @@
 // @description  Automated tote processing for AFT Poirot V3 with multi-item price lookup
 // @match        https://aft-poirot-website-dub.dub.proxy.amazon.com/*
 // @icon         https://cdn-icons-png.flaticon.com/512/3687/3687412.png
+// @updateURL    https://github.com/joyhjoe1997-alt/tampermonkey-scripts/raw/main/sideline-6.0.user.js
+// @downloadURL  https://github.com/joyhjoe1997-alt/tampermonkey-scripts/raw/main/sideline-6.0.user.js
 // @run-at       document-idle
 // @grant        GM_xmlhttpRequest
 // @connect      amazon.co.uk
