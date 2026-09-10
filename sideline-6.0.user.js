@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Sideline - Multi-Tote Deletion Automation
 // @author       joyhjoe
-// @version      6.2
+// @version      6.3
 // @description  Automated tote processing for AFT Poirot V3 with multi-item price lookup
 // @match        https://aft-poirot-website-dub.dub.proxy.amazon.com/*
 // @icon         https://cdn-icons-png.flaticon.com/512/3687/3687412.png
@@ -16,10 +16,12 @@
 // ==/UserScript==
 
 /**
- * SIDELINE v6.2 - AFT Poirot Tote Automation
+ * SIDELINE v6.3 - AFT Poirot Tote Automation
  *
  * Features:
  *   - Paste tote IDs, auto-processes them sequentially
+ *   - Background-tab safe: polling runs off a Web Worker ticker so the
+ *     automation keeps progressing when the tab is unfocused/backgrounded
  *   - In-script update checker: compares @version against the GitHub raw file
  *     and shows an "Install update" banner when a newer version is published
  *   - Silent duplicate removal on Load List (persists across reloads)
@@ -78,7 +80,7 @@
     const FCR_BASE = 'https://qi-fcresearch-eu.corp.amazon.com';
 
     /** Current running version + where to check/download updates */
-    const VERSION = '6.2';
+    const VERSION = '6.3';
     const UPDATE_URL = 'https://github.com/joyhjoe1997-alt/tampermonkey-scripts/raw/main/sideline-6.0.user.js';
 
     /** localStorage keys */
@@ -107,6 +109,68 @@
         get: (k, d = '') => localStorage.getItem(k) ?? d,
         set: (k, v) => localStorage.setItem(k, String(v)),
     };
+
+    // =========================================================================
+    //  BACKGROUND TICKER - keeps polling alive in unfocused/background tabs
+    // =========================================================================
+    // Browsers throttle setInterval/setTimeout to ~1/sec (or worse) in
+    // background tabs, which stalls the automation loop. A Web Worker runs on
+    // its own thread that is NOT throttled the same way, so we drive all polling
+    // from worker "ticks". Falls back to setInterval if workers are unavailable.
+
+    const bgTicker = (() => {
+        const TICK_MS = 200;
+        const callbacks = new Map(); // id -> fn
+        let nextId = 1;
+        let worker = null;
+
+        function fireAll() { for (const fn of callbacks.values()) { try { fn(); } catch { } } }
+
+        let fallbackIv = null;
+        function startFallback() {
+            if (fallbackIv) return;
+            // Main-thread interval (throttled in background, but still works)
+            fallbackIv = setInterval(fireAll, TICK_MS);
+        }
+
+        try {
+            const blob = new Blob([
+                `let iv=null;onmessage=e=>{if(e.data==='start'&&!iv){iv=setInterval(()=>postMessage('tick'),${TICK_MS});}else if(e.data==='stop'&&iv){clearInterval(iv);iv=null;}};`
+            ], { type: 'application/javascript' });
+            worker = new Worker(URL.createObjectURL(blob));
+            let gotTick = false;
+            worker.onmessage = () => { gotTick = true; fireAll(); };
+            worker.onerror = () => { worker = null; startFallback(); };
+            // Watchdog: if the worker is silently blocked (e.g. strict CSP on
+            // worker-src blob:), fall back to a main-thread interval.
+            worker.postMessage('start');
+            setTimeout(() => { if (!gotTick) { worker = null; startFallback(); } }, 1000);
+        } catch { worker = null; }
+
+        if (!worker) startFallback();
+
+        function ensureRunning() { if (worker && callbacks.size > 0) worker.postMessage('start'); }
+        function maybeStop() { if (worker && callbacks.size === 0) worker.postMessage('stop'); }
+
+        return {
+            /** Registers fn to run every tick (~200ms). Returns an id to clear. */
+            add(fn) { const id = nextId++; callbacks.set(id, fn); ensureRunning(); return id; },
+            /** Stops a previously added callback. */
+            remove(id) { callbacks.delete(id); maybeStop(); },
+        };
+    })();
+
+    /** Non-throttled interval built on the background ticker. Returns a handle. */
+    function bgInterval(fn) { return bgTicker.add(fn); }
+    /** Clears a bgInterval handle. */
+    function clearBgInterval(id) { bgTicker.remove(id); }
+    /** Non-throttled sleep (resolves after ~ms, unaffected by background throttling). */
+    function bgSleep(ms) {
+        return new Promise(resolve => {
+            const start = Date.now();
+            const id = bgTicker.add(() => { if (Date.now() - start >= ms) { bgTicker.remove(id); resolve(); } });
+        });
+    }
 
     // =========================================================================
     // =========================================================================
@@ -399,11 +463,11 @@
     function waitFor(selector, timeout = TIMING.changeTimeout) {
         return new Promise(resolve => {
             const start = Date.now();
-            const iv = setInterval(() => {
+            const iv = bgInterval(() => {
                 const el = document.querySelector(selector);
-                if (el?.offsetParent !== null) { clearInterval(iv); resolve(el); }
-                else if (Date.now() - start > timeout) { clearInterval(iv); resolve(null); }
-            }, TIMING.pollInterval);
+                if (el?.offsetParent !== null) { clearBgInterval(iv); resolve(el); }
+                else if (Date.now() - start > timeout) { clearBgInterval(iv); resolve(null); }
+            });
         });
     }
 
@@ -411,10 +475,10 @@
     function waitForScanPage(timeout = TIMING.scanTimeout) {
         return new Promise(resolve => {
             const start = Date.now();
-            const iv = setInterval(() => {
-                if (isOnScanPage()) { clearInterval(iv); resolve(document.querySelector(SEL.scanInput)); }
-                else if (Date.now() - start > timeout) { clearInterval(iv); resolve(null); }
-            }, TIMING.pollInterval);
+            const iv = bgInterval(() => {
+                if (isOnScanPage()) { clearBgInterval(iv); resolve(document.querySelector(SEL.scanInput)); }
+                else if (Date.now() - start > timeout) { clearBgInterval(iv); resolve(null); }
+            });
         });
     }
 
@@ -422,9 +486,9 @@
     function waitForPageLeave(timeout = TIMING.pageTimeout) {
         return new Promise(resolve => {
             const start = Date.now();
-            const iv = setInterval(() => {
-                if (!isOnScanPage() || Date.now() - start > timeout) { clearInterval(iv); resolve(); }
-            }, TIMING.pollInterval);
+            const iv = bgInterval(() => {
+                if (!isOnScanPage() || Date.now() - start > timeout) { clearBgInterval(iv); resolve(); }
+            });
         });
     }
 
@@ -446,6 +510,8 @@
                     .length;
             }
 
+            let stableSince = 0; // timestamp when count last stabilized (>0)
+
             function check() {
                 const count = countItems();
                 const elapsed = Math.round((Date.now() - start) / 1000);
@@ -454,21 +520,25 @@
                 // Exact match with expected row count — done immediately
                 if (expected > 0 && count >= expected) { done(); return; }
 
-                // Count changed — reset stability timer
+                // Count changed — reset stability window
                 if (count !== lastCount) {
                     lastCount = count;
-                    if (stableTimer) clearTimeout(stableTimer);
-                    // Wait 500ms of no changes to confirm all loaded
-                    if (count > 0) {
-                        stableTimer = setTimeout(done, 500);
-                    }
+                    stableSince = count > 0 ? Date.now() : 0;
                 }
+
+                // Stable for 500ms with items present — assume all loaded
+                if (stableSince && Date.now() - stableSince >= 500) { done(); return; }
+
+                // Safety timeout
+                if (Date.now() - start > TIMING.itemsTimeout) { done(); }
             }
 
+            let finished = false;
             function done() {
+                if (finished) return;
+                finished = true;
                 observer.disconnect();
-                if (stableTimer) clearTimeout(stableTimer);
-                if (safetyTimeout) clearTimeout(safetyTimeout);
+                clearBgInterval(tick);
                 resolve();
             }
 
@@ -476,8 +546,10 @@
             const observer = new MutationObserver(check);
             observer.observe(document.body, { childList: true, subtree: true });
 
-            // Safety timeout
-            const safetyTimeout = setTimeout(done, TIMING.itemsTimeout);
+            // Background-safe polling tick drives the stability + safety timing
+            // (MutationObserver alone can miss the "no more changes" case, and
+            // setTimeout is throttled in background tabs).
+            const tick = bgInterval(check);
 
             // Initial check (items might already be there)
             check();
@@ -501,13 +573,13 @@
     function waitForChangeOrError(timeout = TIMING.changeTimeout) {
         return new Promise(resolve => {
             const start = Date.now();
-            const iv = setInterval(() => {
+            const iv = bgInterval(() => {
                 const btn = document.querySelector(SEL.changeContainer);
-                if (btn?.offsetParent != null) { clearInterval(iv); resolve({ type: 'change', el: btn }); return; }
+                if (btn?.offsetParent != null) { clearBgInterval(iv); resolve({ type: 'change', el: btn }); return; }
                 const err = getScanError();
-                if (err) { clearInterval(iv); resolve({ type: 'error', message: err }); return; }
-                if (Date.now() - start > timeout) { clearInterval(iv); resolve({ type: 'timeout' }); }
-            }, TIMING.pollInterval);
+                if (err) { clearBgInterval(iv); resolve({ type: 'error', message: err }); return; }
+                if (Date.now() - start > timeout) { clearBgInterval(iv); resolve({ type: 'timeout' }); }
+            });
         });
     }
 
@@ -537,11 +609,11 @@
         window.confirm = () => true; // auto-accept native dialogs
         return new Promise(resolve => {
             const start = Date.now();
-            const iv = setInterval(() => {
+            const iv = bgInterval(() => {
                 const btn = findYesButton();
-                if (btn) { clearInterval(iv); resolve(btn); }
-                else if (Date.now() - start > timeout) { clearInterval(iv); resolve(null); }
-            }, TIMING.pollInterval);
+                if (btn) { clearBgInterval(iv); resolve(btn); }
+                else if (Date.now() - start > timeout) { clearBgInterval(iv); resolve(null); }
+            });
         });
     }
 
@@ -808,7 +880,7 @@
                 if (qty === -1) {
                     const elapsed = Math.round((Date.now() - qtyStart) / 1000);
                     setStatus(`Waiting for inventory to load... (${elapsed}s)`, '#3498db');
-                    await new Promise(r => setTimeout(r, 300));
+                    await bgSleep(300);
                 }
             }
 
