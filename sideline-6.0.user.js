@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Sideline - Multi-Tote Deletion Automation
 // @author       joyhjoe
-// @version      6.1
+// @version      6.2
 // @description  Automated tote processing for AFT Poirot V3 with multi-item price lookup
 // @match        https://aft-poirot-website-dub.dub.proxy.amazon.com/*
 // @icon         https://cdn-icons-png.flaticon.com/512/3687/3687412.png
@@ -11,13 +11,17 @@
 // @grant        GM_xmlhttpRequest
 // @connect      amazon.co.uk
 // @connect      qi-fcresearch-eu.corp.amazon.com
+// @connect      github.com
+// @connect      raw.githubusercontent.com
 // ==/UserScript==
 
 /**
- * SIDELINE v6.1 - AFT Poirot Tote Automation
+ * SIDELINE v6.2 - AFT Poirot Tote Automation
  *
  * Features:
  *   - Paste tote IDs, auto-processes them sequentially
+ *   - In-script update checker: compares @version against the GitHub raw file
+ *     and shows an "Install update" banner when a newer version is published
  *   - Silent duplicate removal on Load List (persists across reloads)
  *   - Detects blocking scan errors (e.g. Reverse Logistics) instantly and
  *     shows a "Cannot Process" skip/stop dialog
@@ -72,6 +76,10 @@
     const ASIN_RE = /\bB[A-Z0-9]{9}\b/;
     const FNSKU_RE = /\bX[A-Z0-9]{9}\b/;
     const FCR_BASE = 'https://qi-fcresearch-eu.corp.amazon.com';
+
+    /** Current running version + where to check/download updates */
+    const VERSION = '6.2';
+    const UPDATE_URL = 'https://github.com/joyhjoe1997-alt/tampermonkey-scripts/raw/main/sideline-6.0.user.js';
 
     /** localStorage keys */
     const LS = {
@@ -1025,12 +1033,71 @@
     }
 
     // =========================================================================
+    //  UPDATE CHECKER - compares running @version against the remote raw file
+    // =========================================================================
+
+    /** Compares two dotted version strings. Returns 1 if a>b, -1 if a<b, 0 if equal. */
+    function compareVersions(a, b) {
+        const pa = String(a).split('.').map(n => parseInt(n, 10) || 0);
+        const pb = String(b).split('.').map(n => parseInt(n, 10) || 0);
+        const len = Math.max(pa.length, pb.length);
+        for (let i = 0; i < len; i++) {
+            const x = pa[i] || 0, y = pb[i] || 0;
+            if (x > y) return 1;
+            if (x < y) return -1;
+        }
+        return 0;
+    }
+
+    /** Fetches the remote script header and returns its @version, or null. */
+    function fetchRemoteVersion() {
+        return new Promise(resolve => {
+            GM_xmlhttpRequest({
+                method: 'GET',
+                url: `${UPDATE_URL}?_=${Date.now()}`, // cache-bust
+                headers: { 'Cache-Control': 'no-cache' },
+                onload(resp) {
+                    const m = (resp.responseText || '').match(/@version\s+([\d.]+)/);
+                    resolve(m ? m[1] : null);
+                },
+                onerror() { resolve(null); },
+                ontimeout() { resolve(null); },
+            });
+        });
+    }
+
+    /** Shows an update banner inside the panel with a one-click install link. */
+    function showUpdateBanner(remoteVersion) {
+        if (document.getElementById('pvt-update-banner')) return;
+        const body = document.getElementById('pvt-body');
+        if (!body) return;
+        const banner = document.createElement('div');
+        banner.id = 'pvt-update-banner';
+        banner.style.cssText = 'margin-bottom:10px;padding:10px;border-radius:8px;background:#fff3cd;border:1px solid #ffe08a;color:#8a6d00;font:600 12px Segoe UI;text-align:center';
+        banner.innerHTML = `Update available: v${remoteVersion} (you have v${VERSION})<br>
+            <a href="${UPDATE_URL}" target="_blank" rel="noopener" style="display:inline-block;margin-top:6px;padding:6px 14px;border-radius:6px;background:#f39c12;color:#fff;text-decoration:none">Install update</a>`;
+        body.insertBefore(banner, body.firstChild);
+    }
+
+    /** Checks for a newer remote version and shows the banner if found. */
+    async function checkForUpdate() {
+        const remote = await fetchRemoteVersion();
+        if (remote && compareVersions(remote, VERSION) > 0) {
+            showUpdateBanner(remote);
+            setStatus(`Update available: v${remote}`, '#f39c12');
+        }
+    }
+
+    // =========================================================================
     //  INITIALIZATION
     // =========================================================================
 
     function init() {
         if (document.getElementById('pvt-panel')) return;
         buildPanel();
+
+        // Check GitHub for a newer version (non-blocking)
+        checkForUpdate();
 
         // Restore tote list from localStorage
         const saved = ls.get(LS.list);
