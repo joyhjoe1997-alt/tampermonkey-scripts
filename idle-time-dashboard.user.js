@@ -51,7 +51,15 @@
         percentileThreshold: 8,
         concurrencyLimit: 10,
         warehouseId: 'EMA4',
-        shiftPreset: 'night'
+        shiftPreset: 'night',
+        // When true, idle time is measured from raw scan gaps (activityDetails
+        // endpoint) instead of the edited .editable rows on timeDetails. Scan
+        // gaps are ground truth — the time between consecutive real scans — so
+        // they don't depend on how FCLM has already bucketed/edited time.
+        // Falls back to .editable parsing automatically when scans < 2.
+        useScanGapIdle: true,
+        // Minimum gap (minutes) between consecutive scans to count as idle.
+        scanGapThresholdMin: 15
     };
 
     let settings = {};
@@ -605,10 +613,16 @@
             return cached;
         }
         const bucket = { timestamp: now, stationsById: {}, stationsByLogin: {} };
+        // Wider SCC process sweep (ported from FCLM All-in-One) — resolves
+        // stations for many more AAs than the original 3-process list. Each
+        // call is non-fatal via Promise.allSettled.
+        const SCC_PROCESSES = [
+            'PPAFE1', 'PPAFE2', 'Singles', 'SinglesMix', 'SinglesCW1000',
+            'SinglesSIOC', 'SmartPac', 'SmartPacPaper', 'CDC', 'ICQA',
+            'PackFlow', 'Induct', 'Rebin', 'P2R2', 'P2R3', 'P2R4', 'P2R5'
+        ];
         await Promise.allSettled([
-            enrichFetchStationsFromSCC(warehouseId, 'PPAFE1', bucket),
-            enrichFetchStationsFromSCC(warehouseId, 'PPAFE2', bucket),
-            enrichFetchStationsFromSCC(warehouseId, 'Singles', bucket),
+            ...SCC_PROCESSES.map(p => enrichFetchStationsFromSCC(warehouseId, p, bucket)),
             enrichFetchStationsFromRobo(warehouseId, bucket),
             enrichFetchStationsFromIFC(warehouseId, bucket)
         ]);
@@ -960,6 +974,116 @@
         });
 
         return await fetchWithConcurrency(tasks, settings.concurrencyLimit);
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // SECTION 5B: CONCURRENT activityDetails FETCHER (raw scan events)
+    //   Ported concept from FCLM All-in-One. Pulls the raw scan activity
+    //   log for each AA so idle time can be measured from the gaps BETWEEN
+    //   consecutive scans — ground truth — rather than from FCLM's edited
+    //   .editable segments. Non-fatal: a null result falls back to the
+    //   .editable idle parsing in the pipeline.
+    // ═══════════════════════════════════════════════════════════════
+
+    async function fetchAllActivityDetails(aaList) {
+        setStatus(`Fetching scan activity for ${aaList.length} associates...`, '#3498db');
+        showProgress(0, aaList.length);
+
+        const { startDate, endDate } = getShiftDates();
+        const fmtDay = (d) => `${d.getFullYear()}/${String(d.getMonth() + 1).padStart(2, '0')}/${String(d.getDate()).padStart(2, '0')}`;
+
+        const qs =
+            `reportFormat=HTML&warehouseId=${encodeURIComponent(settings.warehouseId)}` +
+            `&maxIntradayDays=1&spanType=Intraday` +
+            `&startDateIntraday=${encodeURIComponent(fmtDay(startDate))}` +
+            `&startHourIntraday=${startDate.getHours()}&startMinuteIntraday=${startDate.getMinutes()}` +
+            `&endDateIntraday=${encodeURIComponent(fmtDay(endDate))}` +
+            `&endHourIntraday=${endDate.getHours()}&endMinuteIntraday=${endDate.getMinutes()}`;
+
+        const tasks = aaList.map(aa => {
+            return async () => {
+                const url = `${BASE_URL}/employee/activityDetails?employeeId=${aa.employeeId}&${qs}`;
+                try {
+                    const html = await gmFetch(url, 15000);
+                    return { employeeId: aa.employeeId, html };
+                } catch (e) {
+                    console.warn(`[IdleDash] Failed to fetch activityDetails for ${aa.employeeId}:`, e.message);
+                    return { employeeId: aa.employeeId, html: null };
+                }
+            };
+        });
+
+        return await fetchWithConcurrency(tasks, settings.concurrencyLimit);
+    }
+
+    // Parse raw scan timestamps from an activityDetails HTML page.
+    // Returns a sorted array of Date objects (ascending). Empty if none.
+    function parseActivityScans(html) {
+        if (!html) return [];
+        const doc = new DOMParser().parseFromString(html, 'text/html');
+
+        // Prefer the DataTables result table; fall back to any tbody rows.
+        let dataTable = null;
+        doc.querySelectorAll('table').forEach(t => {
+            if ((t.id && t.id.indexOf('DataTables_') > -1) || /dataTable/i.test(t.className)) dataTable = t;
+        });
+        const rows = dataTable
+            ? dataTable.querySelectorAll('tbody tr')
+            : doc.querySelectorAll('tbody tr');
+
+        // Scans that represent real "doing work" events, and the tools that
+        // emit them. Matches FCLM All-in-One's filter.
+        const SCAN_ACTIONS = /ISSInspection|CubiscannedItem|ItemDataScanned|CDCInspection/i;
+        const SCAN_TOOLS = /WAVE|MadCat|AFTItemOmniscanService/i;
+
+        const scanTs = [];
+        const allTs = [];
+
+        rows.forEach(row => {
+            const cells = Array.from(row.querySelectorAll('td'));
+            if (cells.length < 2) return;
+
+            // Timestamp is usually in the sorting_1 cell (DataTables) or col 0.
+            const tsCell = row.querySelector('td.sorting_1 span, td.sorting_1') || cells[0];
+            const txt = (tsCell.textContent || '').trim();
+            // activityDetails uses "YYYY/MM/DD HH:MM:SS" (optionally trailing TZ).
+            if (!/^\d{4}\//.test(txt)) return;
+            const ts = new Date(txt.replace(/\s+[A-Z]{2,4}$/, ''));
+            if (isNaN(ts.getTime())) return;
+
+            allTs.push(ts);
+            const rowText = row.textContent || '';
+            if (SCAN_ACTIONS.test(rowText) && SCAN_TOOLS.test(rowText)) scanTs.push(ts);
+        });
+
+        // If the strict scan filter found too little, fall back to all timestamped
+        // rows (same resilience step as the All-in-One tracker).
+        const chosen = scanTs.length >= 2 ? scanTs : allTs;
+        chosen.sort((a, b) => a - b);
+        return chosen;
+    }
+
+    // Convert a sorted scan-timestamp array into idle segments, one per gap
+    // that meets the threshold. Returns the same shape parseIdleSegments
+    // produces ({ start, end, duration, process }) so downstream analysis is
+    // unchanged. process is '' because scan gaps have no coded process.
+    function scanGapsToSegments(timestamps) {
+        const segments = [];
+        if (!Array.isArray(timestamps) || timestamps.length < 2) return segments;
+        const thresholdMin = settings.scanGapThresholdMin || 15;
+        const thresholdMs = thresholdMin * 60000;
+        for (let i = 1; i < timestamps.length; i++) {
+            const gapMs = timestamps[i].getTime() - timestamps[i - 1].getTime();
+            if (gapMs >= thresholdMs) {
+                segments.push({
+                    start: timestamps[i - 1],
+                    end: timestamps[i],
+                    duration: gapMs / 60000,
+                    process: ''
+                });
+            }
+        }
+        return segments;
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -2232,6 +2356,34 @@
             });
             if (!isScanning) return;
 
+            // Step 3a: (Optional) Measure idle from raw scan gaps for better
+            // accuracy. The activityDetails endpoint gives real scan events;
+            // the time between consecutive scans is ground-truth idle, not
+            // dependent on FCLM's edited .editable segmentation. We only
+            // OVERRIDE aa.segments when the AA has >= 2 scans; otherwise the
+            // .editable segments parsed above stay in place as the fallback.
+            if (settings.useScanGapIdle) {
+                const activityResults = await fetchAllActivityDetails(aaList);
+                if (!isScanning) return;
+                let upgraded = 0;
+                aaList.forEach((aa, idx) => {
+                    const res = activityResults[idx];
+                    const scans = res && res.html ? parseActivityScans(res.html) : [];
+                    aa.scanCount = scans.length;
+                    if (scans.length >= 2) {
+                        aa.segments = scanGapsToSegments(scans);
+                        aa.idleSource = 'scan-gap';
+                        upgraded++;
+                    } else {
+                        aa.idleSource = 'editable';
+                    }
+                });
+                console.log(`[IdleDash] Scan-gap idle: ${upgraded}/${aaList.length} AAs upgraded; ${aaList.length - upgraded} fell back to edited segments.`);
+            } else {
+                aaList.forEach(aa => { aa.idleSource = 'editable'; });
+            }
+            if (!isScanning) return;
+
             // Step 3b: Fetch PPA clock punches (non-fatal). Used to measure
             // Fast Start / Strong Finish against real clock-in/out.
             setStatus('Loading clock-in / clock-out punches...', '#2980b9');
@@ -2560,6 +2712,7 @@
             { key: 'manager',                label: 'Logging Manager',          type: 'string' },
             { key: 'behavioralType',         label: 'Behavioral Type',          type: 'string' },
             { key: 'idleTime',               label: 'Idle Time (min)',          type: 'number' },
+            { key: 'idleSource',             label: 'Source',                   type: 'string' },
             { key: 'paidHours',              label: 'Hours Worked',             type: 'number' },
             { key: 'location',               label: 'Location',                 type: 'string' },
             { key: 'idle15',                 label: 'Instances >15 min',        type: 'number' },
@@ -2585,6 +2738,7 @@
                 case 'behavioralType':       return a.behavioralType || '';
                 case 'location':             return aa.station || '';
                 case 'idleTime':             return a.nonBreakIdleMinutes || 0;
+                case 'idleSource':           return aa.idleSource || '';
                 case 'paidHours':            return aa.paidHours != null ? aa.paidHours : -1;
                 case 'idle15':               return a.idleTimestamps15?.length || 0;
                 case 'idle30':               return a.idleTimestamps30?.length || 0;
@@ -2689,6 +2843,20 @@
                         return `<td style="color:${isNormal ? '#27ae60' : '#e74c3c'};font-weight:600">${escapeHtml(behavioralType)}</td>`;
                     case 'idleTime':
                         return `<td>${(a.nonBreakIdleMinutes || 0).toFixed(1)}</td>`;
+                    case 'idleSource': {
+                        // Badge showing how idle time was measured for this AA.
+                        // scan-gap = raw scan events (accurate); edited = FCLM
+                        // .editable fallback (used when < 2 scans were found).
+                        const src = aa.idleSource || 'editable';
+                        const isScan = src === 'scan-gap';
+                        const label = isScan ? 'Scan' : 'Edited';
+                        const bg = isScan ? '#27ae60' : '#95a5a6';
+                        const scanTip = (aa.scanCount != null) ? ` — ${aa.scanCount} scans` : '';
+                        const tip = isScan
+                            ? `Idle measured from raw scan gaps${scanTip}`
+                            : `Fell back to edited segments${scanTip}`;
+                        return `<td><span class="idash-badge" style="background:${bg}" title="${escapeHtml(tip)}">${label}</span></td>`;
+                    }
                     case 'paidHours':
                         return aa.paidHours != null
                             ? `<td style="font-weight:600;color:#27ae60">${aa.paidHours.toFixed(2)}</td>`
@@ -2772,8 +2940,11 @@
 
         const phases = getActivePhases();
 
+        // NOTE: header order matches the row builder below. Row emits
+        // station (Location) then paidHours (Hours Worked), so the headers
+        // are ordered Location, Hours Worked to stay aligned.
         const headers = ['Login', 'Employee ID', 'Logging Manager', 'Behavioral Type',
-            'Idle Time (min)', 'Hours Worked', 'Location', 'Instances >15 min', 'Instances >30 min',
+            'Idle Time (min)', 'Idle Source', 'Location', 'Hours Worked', 'Instances >15 min', 'Instances >30 min',
             'Gaps >15m Timestamps'];
 
         // Add timing columns only for phases that have started.
@@ -2800,6 +2971,7 @@
                 aa.manager || '',
                 a.behavioralType || 'Normal',
                 (a.nonBreakIdleMinutes || 0).toFixed(1),
+                aa.idleSource === 'scan-gap' ? 'Scan' : 'Edited',
                 aa.station || '',
                 aa.paidHours != null ? aa.paidHours.toFixed(2) : '',
                 (a.idleTimestamps15 || []).length,
