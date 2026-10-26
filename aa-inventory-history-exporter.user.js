@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AA Inventory History Batch Exporter
 // @namespace    http://tampermonkey.net/
-// @version      1.7
+// @version      1.8
 // @description  Paste a list of AA logins + a date range, pull each AA's Inventory History (background, no navigation) and export a multi-sheet .xlsx (home summary + one sheet per AA).
 // @author       joyhjoe
 // @match        *://qi-fcresearch-eu.corp.amazon.com/*/results?s=*
@@ -88,7 +88,7 @@
     // ═══════════════════════════════════════════════════════════════
     // SECTION 1: CONFIG
     // ═══════════════════════════════════════════════════════════════
-    const VERSION = '1.7';
+    const VERSION = '1.8';
     const STORAGE_KEY = 'aa_inv_exporter_settings_v1';
     const ORIGIN = location.origin;
 
@@ -113,8 +113,10 @@
     // Concurrency: iframes are heavy, keep this low. Direct endpoint can go higher.
     const CONCURRENCY = ENGINE === 'A' ? 5 : 2;
 
-    // Per-AA timeout (ms) for a single inventory-history load.
-    const AA_TIMEOUT_MS = 60000;
+    // Per-AA timeout (ms) for a single inventory-history load. Generous because
+    // large histories (thousands of rows) are loaded by scrolling the Scroller
+    // through every row before scraping.
+    const AA_TIMEOUT_MS = 180000;
 
     const DEFAULT_SETTINGS = {
         logins: '',
@@ -465,44 +467,136 @@
         }
     }
 
-    // DataTables paginates (default 100/page) and only the current page lives
-    // in the DOM. Force every row to render so the DOM scrape sees all of them.
-    // Returns true if a "show all" action was applied.
-    function showAllRows(doc) {
-        // Preferred: DataTables API — set page length to all (-1) and redraw.
+    // Read the DataTables "info" string (e.g. "Showing 1 to 100 of 4,089
+    // entries") and return the total row count N, or null if not found.
+    function getTableTotal(doc) {
+        // Try the DataTables API first.
         const api = getInvDataTable(doc);
         if (api) {
             try {
-                // page.len(-1) = show all. Redraw on the current page so the DOM
-                // reflects every row.
-                api.page.len(-1);
-                api.draw(false);
-                return true;
-            } catch (e) { /* fall through */ }
+                const info = api.page.info();
+                if (info && typeof info.recordsDisplay === 'number' && info.recordsDisplay > 0) {
+                    return info.recordsDisplay;
+                }
+            } catch (e) {}
+        }
+        // Fall back to parsing the on-screen info element.
+        const infoEl = doc.getElementById('table-inventory-history_info') ||
+                       doc.querySelector('#table-inventory-history_wrapper .dataTables_info');
+        if (infoEl) {
+            const m = (infoEl.textContent || '').replace(/,/g, '').match(/of\s+(\d+)\s+entries/i);
+            if (m) return parseInt(m[1], 10);
+        }
+        return null;
+    }
+
+    // The FC Research inventory-history table uses DataTables Scroller: rows are
+    // rendered on demand as you scroll, so only ~100 are materialized at a time.
+    // Drive the scroll container to the bottom repeatedly until every row has
+    // been materialized (rendered count reaches the "of N" total), or until we
+    // stop making progress. Returns the final rendered row count.
+    // Returns { headers, rowsMap } by scrolling the Scroller through the whole
+    // table and ACCUMULATING every materialized row as we go. Accumulation is
+    // essential because Scroller recycles DOM/data for rows scrolled past, so a
+    // single read at the end would miss most rows. Rows are deduped by a stable
+    // key (preferred: DataTables row index via the data-dt-row attribute, else
+    // the full row text).
+    async function loadAllScrollerRows(doc) {
+        const total = getTableTotal(doc);
+        const scrollBody = doc.querySelector('#table-inventory-history_wrapper .dataTables_scrollBody');
+        const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+        // Resolve the header list once.
+        const headers = readHeaders(doc);
+
+        const rowsMap = new Map(); // key → row object
+
+        const harvest = () => {
+            let trs = doc.querySelectorAll(
+                '#table-inventory-history_wrapper .dataTables_scrollBody tbody tr'
+            );
+            if (!trs.length) {
+                const t = doc.getElementById('table-inventory-history');
+                if (t) trs = t.querySelectorAll('tbody tr');
+            }
+            trs.forEach(tr => {
+                if (tr.querySelector('td.dataTables_empty')) return;
+                const cells = Array.from(tr.querySelectorAll('td'));
+                if (!cells.length) return;
+                const obj = {};
+                cells.forEach((td, i) => {
+                    const key = headers[i] && headers[i].length ? headers[i] : `col${i}`;
+                    obj[key] = (td.innerText || td.textContent || '').trim();
+                });
+                // Stable key: DataTables row index if present, else row content.
+                const dtRow = tr.getAttribute('data-dt-row');
+                const key = dtRow != null ? ('r' + dtRow) : cells.map(c => (c.innerText || c.textContent || '').trim()).join('\u0001');
+                rowsMap.set(key, obj);
+            });
+        };
+
+        let lastSize = -1;
+        let stalls = 0;
+        const MAX_ITERS = 2000;
+        const STALL_LIMIT = 10;
+        let pos = 0;
+        const STEP = 40; // rows to advance per scroll (smaller than the ~100
+                         // materialized window so we never skip a block)
+
+        for (let i = 0; i < MAX_ITERS; i++) {
+            if (cancelRequested) break;
+
+            harvest();
+
+            if (total && rowsMap.size >= total) break;
+
+            if (rowsMap.size === lastSize) {
+                stalls++;
+                if (stalls >= STALL_LIMIT) break;
+            } else {
+                stalls = 0;
+                lastSize = rowsMap.size;
+            }
+
+            // Advance the scroll position by a pixel amount tied to row height.
+            if (scrollBody) {
+                const rowH = estimateRowHeight(doc, scrollBody);
+                pos += STEP * rowH;
+                if (pos > scrollBody.scrollHeight) pos = scrollBody.scrollHeight;
+                scrollBody.scrollTop = pos;
+                // If we're at the very bottom and not yet complete, nudge fully down.
+                if (pos >= scrollBody.scrollHeight - 2) {
+                    scrollBody.scrollTop = scrollBody.scrollHeight;
+                }
+            } else {
+                break;
+            }
+
+            await sleep(220); // let Scroller fetch/render the next block
         }
 
-        // Fallback: flip the DataTables length <select> to "All" (value -1),
-        // injecting the option if the menu doesn't offer it.
-        const selects = [];
-        const byWrap = doc.querySelector('#table-inventory-history_length select');
-        if (byWrap) selects.push(byWrap);
-        const byName = doc.querySelector('select[name="table-inventory-history_length"]');
-        if (byName && !selects.includes(byName)) selects.push(byName);
+        harvest(); // final sweep at the bottom
 
-        let changed = false;
-        selects.forEach(select => {
-            let allOpt = Array.from(select.options).find(o => o.value === '-1');
-            if (!allOpt) {
-                allOpt = doc.createElement('option');
-                allOpt.value = '-1';
-                allOpt.text = 'All';
-                select.appendChild(allOpt);
-            }
-            select.value = '-1';
-            select.dispatchEvent(new Event('change', { bubbles: true }));
-            changed = true;
-        });
-        return changed;
+        if (scrollBody) { try { scrollBody.scrollTop = 0; } catch (e) {} }
+
+        return { headers: headers.length ? headers : null, rowsMap };
+    }
+
+    // Read header texts in column order from the table (split or plain layout).
+    function readHeaders(doc) {
+        let cells = doc.querySelectorAll('#table-inventory-history_wrapper .dataTables_scrollHead thead tr th');
+        if (!cells.length) {
+            const t = doc.getElementById('table-inventory-history');
+            if (t) cells = t.querySelectorAll('thead tr th');
+        }
+        return Array.from(cells).map(th => (th.innerText || th.textContent || '').trim());
+    }
+
+    // Estimate a single row's pixel height to size scroll steps.
+    function estimateRowHeight(doc, scrollBody) {
+        const tr = scrollBody.querySelector('tbody tr');
+        const h = tr ? tr.getBoundingClientRect().height : 0;
+        return h && h > 4 ? h : 24; // sensible default
     }
 
     // Identify which header is the timestamp column (for gap math + sorting).
@@ -637,16 +731,31 @@
                         // default, and we only see the rows in the DOM — so first
                         // switch the page length to "All", then scrape everything.
                         phase = 'scraping';
-                        setTimeout(() => {
+                        (async () => {
                             try {
-                                showAllRows(iframe.contentDocument);
-                            } catch (e) { /* non-fatal; scrape what we have */ }
-                            // DataTables re-renders all rows asynchronously. Poll
-                            // until the rendered row count stops growing (stable
-                            // across two checks), then scrape — handles large
-                            // histories without guessing a fixed delay.
-                            waitForStableRowsThenScrape(iframe, done, resolve, reject, setRenderTick);
-                        }, 400);
+                                // Scroller virtualizes rows (only ~100 live in the
+                                // DOM at once), so scroll through the whole table
+                                // and accumulate every materialized row.
+                                const acc = await loadAllScrollerRows(iframe.contentDocument);
+                                if (cancelRequested) return done(reject, new Error('Cancelled'));
+
+                                const collected = Array.from(acc.rowsMap.values());
+                                // If accumulation got everything (or more than a
+                                // single page), use it. Otherwise fall back to a
+                                // plain scrape (small tables, or non-Scroller).
+                                if (collected.length > 0) {
+                                    const headers = acc.headers ||
+                                        (collected[0] ? Object.keys(collected[0]) : []);
+                                    done(resolve, { headers, rows: collected, source: 'scroll' });
+                                } else {
+                                    done(resolve, scrapeInventoryTable(iframe.contentDocument));
+                                }
+                            } catch (e) {
+                                // Last resort: whatever a direct scrape can see.
+                                try { done(resolve, scrapeInventoryTable(iframe.contentDocument)); }
+                                catch (e2) { done(reject, e2); }
+                            }
+                        })();
                     }
                     return;
                 }
@@ -654,60 +763,6 @@
 
             document.body.appendChild(iframe);
         });
-    }
-
-    // Count non-empty data rows currently rendered in the table.
-    function countRenderedRows(doc) {
-        let rows = doc.querySelectorAll(
-            '#table-inventory-history_wrapper .dataTables_scrollBody tbody tr'
-        );
-        if (!rows.length) {
-            const t = doc.getElementById('table-inventory-history');
-            if (t) rows = t.querySelectorAll('tbody tr');
-        }
-        let n = 0;
-        rows.forEach(tr => {
-            if (tr.querySelector('td.dataTables_empty')) return;
-            if (tr.querySelector('td')) n++;
-        });
-        return n;
-    }
-
-    // Poll until the rendered row count is stable across consecutive checks
-    // (DataTables has finished painting all rows), then scrape. Bounded by a
-    // max number of attempts so a stuck render still resolves with what's there.
-    function waitForStableRowsThenScrape(iframe, done, resolve, reject, registerTick) {
-        let last = -1;
-        let stableHits = 0;
-        let attempts = 0;
-        const MAX_ATTEMPTS = 40;        // ~40 * 300ms = 12s ceiling
-        const STABLE_NEEDED = 2;        // two identical counts in a row
-        const tick = setInterval(() => {
-            if (cancelRequested) { clearInterval(tick); return done(reject, new Error('Cancelled')); }
-            let doc;
-            try { doc = iframe.contentDocument; } catch (e) { clearInterval(tick); return done(reject, e); }
-            if (!doc) return;
-
-            attempts++;
-            const n = countRenderedRows(doc);
-            if (n === last) {
-                stableHits++;
-            } else {
-                stableHits = 0;
-                last = n;
-            }
-
-            if ((stableHits >= STABLE_NEEDED && last > 0) || attempts >= MAX_ATTEMPTS) {
-                clearInterval(tick);
-                try {
-                    const result = scrapeInventoryTable(iframe.contentDocument);
-                    done(resolve, result);
-                } catch (e) {
-                    done(reject, e);
-                }
-            }
-        }, 300);
-        if (registerTick) registerTick(tick);
     }
 
     // Locate the inventory-history search button inside a document.
@@ -994,11 +1049,9 @@
                             rec.statusLabel = 'No rows in window';
                         } else {
                             rec.status = 'done';
-                            // Tag the source so a DOM-capped fetch is visible:
-                            //   "api" = full data model (no cap), else DOM scrape.
-                            const src = raw.source === 'api'
-                                ? (raw.serverSide ? ' ⚠server-side' : '')
-                                : ' (DOM)';
+                            // Source tag: 'scroll'/'api' = full capture, '' tag;
+                            // a plain DOM scrape (capped) is flagged so it's visible.
+                            const src = (raw.source === 'scroll' || raw.source === 'api') ? '' : ' (DOM)';
                             rec.statusLabel = `${enriched.rows.length} rows${src}`;
                         }
                     }
@@ -1412,9 +1465,7 @@
                     rec.statusLabel = 'No rows in window';
                 } else {
                     rec.status = 'done';
-                    const src = raw.source === 'api'
-                        ? (raw.serverSide ? ' ⚠server-side' : '')
-                        : ' (DOM)';
+                    const src = (raw.source === 'scroll' || raw.source === 'api') ? '' : ' (DOM)';
                     rec.statusLabel = `${enriched.rows.length} rows${src}`;
                 }
             }
