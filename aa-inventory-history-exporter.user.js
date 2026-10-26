@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AA Inventory History Batch Exporter
 // @namespace    http://tampermonkey.net/
-// @version      1.5
+// @version      1.6
 // @description  Paste a list of AA logins + a date range, pull each AA's Inventory History (background, no navigation) and export a multi-sheet .xlsx (home summary + one sheet per AA).
 // @author       joyhjoe
 // @match        *://qi-fcresearch-eu.corp.amazon.com/*/results?s=*
@@ -88,7 +88,7 @@
     // ═══════════════════════════════════════════════════════════════
     // SECTION 1: CONFIG
     // ═══════════════════════════════════════════════════════════════
-    const VERSION = '1.5';
+    const VERSION = '1.6';
     const STORAGE_KEY = 'aa_inv_exporter_settings_v1';
     const ORIGIN = location.origin;
 
@@ -376,6 +376,51 @@
         return { headers: headers.length ? headers : (rows[0] ? Object.keys(rows[0]) : []), rows };
     }
 
+    // DataTables paginates to 100 rows by default and only the current page is
+    // in the DOM. Force "show all" so the full history can be scraped.
+    // Tries the DataTables JS API first (most reliable), then falls back to the
+    // length <select> that DataTables renders.
+    function showAllRows(doc) {
+        // Step 1 - DataTables API via the iframe's own jQuery, if present.
+        try {
+            const win = doc.defaultView || doc.parentWindow;
+            const $ = win && (win.jQuery || win.$);
+            if ($ && $.fn && $.fn.dataTable) {
+                const sel = '#table-inventory-history';
+                if ($.fn.dataTable.isDataTable.call($, sel) || $(sel).hasClass('dataTable')) {
+                    const api = $(sel).DataTable();
+                    api.page.len(-1).draw(false); // -1 = all rows
+                    return true;
+                }
+            }
+        } catch (e) { /* fall through to the select approach */ }
+
+        // Step 2 - the length select DataTables renders: id
+        //    "table-inventory-history_length" wrapper, or a select whose name
+        //    is "table-inventory-history_length". Setting to -1 means All.
+        const selects = [];
+        const byWrap = doc.querySelector('#table-inventory-history_length select');
+        if (byWrap) selects.push(byWrap);
+        const byName = doc.querySelector('select[name="table-inventory-history_length"]');
+        if (byName && !selects.includes(byName)) selects.push(byName);
+
+        let changed = false;
+        selects.forEach(select => {
+            // Prefer an existing "-1" (All) option; otherwise inject one.
+            let allOpt = Array.from(select.options).find(o => o.value === '-1');
+            if (!allOpt) {
+                allOpt = doc.createElement('option');
+                allOpt.value = '-1';
+                allOpt.text = 'All';
+                select.appendChild(allOpt);
+            }
+            select.value = '-1';
+            select.dispatchEvent(new Event('change', { bubbles: true }));
+            changed = true;
+        });
+        return changed;
+    }
+
     // Identify which header is the timestamp column (for gap math + sorting).
     function findTimestampHeader(headers) {
         const prefer = ['date', 'time', 'timestamp', 'event time', 'date/time', 'datetime'];
@@ -409,6 +454,7 @@
             iframe.src = buildResultsUrl(login);
 
             let settled = false;
+            let renderTick = null; // set by waitForStableRowsThenScrape
             const cleanup = () => {
                 try { iframe.remove(); } catch (e) {}
             };
@@ -417,9 +463,13 @@
                 settled = true;
                 clearTimeout(timer);
                 clearInterval(poll);
+                if (renderTick) clearInterval(renderTick);
                 cleanup();
                 fn(arg);
             };
+            // Allow the render-stabilization poller to register its interval so
+            // an overall timeout can cancel it too.
+            const setRenderTick = (id) => { renderTick = id; };
 
             const timer = setTimeout(() => {
                 done(reject, new Error('Timed out loading ' + login));
@@ -486,16 +536,20 @@
                     const hasRows = table && table.querySelector('tbody tr td:not(.dataTables_empty)');
 
                     if ((status && !stillLoading) || filterReady || hasRows) {
-                        // Small settle delay so DataTables finishes painting rows.
+                        // Data is loaded. DataTables paginates to 100 rows by
+                        // default, and we only see the rows in the DOM — so first
+                        // switch the page length to "All", then scrape everything.
                         phase = 'scraping';
                         setTimeout(() => {
                             try {
-                                const result = scrapeInventoryTable(iframe.contentDocument);
-                                done(resolve, result);
-                            } catch (e) {
-                                done(reject, e);
-                            }
-                        }, 600);
+                                showAllRows(iframe.contentDocument);
+                            } catch (e) { /* non-fatal; scrape what we have */ }
+                            // DataTables re-renders all rows asynchronously. Poll
+                            // until the rendered row count stops growing (stable
+                            // across two checks), then scrape — handles large
+                            // histories without guessing a fixed delay.
+                            waitForStableRowsThenScrape(iframe, done, resolve, reject, setRenderTick);
+                        }, 400);
                     }
                     return;
                 }
@@ -503,6 +557,60 @@
 
             document.body.appendChild(iframe);
         });
+    }
+
+    // Count non-empty data rows currently rendered in the table.
+    function countRenderedRows(doc) {
+        let rows = doc.querySelectorAll(
+            '#table-inventory-history_wrapper .dataTables_scrollBody tbody tr'
+        );
+        if (!rows.length) {
+            const t = doc.getElementById('table-inventory-history');
+            if (t) rows = t.querySelectorAll('tbody tr');
+        }
+        let n = 0;
+        rows.forEach(tr => {
+            if (tr.querySelector('td.dataTables_empty')) return;
+            if (tr.querySelector('td')) n++;
+        });
+        return n;
+    }
+
+    // Poll until the rendered row count is stable across consecutive checks
+    // (DataTables has finished painting all rows), then scrape. Bounded by a
+    // max number of attempts so a stuck render still resolves with what's there.
+    function waitForStableRowsThenScrape(iframe, done, resolve, reject, registerTick) {
+        let last = -1;
+        let stableHits = 0;
+        let attempts = 0;
+        const MAX_ATTEMPTS = 40;        // ~40 * 300ms = 12s ceiling
+        const STABLE_NEEDED = 2;        // two identical counts in a row
+        const tick = setInterval(() => {
+            if (cancelRequested) { clearInterval(tick); return done(reject, new Error('Cancelled')); }
+            let doc;
+            try { doc = iframe.contentDocument; } catch (e) { clearInterval(tick); return done(reject, e); }
+            if (!doc) return;
+
+            attempts++;
+            const n = countRenderedRows(doc);
+            if (n === last) {
+                stableHits++;
+            } else {
+                stableHits = 0;
+                last = n;
+            }
+
+            if ((stableHits >= STABLE_NEEDED && last > 0) || attempts >= MAX_ATTEMPTS) {
+                clearInterval(tick);
+                try {
+                    const result = scrapeInventoryTable(iframe.contentDocument);
+                    done(resolve, result);
+                } catch (e) {
+                    done(reject, e);
+                }
+            }
+        }, 300);
+        if (registerTick) registerTick(tick);
     }
 
     // Locate the inventory-history search button inside a document.
