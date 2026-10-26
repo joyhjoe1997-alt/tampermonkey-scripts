@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AA Inventory History Batch Exporter
 // @namespace    http://tampermonkey.net/
-// @version      1.6
+// @version      1.7
 // @description  Paste a list of AA logins + a date range, pull each AA's Inventory History (background, no navigation) and export a multi-sheet .xlsx (home summary + one sheet per AA).
 // @author       joyhjoe
 // @match        *://qi-fcresearch-eu.corp.amazon.com/*/results?s=*
@@ -88,7 +88,7 @@
     // ═══════════════════════════════════════════════════════════════
     // SECTION 1: CONFIG
     // ═══════════════════════════════════════════════════════════════
-    const VERSION = '1.6';
+    const VERSION = '1.7';
     const STORAGE_KEY = 'aa_inv_exporter_settings_v1';
     const ORIGIN = location.origin;
 
@@ -128,6 +128,7 @@
     let isRunning = false;
     let cancelRequested = false;
     let lastResults = null; // array of per-AA result objects from the last run
+    let activeRun = null;   // { results, startDate, endDate, window } for per-AA retry
 
     // ═══════════════════════════════════════════════════════════════
     // SECTION 2: SETTINGS PERSISTENCE
@@ -337,6 +338,12 @@
     //   columns by header text. Returns { headers:[], rows:[{...}] }.
     // ═══════════════════════════════════════════════════════════════
     function scrapeInventoryTable(doc) {
+        // Preferred: read straight from the DataTables data model. This returns
+        // EVERY row regardless of pagination or what's rendered in the DOM, so
+        // it is immune to the 100-row page cap.
+        const viaApi = scrapeViaDataTablesApi(doc);
+        if (viaApi && viaApi.rows.length) return viaApi;
+
         // DataTables splits header and body into separate scroll containers.
         // Prefer the split layout (used by the CSV script), fall back to a
         // plain <table id="table-inventory-history">.
@@ -376,28 +383,106 @@
         return { headers: headers.length ? headers : (rows[0] ? Object.keys(rows[0]) : []), rows };
     }
 
-    // DataTables paginates to 100 rows by default and only the current page is
-    // in the DOM. Force "show all" so the full history can be scraped.
-    // Tries the DataTables JS API first (most reliable), then falls back to the
-    // length <select> that DataTables renders.
-    function showAllRows(doc) {
-        // Step 1 - DataTables API via the iframe's own jQuery, if present.
+    // Strip HTML tags / collapse whitespace from a DataTables cell value.
+    function cellText(v) {
+        if (v == null) return '';
+        let s = String(v);
+        if (s.indexOf('<') !== -1) {
+            // Render HTML to text via a throwaway element.
+            const tmp = document.createElement('div');
+            tmp.innerHTML = s;
+            s = tmp.textContent || tmp.innerText || '';
+        }
+        return s.replace(/\s+/g, ' ').trim();
+    }
+
+    // Read all rows directly from the DataTables data model (every row, not
+    // just the rendered page). Returns { headers, rows } or null if the API /
+    // table isn't available.
+    function scrapeViaDataTablesApi(doc) {
+        const api = getInvDataTable(doc);
+        if (!api) return null;
+        try {
+            // Column headers in order.
+            const headers = [];
+            api.columns().every(function () {
+                const node = this.header();
+                headers.push((node ? (node.innerText || node.textContent || '') : '').replace(/\s+/g, ' ').trim());
+            });
+
+            // Every row's cell data, in column order. rows().data() returns the
+            // full data set (all pages), each entry being that row's cells.
+            const rows = [];
+            const data = api.rows().data(); // ALL rows, independent of pagination
+            for (let i = 0; i < data.length; i++) {
+                const cells = data[i];
+                const obj = {};
+                if (Array.isArray(cells)) {
+                    cells.forEach((val, c) => {
+                        const key = headers[c] && headers[c].length ? headers[c] : `col${c}`;
+                        obj[key] = cellText(val);
+                    });
+                } else if (cells && typeof cells === 'object') {
+                    const keys = Object.keys(cells);
+                    keys.forEach((k, c) => {
+                        const key = headers[c] && headers[c].length ? headers[c] : (k || `col${c}`);
+                        obj[key] = cellText(cells[k]);
+                    });
+                }
+                if (Object.keys(obj).length) rows.push(obj);
+            }
+
+            if (!rows.length) return null;
+            let serverSide = false;
+            try { serverSide = !!(api.settings && api.settings()[0] && api.settings()[0].oFeatures && api.settings()[0].oFeatures.bServerSide); } catch (e) {}
+            return {
+                headers: headers.length ? headers : Object.keys(rows[0]),
+                rows,
+                source: 'api',
+                apiTotal: data.length,
+                serverSide
+            };
+        } catch (e) {
+            return null;
+        }
+    }
+
+    // Get the DataTables API instance for the inventory-history table from the
+    // iframe's own jQuery/DataTables, or null if not available.
+    function getInvDataTable(doc) {
         try {
             const win = doc.defaultView || doc.parentWindow;
             const $ = win && (win.jQuery || win.$);
-            if ($ && $.fn && $.fn.dataTable) {
-                const sel = '#table-inventory-history';
-                if ($.fn.dataTable.isDataTable.call($, sel) || $(sel).hasClass('dataTable')) {
-                    const api = $(sel).DataTable();
-                    api.page.len(-1).draw(false); // -1 = all rows
-                    return true;
-                }
-            }
-        } catch (e) { /* fall through to the select approach */ }
+            if (!$ || !$.fn || !$.fn.dataTable) return null;
+            const node = doc.getElementById('table-inventory-history');
+            if (!node) return null;
+            // isDataTable takes the table node/selector as its argument.
+            const isDt = $.fn.dataTable.isDataTable(node) || $(node).hasClass('dataTable');
+            if (!isDt) return null;
+            return $(node).DataTable();
+        } catch (e) {
+            return null;
+        }
+    }
 
-        // Step 2 - the length select DataTables renders: id
-        //    "table-inventory-history_length" wrapper, or a select whose name
-        //    is "table-inventory-history_length". Setting to -1 means All.
+    // DataTables paginates (default 100/page) and only the current page lives
+    // in the DOM. Force every row to render so the DOM scrape sees all of them.
+    // Returns true if a "show all" action was applied.
+    function showAllRows(doc) {
+        // Preferred: DataTables API — set page length to all (-1) and redraw.
+        const api = getInvDataTable(doc);
+        if (api) {
+            try {
+                // page.len(-1) = show all. Redraw on the current page so the DOM
+                // reflects every row.
+                api.page.len(-1);
+                api.draw(false);
+                return true;
+            } catch (e) { /* fall through */ }
+        }
+
+        // Fallback: flip the DataTables length <select> to "All" (value -1),
+        // injecting the option if the menu doesn't offer it.
         const selects = [];
         const byWrap = doc.querySelector('#table-inventory-history_length select');
         if (byWrap) selects.push(byWrap);
@@ -406,7 +491,6 @@
 
         let changed = false;
         selects.forEach(select => {
-            // Prefer an existing "-1" (All) option; otherwise inject one.
             let allOpt = Array.from(select.options).find(o => o.value === '-1');
             if (!allOpt) {
                 allOpt = doc.createElement('option');
@@ -477,6 +561,7 @@
 
             let phase = 'init';     // init → searching → waiting → scraping
             let searchFiredAt = 0;
+            let sawLoading = false;     // did we observe the status enter "loading"?
 
             iframe.addEventListener('load', async () => {
                 // 'load' can fire for the initial document and again if the app
@@ -520,22 +605,34 @@
                     return;
                 }
 
-                // PHASE: waiting — wait for load to complete, then scrape.
+                // PHASE: waiting — wait for FC Research to finish loading, then scrape.
                 if (phase === 'waiting') {
                     // Give the click a moment to kick off the request.
-                    if (Date.now() - searchFiredAt < 400) return;
+                    if (Date.now() - searchFiredAt < 500) return;
 
                     const status = doc.getElementById('inventory-history-status');
                     const stillLoading = status && /(^|\s)loading(\s|$)/.test(status.className);
-                    const filterReady = doc.getElementById('table-inventory-history_filter');
                     const table = doc.getElementById('table-inventory-history');
-
-                    // Ready when: status present and not loading, OR the filter UI
-                    // (built by DataTables after data loads) exists, OR a populated
-                    // table body is present.
                     const hasRows = table && table.querySelector('tbody tr td:not(.dataTables_empty)');
+                    const emptyRow = table && table.querySelector('td.dataTables_empty');
 
-                    if ((status && !stillLoading) || filterReady || hasRows) {
+                    // Track whether the status element ever entered "loading" so
+                    // we don't mistake "request hasn't started yet" for "done".
+                    if (stillLoading) { sawLoading = true; return; } // still loading → keep waiting
+
+                    const elapsed = Date.now() - searchFiredAt;
+
+                    // Consider it loaded when ANY of these hold:
+                    //   - the status went through loading and is now cleared
+                    //   - real data rows are present
+                    //   - DataTables explicitly rendered its "no records" row
+                    //   - a generous grace period elapsed with the status idle
+                    //     (covers pages without the status element)
+                    const loadedByStatus = status && sawLoading && !stillLoading;
+                    const loadedByEmpty  = emptyRow && elapsed > 2500;
+                    const loadedByGrace  = !status && elapsed > 3500;
+
+                    if (loadedByStatus || hasRows || loadedByEmpty || loadedByGrace) {
                         // Data is loaded. DataTables paginates to 100 rows by
                         // default, and we only see the rows in the DOM — so first
                         // switch the page length to "All", then scrape everything.
@@ -864,6 +961,10 @@
             error: null
         }));
 
+        // Expose run context so a per-AA Retry can re-fetch one login using the
+        // same date range + window.
+        activeRun = { results, startDate, endDate, window };
+
         renderProgress(results);
 
         let index = 0;
@@ -893,7 +994,12 @@
                             rec.statusLabel = 'No rows in window';
                         } else {
                             rec.status = 'done';
-                            rec.statusLabel = `${enriched.rows.length} rows`;
+                            // Tag the source so a DOM-capped fetch is visible:
+                            //   "api" = full data model (no cap), else DOM scrape.
+                            const src = raw.source === 'api'
+                                ? (raw.serverSide ? ' ⚠server-side' : '')
+                                : ' (DOM)';
+                            rec.statusLabel = `${enriched.rows.length} rows${src}`;
                         }
                     }
                 } catch (e) {
@@ -1073,6 +1179,12 @@
             }
             .aa-exp-row:last-child { border-bottom: none; }
             .aa-exp-row .login { font-family: ui-monospace, Menlo, Consolas, monospace; font-weight: 700; }
+            .aa-exp-row-right { display: inline-flex; align-items: center; gap: 10px; }
+            .aa-exp-retry {
+                border: none; background: #e0e7ff; color: #4338ca; font-size: 13px; font-weight: 800;
+                padding: 4px 12px; border-radius: 8px; cursor: pointer; transition: background .15s;
+            }
+            .aa-exp-retry:hover { background: #c7d2fe; }
             .aa-exp-badge { font-size: 13px; font-weight: 800; padding: 3px 12px; border-radius: 999px; }
             .st-pending { background: #f1f5f9; color: #64748b; }
             .st-running { background: #fef3c7; color: #b45309; }
@@ -1252,11 +1364,75 @@
             const row = document.createElement('div');
             row.className = 'aa-exp-row';
             const cls = 'st-' + r.status;
+            // Offer a Retry button for AAs that failed or came back empty
+            // (and aren't currently running). Lets you re-pull just that AA
+            // if FC Research hadn't finished loading.
+            const canRetry = (r.status === 'error' || r.status === 'empty') && !r.retrying;
+            const retryBtn = canRetry
+                ? `<button class="aa-exp-retry" data-login="${escapeHtml(r.login)}" title="Re-fetch this AA">↻ Retry</button>`
+                : '';
             row.innerHTML = `
                 <span class="login">${escapeHtml(r.login)}</span>
-                <span class="aa-exp-badge ${cls}">${escapeHtml(r.statusLabel || r.status)}</span>`;
+                <span class="aa-exp-row-right">
+                    <span class="aa-exp-badge ${cls}">${escapeHtml(r.statusLabel || r.status)}</span>
+                    ${retryBtn}
+                </span>`;
+            const btn = row.querySelector('.aa-exp-retry');
+            if (btn) btn.addEventListener('click', () => retryOneAA(r.login));
             el.list.appendChild(row);
         });
+    }
+
+    // Re-fetch a single AA (used by the per-row Retry button). Reuses the
+    // active run's date range + window, updates just that record, and refreshes
+    // the Download availability.
+    async function retryOneAA(login) {
+        if (!activeRun) return;
+        if (isRunning) { toast('Wait for the current run to finish before retrying.'); return; }
+        if (cancelRequested) cancelRequested = false;
+        const rec = activeRun.results.find(r => r.login === login);
+        if (!rec || rec.retrying) return;
+
+        rec.retrying = true;
+        rec.status = 'running';
+        rec.statusLabel = 'Retrying…';
+        renderProgress(activeRun.results);
+
+        try {
+            const raw = await fetchOneAA(rec.login, activeRun.startDate, activeRun.endDate);
+            if (!raw || !raw.rows || raw.rows.length === 0) {
+                rec.status = 'empty';
+                rec.statusLabel = 'No rows in range';
+                rec.data = { headers: raw ? raw.headers : [], rows: [], firstEvent: '', lastEvent: '', totalSpan: '' };
+            } else {
+                const enriched = enrichWithGaps(raw, activeRun.window);
+                rec.data = enriched;
+                if (enriched.rows.length === 0) {
+                    rec.status = 'empty';
+                    rec.statusLabel = 'No rows in window';
+                } else {
+                    rec.status = 'done';
+                    const src = raw.source === 'api'
+                        ? (raw.serverSide ? ' ⚠server-side' : '')
+                        : ' (DOM)';
+                    rec.statusLabel = `${enriched.rows.length} rows${src}`;
+                }
+            }
+            rec.error = null;
+        } catch (e) {
+            rec.status = 'error';
+            rec.statusLabel = (e && e.message) ? e.message : 'Failed';
+            rec.error = e;
+        }
+
+        rec.retrying = false;
+        renderProgress(activeRun.results);
+
+        // Keep the re-download in sync with whatever is now available, and make
+        // sure the re-download uses the freshest results.
+        const anyData = activeRun.results.some(r => r.status === 'done');
+        el.download.disabled = !anyData;
+        if (lastResults) lastResults.results = activeRun.results;
     }
 
     function escapeHtml(s) {
