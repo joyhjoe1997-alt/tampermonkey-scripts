@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AA Inventory History Batch Exporter
 // @namespace    http://tampermonkey.net/
-// @version      1.8
+// @version      1.9
 // @description  Paste a list of AA logins + a date range, pull each AA's Inventory History (background, no navigation) and export a multi-sheet .xlsx (home summary + one sheet per AA).
 // @author       joyhjoe
 // @match        *://qi-fcresearch-eu.corp.amazon.com/*/results?s=*
@@ -88,7 +88,7 @@
     // ═══════════════════════════════════════════════════════════════
     // SECTION 1: CONFIG
     // ═══════════════════════════════════════════════════════════════
-    const VERSION = '1.8';
+    const VERSION = '1.9';
     const STORAGE_KEY = 'aa_inv_exporter_settings_v1';
     const ORIGIN = location.origin;
 
@@ -1102,7 +1102,7 @@
             @keyframes aaExpFade { from { opacity: 0; } to { opacity: 1; } }
 
             #aa-exp-panel {
-                margin-top: 5vh; width: 680px; max-width: calc(100vw - 32px);
+                margin-top: 5vh; width: 960px; max-width: calc(100vw - 48px);
                 max-height: 90vh; overflow: auto;
                 background: #fff; border-radius: 20px;
                 box-shadow: 0 30px 80px rgba(0,0,0,.45);
