@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AA Inventory History Batch Exporter
 // @namespace    http://tampermonkey.net/
-// @version      1.1
+// @version      1.2
 // @description  Paste a list of AA logins + a date range, pull each AA's Inventory History (background, no navigation) and export a multi-sheet .xlsx (home summary + one sheet per AA).
 // @author       joyhjoe
 // @match        *://qi-fcresearch-eu.corp.amazon.com/*/results?s=*
@@ -88,7 +88,7 @@
     // ═══════════════════════════════════════════════════════════════
     // SECTION 1: CONFIG
     // ═══════════════════════════════════════════════════════════════
-    const VERSION = '1.1';
+    const VERSION = '1.2';
     const STORAGE_KEY = 'aa_inv_exporter_settings_v1';
     const ORIGIN = location.origin;
 
@@ -198,6 +198,28 @@
         // Last resort: let Date try.
         const d = new Date(s);
         return isNaN(d.getTime()) ? null : d;
+    }
+
+    // ── Picker <-> internal format bridges ──
+    // Native <input type="date"> uses YYYY-MM-DD; our internal/stored format and
+    // the FC Research #searchStart field use MM/DD/YYYY.
+    function isoToUsDate(iso) {
+        if (!iso) return '';
+        const m = String(iso).match(/^(\d{4})-(\d{2})-(\d{2})$/);
+        return m ? `${m[2]}/${m[3]}/${m[1]}` : '';
+    }
+    function usToIsoDate(us) {
+        if (!us) return '';
+        const m = String(us).match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+        if (!m) return '';
+        return `${m[3]}-${String(+m[1]).padStart(2, '0')}-${String(+m[2]).padStart(2, '0')}`;
+    }
+    // Native <input type="time" step="1"> gives HH:MM or HH:MM:SS; pad to HH:MM:SS.
+    function padTime(t) {
+        if (!t) return '';
+        const parts = String(t).split(':');
+        if (parts.length === 2) parts.push('00');
+        return parts.map(p => String(p).padStart(2, '0')).join(':');
     }
 
     // Validate/normalize a 24-hour time string → "HH:MM:SS" or null.
@@ -786,9 +808,17 @@
             }
             .aa-exp-dates { display: flex; gap: 12px; flex-wrap: wrap; }
             .aa-exp-dates .aa-exp-field { flex: 1 1 calc(50% - 6px); min-width: 120px; margin-bottom: 0; }
-            .aa-exp-field input[type=text] {
+            .aa-exp-field input[type=text],
+            .aa-exp-field input[type=date],
+            .aa-exp-field input[type=time] {
                 width: 100%; box-sizing: border-box; border: 1px solid #cbd5e1; border-radius: 8px;
                 padding: 9px 12px; font-size: 14px; text-align: center;
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                color: #0f172a; background: #fff; min-height: 38px;
+            }
+            .aa-exp-field input[type=date]::-webkit-calendar-picker-indicator,
+            .aa-exp-field input[type=time]::-webkit-calendar-picker-indicator {
+                cursor: pointer; opacity: .6;
             }
             textarea:focus, input:focus { outline: none; border-color: #2563eb; box-shadow: 0 0 0 3px rgba(37,99,235,.15); }
             .aa-exp-hint { font-size: 11px; color: #94a3b8; margin-top: 6px; }
@@ -899,22 +929,22 @@
                     <div class="aa-exp-dates">
                         <div class="aa-exp-field">
                             <label>Start date</label>
-                            <input type="text" id="aa-exp-start" placeholder="MM/DD/YYYY">
+                            <input type="date" id="aa-exp-start">
                         </div>
                         <div class="aa-exp-field">
                             <label>Start time</label>
-                            <input type="text" id="aa-exp-start-time" placeholder="18:15:00">
+                            <input type="time" id="aa-exp-start-time" step="1">
                         </div>
                         <div class="aa-exp-field">
                             <label>End date</label>
-                            <input type="text" id="aa-exp-end" placeholder="MM/DD/YYYY">
+                            <input type="date" id="aa-exp-end">
                         </div>
                         <div class="aa-exp-field">
                             <label>End time</label>
-                            <input type="text" id="aa-exp-end-time" placeholder="04:45:00">
+                            <input type="time" id="aa-exp-end-time" step="1">
                         </div>
                     </div>
-                    <div class="aa-exp-hint">Same window is applied to every AA. Date MM/DD/YYYY, time 24h HH:MM:SS. Leave both times blank for full days. If end time ≤ start time (e.g. 18:15:00 → 04:45:00) the window is treated as overnight (ends next day).</div>
+                    <div class="aa-exp-hint">Same window is applied to every AA. Pick dates and 24h times (seconds supported). Leave both times blank for full days. If end time ≤ start time (e.g. 18:15:00 → 04:45:00) the window is treated as overnight (ends next day).</div>
 
                     <div class="aa-exp-actions">
                         <button class="aa-exp-btn run" id="aa-exp-run">
@@ -975,8 +1005,8 @@
 
         // Prefill from settings
         el.logins.value = settings.logins || '';
-        el.start.value = settings.startDate || '';
-        el.end.value = settings.endDate || '';
+        el.start.value = usToIsoDate(settings.startDate || '');
+        el.end.value = usToIsoDate(settings.endDate || '');
         el.startTime.value = settings.startTime || '';
         el.endTime.value = settings.endTime || '';
         updateLoginCount();
@@ -1002,10 +1032,10 @@
 
     function persistInputs() {
         settings.logins = el.logins.value;
-        settings.startDate = el.start.value;
-        settings.endDate = el.end.value;
-        settings.startTime = el.startTime.value;
-        settings.endTime = el.endTime.value;
+        settings.startDate = isoToUsDate(el.start.value);
+        settings.endDate = isoToUsDate(el.end.value);
+        settings.startTime = el.startTime.value ? padTime(el.startTime.value) : '';
+        settings.endTime = el.endTime.value ? padTime(el.endTime.value) : '';
         saveSettings();
     }
 
@@ -1057,18 +1087,20 @@
     // `requireXlsx` adds the SheetJS-loaded check (used by Run, not Test).
     function collectInputs(requireXlsx) {
         const logins = parseLoginList(el.logins.value);
-        const startDate = normalizeDateStr(el.start.value);
-        const endDate = normalizeDateStr(el.end.value);
+        // Date pickers give YYYY-MM-DD; convert to internal MM/DD/YYYY.
+        const startDate = normalizeDateStr(isoToUsDate(el.start.value));
+        const endDate = normalizeDateStr(isoToUsDate(el.end.value));
 
         // Times are optional, but if one is given the other must be too.
+        // Time pickers give HH:MM or HH:MM:SS.
         const rawStartT = el.startTime.value.trim();
         const rawEndT = el.endTime.value.trim();
-        const startTime = rawStartT ? normalizeTimeStr(rawStartT) : '';
-        const endTime = rawEndT ? normalizeTimeStr(rawEndT) : '';
+        const startTime = rawStartT ? normalizeTimeStr(padTime(rawStartT)) : '';
+        const endTime = rawEndT ? normalizeTimeStr(padTime(rawEndT)) : '';
 
         if (!logins.length) { flashField(el.logins); toast('Enter at least one AA login.'); return null; }
-        if (!startDate) { flashField(el.start); toast('Start date must be MM/DD/YYYY.'); return null; }
-        if (!endDate) { flashField(el.end); toast('End date must be MM/DD/YYYY.'); return null; }
+        if (!startDate) { flashField(el.start); toast('Pick a start date.'); return null; }
+        if (!endDate) { flashField(el.end); toast('Pick an end date.'); return null; }
 
         if (rawStartT && startTime === null) { flashField(el.startTime); toast('Start time must be 24h HH:MM:SS (e.g. 18:15:00).'); return null; }
         if (rawEndT && endTime === null) { flashField(el.endTime); toast('End time must be 24h HH:MM:SS (e.g. 04:45:00).'); return null; }
@@ -1090,9 +1122,9 @@
             return null;
         }
 
-        // Normalize back into the fields.
-        el.start.value = startDate;
-        el.end.value = endDate;
+        // Normalize back into the fields (date pickers want ISO).
+        el.start.value = usToIsoDate(startDate);
+        el.end.value = usToIsoDate(endDate);
         if (startTime) el.startTime.value = startTime;
         if (endTime) el.endTime.value = endTime;
         persistInputs();
