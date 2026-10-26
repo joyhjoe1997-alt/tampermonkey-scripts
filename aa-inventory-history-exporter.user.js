@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AA Inventory History Batch Exporter
 // @namespace    http://tampermonkey.net/
-// @version      1.4
+// @version      1.5
 // @description  Paste a list of AA logins + a date range, pull each AA's Inventory History (background, no navigation) and export a multi-sheet .xlsx (home summary + one sheet per AA).
 // @author       joyhjoe
 // @match        *://qi-fcresearch-eu.corp.amazon.com/*/results?s=*
@@ -88,7 +88,7 @@
     // ═══════════════════════════════════════════════════════════════
     // SECTION 1: CONFIG
     // ═══════════════════════════════════════════════════════════════
-    const VERSION = '1.4';
+    const VERSION = '1.5';
     const STORAGE_KEY = 'aa_inv_exporter_settings_v1';
     const ORIGIN = location.origin;
 
@@ -814,175 +814,163 @@
         style.id = 'aa-exp-styles';
         style.textContent = `
             #aa-exp-launch {
-                position: fixed; right: 18px; bottom: 18px; z-index: 2147483000;
-                display: inline-flex; align-items: center; gap: 8px;
-                padding: 11px 16px; border: none; border-radius: 10px; cursor: pointer;
-                background: linear-gradient(135deg, #217346, #185c37); color: #fff;
+                position: fixed; right: 22px; bottom: 22px; z-index: 2147483000;
+                display: inline-flex; align-items: center; gap: 10px;
+                padding: 15px 22px; border: none; border-radius: 14px; cursor: pointer;
+                background: linear-gradient(135deg, #2d9b5e, #185c37); color: #fff;
                 font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-                font-size: 13px; font-weight: 700; letter-spacing: .3px;
-                box-shadow: 0 4px 14px rgba(33,115,70,.45); transition: all .2s ease;
+                font-size: 16px; font-weight: 800; letter-spacing: .3px;
+                box-shadow: 0 8px 24px rgba(24,92,55,.45); transition: transform .18s ease, box-shadow .18s ease;
             }
-            #aa-exp-launch:hover { transform: translateY(-1px); box-shadow: 0 6px 18px rgba(33,115,70,.55); }
-            #aa-exp-launch svg { width: 16px; height: 16px; }
+            #aa-exp-launch:hover { transform: translateY(-2px); box-shadow: 0 12px 30px rgba(24,92,55,.55); }
+            #aa-exp-launch:active { transform: translateY(0) scale(.98); }
+            #aa-exp-launch svg { width: 20px; height: 20px; }
 
             #aa-exp-overlay {
                 position: fixed; inset: 0; z-index: 2147483001; display: none;
-                background: rgba(15,23,42,.45); backdrop-filter: blur(2px);
+                background: rgba(15,23,42,.55); backdrop-filter: blur(4px);
                 align-items: flex-start; justify-content: center;
             }
-            #aa-exp-overlay.open { display: flex; }
+            #aa-exp-overlay.open { display: flex; animation: aaExpFade .2s ease; }
+            @keyframes aaExpFade { from { opacity: 0; } to { opacity: 1; } }
 
             #aa-exp-panel {
-                margin-top: 48px; width: 560px; max-width: calc(100vw - 32px);
-                max-height: calc(100vh - 96px); overflow: auto;
-                background: #fff; border-radius: 14px; box-shadow: 0 20px 60px rgba(0,0,0,.35);
+                margin-top: 5vh; width: 680px; max-width: calc(100vw - 32px);
+                max-height: 90vh; overflow: auto;
+                background: #fff; border-radius: 20px;
+                box-shadow: 0 30px 80px rgba(0,0,0,.45);
                 font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-                color: #0f172a;
+                color: #0f172a; animation: aaExpPop .22s cubic-bezier(.2,.8,.2,1);
             }
+            @keyframes aaExpPop { from { transform: translateY(14px) scale(.98); opacity: .6; } to { transform: none; opacity: 1; } }
+
             .aa-exp-head {
                 display: flex; align-items: center; justify-content: space-between;
-                padding: 16px 20px; border-bottom: 1px solid #e2e8f0;
-                background: linear-gradient(135deg, #232f3e, #37475a); color: #fff;
-                border-radius: 14px 14px 0 0;
+                padding: 22px 28px;
+                background: linear-gradient(135deg, #232f3e 0%, #37475a 100%); color: #fff;
+                border-radius: 20px 20px 0 0;
             }
-            .aa-exp-head h2 { margin: 0; font-size: 15px; font-weight: 700; display:flex; align-items:center; gap:8px; }
-            .aa-exp-head .aa-exp-ver { font-size: 11px; color: #ff9900; font-weight: 700; }
-            .aa-exp-close { background: none; border: none; color: #cbd5e1; font-size: 22px; cursor: pointer; line-height: 1; }
-            .aa-exp-close:hover { color: #fff; }
+            .aa-exp-head h2 { margin: 0; font-size: 21px; font-weight: 800; display:flex; align-items:center; gap:11px; letter-spacing:.2px; }
+            .aa-exp-head .aa-exp-ver { font-size: 13px; color: #ff9900; font-weight: 800; }
+            .aa-exp-close {
+                background: rgba(255,255,255,.1); border: none; color: #e2e8f0; font-size: 24px;
+                cursor: pointer; line-height: 1; width: 38px; height: 38px; border-radius: 10px;
+                display: inline-flex; align-items: center; justify-content: center; transition: background .15s;
+            }
+            .aa-exp-close:hover { background: rgba(255,255,255,.22); color: #fff; }
 
-            .aa-exp-body { padding: 18px 20px; }
-            .aa-exp-field { margin-bottom: 16px; }
+            .aa-exp-body { padding: 26px 28px 30px; }
+            .aa-exp-field { margin-bottom: 22px; }
             .aa-exp-field label {
-                display: block; font-size: 12px; font-weight: 700; text-transform: uppercase;
-                letter-spacing: .6px; color: #475569; margin-bottom: 6px;
+                display: flex; align-items: center; gap: 10px;
+                font-size: 15px; font-weight: 800; letter-spacing: .3px; color: #1e293b; margin-bottom: 10px;
+            }
+            .aa-exp-count-badge {
+                background: #2563eb; color: #fff; font-size: 13px; font-weight: 800;
+                min-width: 24px; text-align: center; padding: 2px 10px; border-radius: 999px;
             }
             .aa-exp-field textarea {
-                width: 100%; box-sizing: border-box; min-height: 110px; resize: vertical;
-                border: 1px solid #cbd5e1; border-radius: 8px; padding: 10px 12px;
-                font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px;
+                width: 100%; box-sizing: border-box; min-height: 130px; resize: vertical;
+                border: 2px solid #e2e8f0; border-radius: 12px; padding: 14px 16px;
+                font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+                font-size: 16px; line-height: 1.6; color: #0f172a;
             }
-            .aa-exp-dates { display: flex; gap: 12px; flex-wrap: wrap; }
-            .aa-exp-dates .aa-exp-field { flex: 1 1 calc(50% - 6px); min-width: 120px; margin-bottom: 0; }
+            .aa-exp-dates { display: flex; gap: 14px; flex-wrap: wrap; }
+            .aa-exp-dates .aa-exp-field { flex: 1 1 calc(50% - 7px); min-width: 140px; margin-bottom: 0; }
             .aa-exp-field input[type=text] {
-                width: 100%; box-sizing: border-box; border: 1px solid #cbd5e1; border-radius: 8px;
-                padding: 9px 12px; font-size: 14px; text-align: center;
+                width: 100%; box-sizing: border-box; border: 2px solid #e2e8f0; border-radius: 12px;
+                padding: 13px 14px; font-size: 17px; font-weight: 600; text-align: center;
                 font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-                color: #0f172a; background: #fff; min-height: 38px;
+                color: #0f172a; background: #fff; min-height: 50px;
             }
             .aa-exp-pick { position: relative; }
-            .aa-exp-pick input[readonly] { cursor: pointer; background: #fff; }
-            .aa-exp-pick input[readonly]:hover { border-color: #93c5fd; }
-            textarea:focus, input:focus { outline: none; border-color: #2563eb; box-shadow: 0 0 0 3px rgba(37,99,235,.15); }
+            .aa-exp-pick input[readonly] { cursor: pointer; background: #f8fafc; }
+            .aa-exp-pick input[readonly]:hover { border-color: #93c5fd; background: #fff; }
+            textarea:focus, input:focus { outline: none; border-color: #2563eb; box-shadow: 0 0 0 4px rgba(37,99,235,.14); }
 
             /* ── Custom popup (calendar / time) ── */
             .aa-pop {
-                position: absolute; top: calc(100% + 6px); left: 0; z-index: 2147483010;
-                background: #fff; border: 1px solid #cbd5e1; border-radius: 10px;
-                box-shadow: 0 12px 32px rgba(0,0,0,.22); padding: 10px; min-width: 240px;
+                position: absolute; top: calc(100% + 8px); left: 0; z-index: 2147483010;
+                background: #fff; border: 1px solid #e2e8f0; border-radius: 14px;
+                box-shadow: 0 18px 44px rgba(0,0,0,.26); padding: 14px; min-width: 280px;
                 font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
             }
             .aa-pop.right { left: auto; right: 0; }
-            .aa-cal-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+            .aa-cal-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
             .aa-cal-nav {
-                border: none; background: #f1f5f9; color: #334155; width: 28px; height: 28px;
-                border-radius: 7px; cursor: pointer; font-size: 15px; line-height: 1;
+                border: none; background: #f1f5f9; color: #334155; width: 34px; height: 34px;
+                border-radius: 9px; cursor: pointer; font-size: 19px; line-height: 1;
             }
             .aa-cal-nav:hover { background: #e2e8f0; }
-            .aa-cal-title { font-size: 13px; font-weight: 700; color: #0f172a; }
-            .aa-cal-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 2px; }
-            .aa-cal-dow { font-size: 10px; font-weight: 700; color: #94a3b8; text-align: center; padding: 4px 0; }
+            .aa-cal-title { font-size: 16px; font-weight: 800; color: #0f172a; }
+            .aa-cal-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 3px; }
+            .aa-cal-dow { font-size: 12px; font-weight: 800; color: #94a3b8; text-align: center; padding: 5px 0; }
             .aa-cal-day {
-                border: none; background: none; cursor: pointer; border-radius: 6px;
-                font-size: 12.5px; color: #0f172a; height: 30px;
+                border: none; background: none; cursor: pointer; border-radius: 8px;
+                font-size: 15px; color: #0f172a; height: 38px; transition: background .12s;
             }
             .aa-cal-day:hover { background: #e0e7ff; }
             .aa-cal-day.other { color: #cbd5e1; }
-            .aa-cal-day.today { outline: 1px solid #93c5fd; }
-            .aa-cal-day.sel { background: #2563eb; color: #fff; font-weight: 700; }
-            .aa-cal-foot { display: flex; justify-content: space-between; margin-top: 8px; }
+            .aa-cal-day.today { outline: 2px solid #93c5fd; }
+            .aa-cal-day.sel { background: #2563eb; color: #fff; font-weight: 800; }
+            .aa-cal-foot { display: flex; justify-content: space-between; margin-top: 10px; }
             .aa-cal-foot button {
-                border: none; background: none; color: #2563eb; font-size: 12px; font-weight: 600;
-                cursor: pointer; padding: 2px 4px;
+                border: none; background: none; color: #2563eb; font-size: 14px; font-weight: 700;
+                cursor: pointer; padding: 4px 6px;
             }
             .aa-cal-foot button:hover { text-decoration: underline; }
 
-            .aa-time-row { display: flex; align-items: center; gap: 6px; justify-content: center; }
+            .aa-time-row { display: flex; align-items: center; gap: 8px; justify-content: center; }
             .aa-time-row select {
-                border: 1px solid #cbd5e1; border-radius: 7px; padding: 8px 6px; font-size: 14px;
-                background: #fff; color: #0f172a; cursor: pointer;
+                border: 2px solid #e2e8f0; border-radius: 9px; padding: 11px 9px; font-size: 18px;
+                background: #fff; color: #0f172a; cursor: pointer; font-weight: 700;
                 font-family: ui-monospace, Menlo, Consolas, monospace;
             }
-            .aa-time-sep { font-weight: 700; color: #475569; }
-            .aa-time-foot { display: flex; justify-content: space-between; margin-top: 10px; }
+            .aa-time-sep { font-weight: 800; color: #475569; font-size: 18px; }
+            .aa-time-foot { display: flex; justify-content: space-between; margin-top: 12px; }
             .aa-time-foot button {
-                border: none; background: none; font-size: 12px; font-weight: 600; cursor: pointer; padding: 2px 4px;
+                border: none; background: none; font-size: 14px; font-weight: 700; cursor: pointer; padding: 4px 6px;
             }
             .aa-time-clear { color: #b91c1c; }
             .aa-time-done { color: #2563eb; }
             .aa-time-foot button:hover { text-decoration: underline; }
-            .aa-exp-hint { font-size: 11px; color: #94a3b8; margin-top: 6px; }
 
-            .aa-exp-actions { display: flex; gap: 10px; margin-top: 20px; align-items: center; }
+            .aa-exp-actions { display: flex; gap: 12px; margin-top: 26px; align-items: center; }
             .aa-exp-btn {
-                display: inline-flex; align-items: center; gap: 7px; padding: 10px 18px;
-                border: none; border-radius: 8px; cursor: pointer; font-size: 13px; font-weight: 700;
-                transition: all .2s ease;
+                display: inline-flex; align-items: center; gap: 9px; padding: 14px 24px;
+                border: none; border-radius: 12px; cursor: pointer; font-size: 16px; font-weight: 800;
+                transition: transform .15s ease, box-shadow .15s ease, background .15s ease;
             }
-            .aa-exp-btn.run { background: linear-gradient(135deg, #217346, #185c37); color: #fff; }
-            .aa-exp-btn.run:hover { background: linear-gradient(135deg, #2d9b5e, #217346); }
+            .aa-exp-btn:active { transform: scale(.97); }
+            .aa-exp-btn.run {
+                background: linear-gradient(135deg, #2d9b5e, #185c37); color: #fff; flex: 1;
+                justify-content: center; box-shadow: 0 6px 18px rgba(24,92,55,.4);
+            }
+            .aa-exp-btn.run:hover { box-shadow: 0 9px 24px rgba(24,92,55,.52); transform: translateY(-1px); }
             .aa-exp-btn.cancel { background: #fee2e2; color: #b91c1c; }
             .aa-exp-btn.cancel:hover { background: #fecaca; }
-            .aa-exp-btn:disabled { opacity: .5; cursor: not-allowed; }
-            .aa-exp-btn.ghost { background: #f1f5f9; color: #334155; }
+            .aa-exp-btn:disabled { opacity: .45; cursor: not-allowed; transform: none; box-shadow: none; }
+            .aa-exp-btn.ghost { background: #eef2f7; color: #334155; }
             .aa-exp-btn.ghost:hover { background: #e2e8f0; }
-            .aa-exp-btn.test { background: #eef2ff; color: #4338ca; }
-            .aa-exp-btn.test:hover { background: #e0e7ff; }
 
-            .aa-exp-preview {
-                margin-top: 16px; border: 1px solid #e2e8f0; border-radius: 10px; overflow: hidden;
-                font-size: 12px;
-            }
-            .aa-exp-preview-head {
-                display: flex; align-items: center; justify-content: space-between; gap: 8px;
-                padding: 9px 12px; background: #f8fafc; border-bottom: 1px solid #e2e8f0;
-                font-weight: 700; color: #334155;
-            }
-            .aa-exp-preview-head .meta { font-weight: 600; color: #64748b; font-size: 11px; }
-            .aa-exp-preview-scroll { max-height: 260px; overflow: auto; }
-            .aa-exp-preview table { border-collapse: collapse; width: 100%; white-space: nowrap; }
-            .aa-exp-preview th, .aa-exp-preview td {
-                border-bottom: 1px solid #f1f5f9; border-right: 1px solid #f1f5f9;
-                padding: 5px 9px; text-align: left; font-family: ui-monospace, Menlo, Consolas, monospace;
-            }
-            .aa-exp-preview th {
-                position: sticky; top: 0; background: #eef2ff; color: #3730a3; font-weight: 700;
-                border-bottom: 2px solid #c7d2fe;
-            }
-            .aa-exp-preview td { color: #0f172a; }
-            .aa-exp-preview tr:nth-child(even) td { background: #fafafa; }
-            .aa-exp-preview-empty { padding: 14px 12px; color: #0369a1; }
-            .aa-exp-preview-error { padding: 14px 12px; color: #b91c1c; }
-
-            .aa-exp-progress-wrap { margin-top: 18px; }
-            .aa-exp-bar { height: 8px; border-radius: 999px; background: #e2e8f0; overflow: hidden; }
+            .aa-exp-progress-wrap { margin-top: 24px; }
+            .aa-exp-bar { height: 12px; border-radius: 999px; background: #e2e8f0; overflow: hidden; }
             .aa-exp-bar > div { height: 100%; width: 0%; background: linear-gradient(90deg, #0ea5e9, #2563eb); transition: width .25s ease; }
-            .aa-exp-counter { font-size: 12px; color: #64748b; margin: 8px 0 4px; font-weight: 600; }
+            .aa-exp-counter { font-size: 15px; color: #475569; margin: 12px 0 6px; font-weight: 800; }
 
-            .aa-exp-list { margin-top: 8px; border: 1px solid #e2e8f0; border-radius: 8px; max-height: 220px; overflow: auto; }
+            .aa-exp-list { margin-top: 10px; border: 1px solid #e2e8f0; border-radius: 12px; max-height: 280px; overflow: auto; }
             .aa-exp-row {
                 display: flex; align-items: center; justify-content: space-between;
-                padding: 7px 12px; font-size: 12.5px; border-bottom: 1px solid #f1f5f9;
+                padding: 11px 16px; font-size: 15px; border-bottom: 1px solid #f1f5f9;
             }
             .aa-exp-row:last-child { border-bottom: none; }
-            .aa-exp-row .login { font-family: ui-monospace, Menlo, Consolas, monospace; font-weight: 600; }
-            .aa-exp-badge { font-size: 11px; font-weight: 700; padding: 2px 9px; border-radius: 999px; }
+            .aa-exp-row .login { font-family: ui-monospace, Menlo, Consolas, monospace; font-weight: 700; }
+            .aa-exp-badge { font-size: 13px; font-weight: 800; padding: 3px 12px; border-radius: 999px; }
             .st-pending { background: #f1f5f9; color: #64748b; }
             .st-running { background: #fef3c7; color: #b45309; }
             .st-done    { background: #dcfce7; color: #15803d; }
             .st-empty   { background: #e0f2fe; color: #0369a1; }
             .st-error   { background: #fee2e2; color: #b91c1c; }
-
-            .aa-exp-note { font-size: 11px; color: #94a3b8; margin-top: 12px; line-height: 1.5; }
         `;
         document.head.appendChild(style);
     }
@@ -1021,9 +1009,8 @@
                 </div>
                 <div class="aa-exp-body">
                     <div class="aa-exp-field">
-                        <label>AA Logins</label>
-                        <textarea id="aa-exp-logins" placeholder="Paste logins — one per line, or separated by space/comma&#10;e.g.&#10;joyhjoe&#10;asmith&#10;bwilliam"></textarea>
-                        <div class="aa-exp-hint" id="aa-exp-count">0 logins</div>
+                        <label>AA Logins <span class="aa-exp-count-badge" id="aa-exp-count">0</span></label>
+                        <textarea id="aa-exp-logins" placeholder="joyhjoe&#10;asmith&#10;bwilliam"></textarea>
                     </div>
                     <div class="aa-exp-dates">
                         <div class="aa-exp-field aa-exp-pick" id="aa-exp-start-wrap">
@@ -1043,41 +1030,27 @@
                             <input type="text" id="aa-exp-end-time" placeholder="HH:MM:SS" readonly autocomplete="off">
                         </div>
                     </div>
-                    <div class="aa-exp-hint">Same window is applied to every AA. Click a field to pick. Leave both times blank for full days (use the ✕ in the time popup to clear). If end time ≤ start time (e.g. 18:15:00 → 04:45:00) the window is treated as overnight (ends next day).</div>
 
                     <div class="aa-exp-actions">
                         <button class="aa-exp-btn run" id="aa-exp-run">
-                            <svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" fill="none" viewBox="0 0 24 24"
+                            <svg xmlns="http://www.w3.org/2000/svg" width="19" height="19" fill="none" viewBox="0 0 24 24"
                                  stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
                                 <polygon points="5 3 19 12 5 21 5 3"/></svg>
                             Run &amp; Export
                         </button>
-                        <button class="aa-exp-btn test" id="aa-exp-test" title="Fetch &amp; preview the first login only — no Excel">
-                            <svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" fill="none" viewBox="0 0 24 24"
-                                 stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
-                                <path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
-                            Test one AA
-                        </button>
                         <button class="aa-exp-btn cancel" id="aa-exp-cancel" disabled>Cancel</button>
-                        <button class="aa-exp-btn ghost" id="aa-exp-download" disabled title="Re-download last result">Download .xlsx</button>
+                        <button class="aa-exp-btn ghost" id="aa-exp-download" disabled title="Re-download last result">
+                            <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" fill="none" viewBox="0 0 24 24"
+                                 stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+                                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                            Download
+                        </button>
                     </div>
-
-                    <div class="aa-exp-preview" id="aa-exp-preview" style="display:none;"></div>
 
                     <div class="aa-exp-progress-wrap" id="aa-exp-progress" style="display:none;">
                         <div class="aa-exp-counter" id="aa-exp-counter">0 / 0</div>
                         <div class="aa-exp-bar"><div id="aa-exp-bar-fill"></div></div>
                         <div class="aa-exp-list" id="aa-exp-list"></div>
-                    </div>
-
-                    <div class="aa-exp-note">
-                        Engine: <b>${ENGINE === 'A' ? 'Direct endpoint' : 'Hidden iframe (same-origin)'}</b> ·
-                        Concurrency ${CONCURRENCY}. Data is pulled in the background; this panel stays open.
-                        The workbook has a <b>Home</b> summary tab plus one tab per AA with a
-                        <b>Gap (since prev)</b> column, color-coded
-                        <span style="background:#63BE7B;padding:0 5px;border-radius:3px;color:#1a1a1a">≤5m</span>
-                        <span style="background:#FFEB84;padding:0 5px;border-radius:3px;color:#1a1a1a">→</span>
-                        <span style="background:#F8696B;padding:0 5px;border-radius:3px;color:#1a1a1a">60m+</span>.
                     </div>
                 </div>
             </div>`;
@@ -1094,10 +1067,8 @@
             endTime: overlay.querySelector('#aa-exp-end-time'),
             count: overlay.querySelector('#aa-exp-count'),
             run: overlay.querySelector('#aa-exp-run'),
-            test: overlay.querySelector('#aa-exp-test'),
             cancel: overlay.querySelector('#aa-exp-cancel'),
             download: overlay.querySelector('#aa-exp-download'),
-            preview: overlay.querySelector('#aa-exp-preview'),
             progress: overlay.querySelector('#aa-exp-progress'),
             counter: overlay.querySelector('#aa-exp-counter'),
             barFill: overlay.querySelector('#aa-exp-bar-fill'),
@@ -1133,7 +1104,6 @@
         el.endTime.addEventListener('input', persistInputs);
 
         el.run.addEventListener('click', onRun);
-        el.test.addEventListener('click', onTest);
         el.cancel.addEventListener('click', onCancel);
         el.download.addEventListener('click', onReDownload);
     }
@@ -1441,113 +1411,8 @@
         return { logins, startDate, endDate, startTime, endTime, window };
     }
 
-    // Test one AA: fetch + parse the FIRST login only, render a preview table.
-    // No gap enrichment math beyond what the preview needs, and no Excel.
-    async function onTest() {
-        if (isRunning) return;
-
-        const input = collectInputs(false);
-        if (!input) return;
-        const { logins, startDate, endDate, startTime, endTime, window } = input;
-
-        const login = logins[0];
-        const winLabel = fmtWindowLabel(startDate, endDate, startTime, endTime);
-
-        isRunning = true;
-        cancelRequested = false;
-        setRunningUI(true);
-        // During a single-AA test we DO allow cancel.
-        el.cancel.disabled = false;
-
-        el.progress.style.display = 'none';
-        el.preview.style.display = 'block';
-        el.preview.innerHTML = `
-            <div class="aa-exp-preview-head">
-                <span>Testing <span style="font-family:ui-monospace,Menlo,Consolas,monospace">${escapeHtml(login)}</span>…</span>
-                <span class="meta">${escapeHtml(winLabel)}</span>
-            </div>
-            <div class="aa-exp-preview-empty">Fetching in the background…</div>`;
-
-        let raw;
-        try {
-            raw = await fetchOneAA(login, startDate, endDate);
-        } catch (e) {
-            isRunning = false;
-            setRunningUI(false);
-            if (cancelRequested) { el.preview.style.display = 'none'; return toast('Test cancelled.'); }
-            el.preview.innerHTML = `
-                <div class="aa-exp-preview-head"><span>Test: ${escapeHtml(login)}</span></div>
-                <div class="aa-exp-preview-error">Failed: ${escapeHtml((e && e.message) || String(e))}</div>`;
-            return;
-        }
-
-        isRunning = false;
-        setRunningUI(false);
-
-        if (cancelRequested) { el.preview.style.display = 'none'; return toast('Test cancelled.'); }
-
-        renderPreview(login, winLabel, window, raw);
-    }
-
-    function renderPreview(login, winLabel, window, raw) {
-        if (!raw || !raw.rows || raw.rows.length === 0) {
-            el.preview.innerHTML = `
-                <div class="aa-exp-preview-head">
-                    <span>Test: <span style="font-family:ui-monospace,Menlo,Consolas,monospace">${escapeHtml(login)}</span></span>
-                    <span class="meta">${escapeHtml(winLabel)}</span>
-                </div>
-                <div class="aa-exp-preview-empty">No rows returned for this AA in that date range.
-                    (${raw && raw.headers ? raw.headers.length : 0} column header${raw && raw.headers && raw.headers.length === 1 ? '' : 's'} detected.)
-                </div>`;
-            return;
-        }
-
-        const rawCount = raw.rows.length;
-
-        // Run the real gap enrichment + window filter so the preview reflects
-        // the exact export output.
-        const enriched = enrichWithGaps(raw, window);
-        const headers = enriched.headers;
-        const rows = enriched.rows;
-
-        if (rows.length === 0) {
-            el.preview.innerHTML = `
-                <div class="aa-exp-preview-head">
-                    <span>Test: <span style="font-family:ui-monospace,Menlo,Consolas,monospace">${escapeHtml(login)}</span></span>
-                    <span class="meta">${escapeHtml(winLabel)}</span>
-                </div>
-                <div class="aa-exp-preview-empty">${rawCount} row${rawCount === 1 ? '' : 's'} fetched, but none fall inside the time window.</div>`;
-            return;
-        }
-
-        const PREVIEW_MAX = 8;
-        const shown = rows.slice(0, PREVIEW_MAX);
-
-        const thead = '<tr>' + headers.map(h => `<th>${escapeHtml(h)}</th>`).join('') + '</tr>';
-        const tbody = shown.map(r =>
-            '<tr>' + headers.map(h => `<td>${escapeHtml(r[h] != null ? r[h] : '')}</td>`).join('') + '</tr>'
-        ).join('');
-
-        const tsHeader = findTimestampHeader(raw.headers);
-        el.preview.innerHTML = `
-            <div class="aa-exp-preview-head">
-                <span>✓ <span style="font-family:ui-monospace,Menlo,Consolas,monospace">${escapeHtml(login)}</span>
-                    — ${rows.length} row${rows.length === 1 ? '' : 's'}${window ? ` (of ${rawCount} fetched)` : ''}</span>
-                <span class="meta">ts col: ${escapeHtml(tsHeader || 'n/a')} · span ${escapeHtml(enriched.totalSpan || '—')}</span>
-            </div>
-            <div class="aa-exp-preview-scroll">
-                <table><thead>${thead}</thead><tbody>${tbody}</tbody></table>
-            </div>
-            ${rows.length > PREVIEW_MAX
-                ? `<div class="aa-exp-preview-empty">Showing first ${PREVIEW_MAX} of ${rows.length} rows. Full data goes to the Excel export.</div>`
-                : ''}`;
-    }
-
     async function onRun() {
         if (isRunning) return;
-
-        // A fresh run clears any lingering single-AA preview.
-        el.preview.style.display = 'none';
 
         const input = collectInputs(true);
         if (!input) return;
@@ -1617,7 +1482,6 @@
 
     function setRunningUI(running) {
         el.run.disabled = running;
-        el.test.disabled = running;
         el.cancel.disabled = !running;
         el.cancel.textContent = 'Cancel';
         el.logins.disabled = running;
