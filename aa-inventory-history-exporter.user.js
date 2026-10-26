@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AA Inventory History Batch Exporter
 // @namespace    http://tampermonkey.net/
-// @version      1.3
+// @version      1.4
 // @description  Paste a list of AA logins + a date range, pull each AA's Inventory History (background, no navigation) and export a multi-sheet .xlsx (home summary + one sheet per AA).
 // @author       joyhjoe
 // @match        *://qi-fcresearch-eu.corp.amazon.com/*/results?s=*
@@ -18,7 +18,7 @@
 // @connect      qi-fcresearch-eu.corp.amazon.com
 // @connect      qi-fcresearch-na.corp.amazon.com
 // @connect      fcresearch-eu.aka.amazon.com
-// @require      https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js
+// @require      https://cdnjs.cloudflare.com/ajax/libs/exceljs/4.4.0/exceljs.min.js
 // ==/UserScript==
 
 /*
@@ -88,7 +88,7 @@
     // ═══════════════════════════════════════════════════════════════
     // SECTION 1: CONFIG
     // ═══════════════════════════════════════════════════════════════
-    const VERSION = '1.3';
+    const VERSION = '1.4';
     const STORAGE_KEY = 'aa_inv_exporter_settings_v1';
     const ORIGIN = location.origin;
 
@@ -249,6 +249,38 @@
             return `${startDate} ${startTime} → ${endDate} ${endTime}`;
         }
         return `${startDate} → ${endDate}`;
+    }
+
+    // Map a gap in minutes to an ARGB fill color for Excel.
+    //   ≤ 5 min   → green
+    //   ≥ 60 min  → red
+    //   between   → smooth green → yellow → orange → red ramp
+    // Returns an 8-char ARGB hex string (ExcelJS fill format), or null for
+    // no fill (empty/first-row gaps).
+    const GAP_GREEN_MAX = 5;    // minutes: at/below → full green
+    const GAP_RED_MIN = 60;     // minutes: at/above → full red
+    function gapFillARGB(gapMin) {
+        if (gapMin == null || isNaN(gapMin) || gapMin < 0) return null;
+
+        // Normalize to 0..1 across the ramp.
+        let t;
+        if (gapMin <= GAP_GREEN_MAX) t = 0;
+        else if (gapMin >= GAP_RED_MIN) t = 1;
+        else t = (gapMin - GAP_GREEN_MAX) / (GAP_RED_MIN - GAP_GREEN_MAX);
+
+        // Two-leg interpolation: green→yellow (t 0..0.5), yellow→red (t 0.5..1).
+        // Green  #63BE7B (99,190,123), Yellow #FFEB84 (255,235,132), Red #F8696B (248,105,107)
+        const lerp = (a, b, f) => Math.round(a + (b - a) * f);
+        let r, g, b;
+        if (t <= 0.5) {
+            const f = t / 0.5;
+            r = lerp(99, 255, f); g = lerp(190, 235, f); b = lerp(123, 132, f);
+        } else {
+            const f = (t - 0.5) / 0.5;
+            r = lerp(255, 248, f); g = lerp(235, 105, f); b = lerp(132, 107, f);
+        }
+        const hex = (n) => n.toString(16).padStart(2, '0').toUpperCase();
+        return 'FF' + hex(r) + hex(g) + hex(b);
     }
 
     function formatGap(ms) {
@@ -570,10 +602,19 @@
             if (d.ts) {
                 if (!firstTs) firstTs = d.ts;
                 lastTs = d.ts;
-                d.row[GAP_COL] = prev ? formatGap(d.ts - prev) : '';
+                if (prev) {
+                    const deltaMs = d.ts - prev;
+                    d.row[GAP_COL] = formatGap(deltaMs);
+                    // Numeric gap in minutes for Excel color-coding (non-exported key).
+                    d.row.__gapMin = deltaMs / 60000;
+                } else {
+                    d.row[GAP_COL] = '';
+                    d.row.__gapMin = null;
+                }
                 prev = d.ts;
             } else {
                 d.row[GAP_COL] = '';
+                d.row.__gapMin = null;
             }
         });
 
@@ -596,27 +637,39 @@
     }
 
     // ═══════════════════════════════════════════════════════════════
-    // SECTION 7: EXCEL WORKBOOK GENERATION (SheetJS)
+    // SECTION 7: EXCEL WORKBOOK GENERATION (ExcelJS — supports fills)
+    //   ExcelJS is used instead of SheetJS because the free SheetJS
+    //   community build cannot write cell background colors. The
+    //   "Gap (since prev)" column is color-coded green→red by gap size.
     // ═══════════════════════════════════════════════════════════════
-    function buildWorkbook(results, startDate, endDate, winLabel) {
-        if (typeof XLSX === 'undefined') {
-            throw new Error('SheetJS (XLSX) failed to load via @require.');
+    const GAP_COL = 'Gap (since prev)';
+
+    // Build the workbook AND trigger the download. Async because ExcelJS
+    // serializes to a buffer asynchronously.
+    async function buildAndDownloadWorkbook(results, startDate, endDate, startTime, endTime, winLabel) {
+        if (typeof ExcelJS === 'undefined') {
+            throw new Error('ExcelJS failed to load via @require.');
         }
-        const wb = XLSX.utils.book_new();
+        const wb = new ExcelJS.Workbook();
+        wb.creator = 'AA Inventory History Exporter';
+        wb.created = new Date();
         const nameSheet = makeSheetNamer();
 
         // ── Home / summary sheet ──
-        const homeAoa = [
-            ['AA Inventory History Export'],
-            ['Window', winLabel || `${startDate}  →  ${endDate}`],
-            ['Generated', fmtDateTime(new Date())],
-            ['FC', FC_SEGMENT],
-            [],
-            ['Login', 'Sheet', 'Rows', 'First event', 'Last event', 'Total span', 'Status']
-        ];
+        const home = wb.addWorksheet('Home');
+        const headerFill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF232F3E' } };
+        const headerFont = { bold: true, color: { argb: 'FFFFFFFF' } };
+
+        home.addRow(['AA Inventory History Export']);
+        home.addRow(['Window', winLabel || `${startDate}  →  ${endDate}`]);
+        home.addRow(['Generated', fmtDateTime(new Date())]);
+        home.addRow(['FC', FC_SEGMENT]);
+        home.addRow([]);
+        const homeHeaderRow = home.addRow(['Login', 'Sheet', 'Rows', 'First event', 'Last event', 'Total span', 'Status']);
+        homeHeaderRow.eachCell(c => { c.fill = headerFill; c.font = headerFont; });
+        home.getRow(1).font = { bold: true, size: 14 };
 
         const perAaSheets = []; // {sheetName, result}
-
         results.forEach(res => {
             let sheetName = '';
             let rowCount = 0;
@@ -625,7 +678,7 @@
                 rowCount = res.data.rows.length;
                 perAaSheets.push({ sheetName, result: res.data });
             }
-            homeAoa.push([
+            home.addRow([
                 res.login,
                 sheetName,
                 rowCount,
@@ -635,35 +688,59 @@
                 res.statusLabel || res.status
             ]);
         });
-
-        const homeWs = XLSX.utils.aoa_to_sheet(homeAoa);
-        homeWs['!cols'] = [
-            { wch: 16 }, { wch: 16 }, { wch: 8 }, { wch: 21 }, { wch: 21 }, { wch: 12 }, { wch: 28 }
-        ];
-        XLSX.utils.book_append_sheet(wb, homeWs, 'Home');
+        [16, 16, 8, 21, 21, 12, 28].forEach((w, i) => { home.getColumn(i + 1).width = w; });
 
         // ── Per-AA sheets ──
         perAaSheets.forEach(({ sheetName, result }) => {
             const headers = result.headers;
-            const aoa = [headers];
+            const ws = wb.addWorksheet(sheetName);
+            const gapIdx = headers.indexOf(GAP_COL); // 0-based; ExcelJS cols are 1-based
+
+            // Header row.
+            const hr = ws.addRow(headers);
+            hr.eachCell(c => { c.fill = headerFill; c.font = headerFont; });
+
+            // Data rows.
             result.rows.forEach(r => {
-                aoa.push(headers.map(h => r[h] != null ? r[h] : ''));
+                const row = ws.addRow(headers.map(h => (r[h] != null ? r[h] : '')));
+                // Color-code the gap cell from its numeric minutes.
+                if (gapIdx >= 0) {
+                    const argb = gapFillARGB(r.__gapMin);
+                    if (argb) {
+                        const cell = row.getCell(gapIdx + 1);
+                        cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb } };
+                        // Dark text on pale greens, near-black everywhere keeps it readable.
+                        cell.font = { color: { argb: 'FF1A1A1A' }, bold: true };
+                        cell.alignment = { horizontal: 'center' };
+                    }
+                }
             });
-            const ws = XLSX.utils.aoa_to_sheet(aoa);
-            ws['!cols'] = headers.map(h => ({ wch: Math.min(Math.max(h.length + 2, 10), 40) }));
-            XLSX.utils.book_append_sheet(wb, ws, sheetName);
+
+            // Set widths without reassigning ws.columns (which would run after
+            // rows are added and can disturb data). Iterate the column getters.
+            headers.forEach((h, i) => {
+                ws.getColumn(i + 1).width = Math.min(Math.max(h.length + 2, 10), 40);
+            });
+            ws.views = [{ state: 'frozen', ySplit: 1 }]; // freeze header row
         });
 
-        return wb;
-    }
-
-    function downloadWorkbook(wb, startDate, endDate, startTime, endTime) {
+        // ── Serialize + download ──
+        const buffer = await wb.xlsx.writeBuffer();
         const safe = (s) => String(s).replace(/[/:]/g, '-');
-        const tPart = (startTime && endTime)
-            ? `_${safe(startTime)}_${safe(endTime)}`
-            : '';
+        const tPart = (startTime && endTime) ? `_${safe(startTime)}_${safe(endTime)}` : '';
         const fname = `AA_Inventory_History_${safe(startDate)}_to_${safe(endDate)}${tPart}.xlsx`;
-        XLSX.writeFile(wb, fname);
+
+        const blob = new Blob([buffer], {
+            type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = fname;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -997,7 +1074,10 @@
                         Engine: <b>${ENGINE === 'A' ? 'Direct endpoint' : 'Hidden iframe (same-origin)'}</b> ·
                         Concurrency ${CONCURRENCY}. Data is pulled in the background; this panel stays open.
                         The workbook has a <b>Home</b> summary tab plus one tab per AA with a
-                        <b>Gap (since prev)</b> column.
+                        <b>Gap (since prev)</b> column, color-coded
+                        <span style="background:#63BE7B;padding:0 5px;border-radius:3px;color:#1a1a1a">≤5m</span>
+                        <span style="background:#FFEB84;padding:0 5px;border-radius:3px;color:#1a1a1a">→</span>
+                        <span style="background:#F8696B;padding:0 5px;border-radius:3px;color:#1a1a1a">60m+</span>.
                     </div>
                 </div>
             </div>`;
@@ -1313,7 +1393,7 @@
     // Validate + normalize all inputs. On success returns
     //   { logins, startDate, endDate, startTime, endTime, window }
     // On failure, flashes the offending field, toasts a message, returns null.
-    // `requireXlsx` adds the SheetJS-loaded check (used by Run, not Test).
+    // `requireXlsx` adds the ExcelJS-loaded check (used by Run, not Test).
     function collectInputs(requireXlsx) {
         const logins = parseLoginList(el.logins.value);
         // Fields hold the internal formats directly (MM/DD/YYYY and HH:MM:SS).
@@ -1345,8 +1425,8 @@
             return null;
         }
 
-        if (requireXlsx && typeof XLSX === 'undefined') {
-            toast('SheetJS did not load (check @require / network). Cannot export.');
+        if (requireXlsx && typeof ExcelJS === 'undefined') {
+            toast('ExcelJS did not load (check @require / network). Cannot export.');
             return null;
         }
 
@@ -1508,8 +1588,7 @@
         }
 
         try {
-            const wb = buildWorkbook(results, startDate, endDate, winLabel);
-            downloadWorkbook(wb, startDate, endDate, startTime, endTime);
+            await buildAndDownloadWorkbook(results, startDate, endDate, startTime, endTime, winLabel);
             const ok = results.filter(r => r.status === 'done').length;
             toast(`Exported ${ok} AA sheet${ok === 1 ? '' : 's'} to Excel.`);
         } catch (e) {
@@ -1524,11 +1603,13 @@
         el.cancel.textContent = 'Cancelling…';
     }
 
-    function onReDownload() {
+    async function onReDownload() {
         if (!lastResults) return;
         try {
-            const wb = buildWorkbook(lastResults.results, lastResults.startDate, lastResults.endDate, lastResults.winLabel);
-            downloadWorkbook(wb, lastResults.startDate, lastResults.endDate, lastResults.startTime, lastResults.endTime);
+            await buildAndDownloadWorkbook(
+                lastResults.results, lastResults.startDate, lastResults.endDate,
+                lastResults.startTime, lastResults.endTime, lastResults.winLabel
+            );
         } catch (e) {
             toast('Download failed: ' + (e.message || e));
         }
