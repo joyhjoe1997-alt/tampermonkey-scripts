@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AA Inventory History Batch Exporter
 // @namespace    http://tampermonkey.net/
-// @version      1.0
+// @version      1.1
 // @description  Paste a list of AA logins + a date range, pull each AA's Inventory History (background, no navigation) and export a multi-sheet .xlsx (home summary + one sheet per AA).
 // @author       joyhjoe
 // @match        *://qi-fcresearch-eu.corp.amazon.com/*/results?s=*
@@ -88,7 +88,7 @@
     // ═══════════════════════════════════════════════════════════════
     // SECTION 1: CONFIG
     // ═══════════════════════════════════════════════════════════════
-    const VERSION = '1.0';
+    const VERSION = '1.1';
     const STORAGE_KEY = 'aa_inv_exporter_settings_v1';
     const ORIGIN = location.origin;
 
@@ -119,7 +119,9 @@
     const DEFAULT_SETTINGS = {
         logins: '',
         startDate: '',   // MM/DD/YYYY
-        endDate: ''      // MM/DD/YYYY
+        endDate: '',     // MM/DD/YYYY
+        startTime: '',   // HH:MM:SS (24h), optional
+        endTime: ''      // HH:MM:SS (24h), optional
     };
 
     let settings = { ...DEFAULT_SETTINGS };
@@ -196,6 +198,57 @@
         // Last resort: let Date try.
         const d = new Date(s);
         return isNaN(d.getTime()) ? null : d;
+    }
+
+    // Validate/normalize a 24-hour time string → "HH:MM:SS" or null.
+    // Accepts H:MM, HH:MM, or HH:MM:SS. Seconds default to 00.
+    function normalizeTimeStr(s) {
+        if (!s || typeof s !== 'string') return null;
+        const m = s.trim().match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/);
+        if (!m) return null;
+        const hh = parseInt(m[1], 10), mm = parseInt(m[2], 10), ss = m[3] != null ? parseInt(m[3], 10) : 0;
+        if (hh > 23 || mm > 59 || ss > 59) return null;
+        const pad = (n) => String(n).padStart(2, '0');
+        return `${pad(hh)}:${pad(mm)}:${pad(ss)}`;
+    }
+
+    function timeParts(hhmmss) {
+        const [h, m, s] = hhmmss.split(':').map(Number);
+        return { h, m, s };
+    }
+
+    // Build the concrete [from, to] Date window for a run from the date + time
+    // inputs. If endTime <= startTime it is treated as an overnight window, so
+    // the end instant rolls to the day AFTER endDate (shift crossing midnight).
+    // dateStr is MM/DD/YYYY, timeStr is HH:MM:SS. timeStr may be '' (no time
+    // filtering → window is the whole start-of-startDate to end-of-endDate).
+    function buildWindow(startDate, endDate, startTime, endTime) {
+        const sd = startDate.split('/').map(Number);      // [MM, DD, YYYY]
+        const ed = endDate.split('/').map(Number);
+
+        let from, to;
+        if (startTime && endTime) {
+            const st = timeParts(startTime);
+            const et = timeParts(endTime);
+            from = new Date(sd[2], sd[0] - 1, sd[1], st.h, st.m, st.s);
+            to = new Date(ed[2], ed[0] - 1, ed[1], et.h, et.m, et.s);
+            // Overnight: end time is earlier than (or equal to) start time → next day.
+            if (et.h * 3600 + et.m * 60 + et.s <= st.h * 3600 + st.m * 60 + st.s) {
+                to.setDate(to.getDate() + 1);
+            }
+        } else {
+            // No time filtering: full days.
+            from = new Date(sd[2], sd[0] - 1, sd[1], 0, 0, 0);
+            to = new Date(ed[2], ed[0] - 1, ed[1], 23, 59, 59);
+        }
+        return { from, to };
+    }
+
+    function fmtWindowLabel(startDate, endDate, startTime, endTime) {
+        if (startTime && endTime) {
+            return `${startDate} ${startTime} → ${endDate} ${endTime}`;
+        }
+        return `${startDate} → ${endDate}`;
     }
 
     function formatGap(ms) {
@@ -481,15 +534,25 @@
     //   Sort rows by timestamp, add "Gap (since prev)" column, and
     //   compute first/last event + total span for the summary.
     // ═══════════════════════════════════════════════════════════════
-    function enrichWithGaps(result) {
-        const { headers, rows } = result;
+    // `window` is an optional { from: Date, to: Date }. When present, rows whose
+    // parsed timestamp falls outside [from, to] are dropped before gap math.
+    // Rows with an unparseable timestamp are kept only when no window is given.
+    function enrichWithGaps(result, window) {
+        const { headers } = result;
         const tsHeader = findTimestampHeader(headers);
 
         // Attach a parsed Date to each row for sorting (non-destructive key).
-        const decorated = rows.map(r => ({
+        let decorated = result.rows.map(r => ({
             row: r,
             ts: tsHeader ? parseEventTimestamp(r[tsHeader]) : null
         }));
+
+        // Apply the time window filter if one was supplied.
+        if (window && window.from && window.to) {
+            decorated = decorated.filter(d =>
+                d.ts && d.ts.getTime() >= window.from.getTime() && d.ts.getTime() <= window.to.getTime()
+            );
+        }
 
         // Sort ascending by timestamp when available; rows without a timestamp
         // keep their original relative order at the end.
@@ -535,7 +598,7 @@
     // ═══════════════════════════════════════════════════════════════
     // SECTION 7: EXCEL WORKBOOK GENERATION (SheetJS)
     // ═══════════════════════════════════════════════════════════════
-    function buildWorkbook(results, startDate, endDate) {
+    function buildWorkbook(results, startDate, endDate, winLabel) {
         if (typeof XLSX === 'undefined') {
             throw new Error('SheetJS (XLSX) failed to load via @require.');
         }
@@ -545,7 +608,7 @@
         // ── Home / summary sheet ──
         const homeAoa = [
             ['AA Inventory History Export'],
-            ['Date range', `${startDate}  →  ${endDate}`],
+            ['Window', winLabel || `${startDate}  →  ${endDate}`],
             ['Generated', fmtDateTime(new Date())],
             ['FC', FC_SEGMENT],
             [],
@@ -594,16 +657,19 @@
         return wb;
     }
 
-    function downloadWorkbook(wb, startDate, endDate) {
-        const safe = (s) => String(s).replace(/\//g, '-');
-        const fname = `AA_Inventory_History_${safe(startDate)}_to_${safe(endDate)}.xlsx`;
+    function downloadWorkbook(wb, startDate, endDate, startTime, endTime) {
+        const safe = (s) => String(s).replace(/[/:]/g, '-');
+        const tPart = (startTime && endTime)
+            ? `_${safe(startTime)}_${safe(endTime)}`
+            : '';
+        const fname = `AA_Inventory_History_${safe(startDate)}_to_${safe(endDate)}${tPart}.xlsx`;
         XLSX.writeFile(wb, fname);
     }
 
     // ═══════════════════════════════════════════════════════════════
     // SECTION 8: BATCH RUNNER (concurrency + progress + cancel)
     // ═══════════════════════════════════════════════════════════════
-    async function runBatch(logins, startDate, endDate) {
+    async function runBatch(logins, startDate, endDate, window) {
         // Per-AA result record.
         const results = logins.map(login => ({
             login,
@@ -635,9 +701,15 @@
                         rec.statusLabel = 'No rows in range';
                         rec.data = { headers: raw ? raw.headers : [], rows: [], firstEvent: '', lastEvent: '', totalSpan: '' };
                     } else {
-                        rec.data = enrichWithGaps(raw);
-                        rec.status = 'done';
-                        rec.statusLabel = `${rec.data.rows.length} rows`;
+                        const enriched = enrichWithGaps(raw, window);
+                        rec.data = enriched;
+                        if (enriched.rows.length === 0) {
+                            rec.status = 'empty';
+                            rec.statusLabel = 'No rows in window';
+                        } else {
+                            rec.status = 'done';
+                            rec.statusLabel = `${enriched.rows.length} rows`;
+                        }
                     }
                 } catch (e) {
                     rec.status = cancelRequested ? 'error' : 'error';
@@ -712,8 +784,8 @@
                 border: 1px solid #cbd5e1; border-radius: 8px; padding: 10px 12px;
                 font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px;
             }
-            .aa-exp-dates { display: flex; gap: 14px; }
-            .aa-exp-dates .aa-exp-field { flex: 1; margin-bottom: 0; }
+            .aa-exp-dates { display: flex; gap: 12px; flex-wrap: wrap; }
+            .aa-exp-dates .aa-exp-field { flex: 1 1 calc(50% - 6px); min-width: 120px; margin-bottom: 0; }
             .aa-exp-field input[type=text] {
                 width: 100%; box-sizing: border-box; border: 1px solid #cbd5e1; border-radius: 8px;
                 padding: 9px 12px; font-size: 14px; text-align: center;
@@ -830,11 +902,19 @@
                             <input type="text" id="aa-exp-start" placeholder="MM/DD/YYYY">
                         </div>
                         <div class="aa-exp-field">
+                            <label>Start time</label>
+                            <input type="text" id="aa-exp-start-time" placeholder="18:15:00">
+                        </div>
+                        <div class="aa-exp-field">
                             <label>End date</label>
                             <input type="text" id="aa-exp-end" placeholder="MM/DD/YYYY">
                         </div>
+                        <div class="aa-exp-field">
+                            <label>End time</label>
+                            <input type="text" id="aa-exp-end-time" placeholder="04:45:00">
+                        </div>
                     </div>
-                    <div class="aa-exp-hint">Same date range is applied to every AA. Format: MM/DD/YYYY.</div>
+                    <div class="aa-exp-hint">Same window is applied to every AA. Date MM/DD/YYYY, time 24h HH:MM:SS. Leave both times blank for full days. If end time ≤ start time (e.g. 18:15:00 → 04:45:00) the window is treated as overnight (ends next day).</div>
 
                     <div class="aa-exp-actions">
                         <button class="aa-exp-btn run" id="aa-exp-run">
@@ -878,6 +958,8 @@
             logins: overlay.querySelector('#aa-exp-logins'),
             start: overlay.querySelector('#aa-exp-start'),
             end: overlay.querySelector('#aa-exp-end'),
+            startTime: overlay.querySelector('#aa-exp-start-time'),
+            endTime: overlay.querySelector('#aa-exp-end-time'),
             count: overlay.querySelector('#aa-exp-count'),
             run: overlay.querySelector('#aa-exp-run'),
             test: overlay.querySelector('#aa-exp-test'),
@@ -895,6 +977,8 @@
         el.logins.value = settings.logins || '';
         el.start.value = settings.startDate || '';
         el.end.value = settings.endDate || '';
+        el.startTime.value = settings.startTime || '';
+        el.endTime.value = settings.endTime || '';
         updateLoginCount();
 
         // Events
@@ -907,6 +991,8 @@
         el.logins.addEventListener('input', () => { persistInputs(); updateLoginCount(); });
         el.start.addEventListener('input', persistInputs);
         el.end.addEventListener('input', persistInputs);
+        el.startTime.addEventListener('input', persistInputs);
+        el.endTime.addEventListener('input', persistInputs);
 
         el.run.addEventListener('click', onRun);
         el.test.addEventListener('click', onTest);
@@ -918,6 +1004,8 @@
         settings.logins = el.logins.value;
         settings.startDate = el.start.value;
         settings.endDate = el.end.value;
+        settings.startTime = el.startTime.value;
+        settings.endTime = el.endTime.value;
         saveSettings();
     }
 
@@ -963,28 +1051,67 @@
     // ═══════════════════════════════════════════════════════════════
     // SECTION 10: RUN / CANCEL / DOWNLOAD handlers
     // ═══════════════════════════════════════════════════════════════
+    // Validate + normalize all inputs. On success returns
+    //   { logins, startDate, endDate, startTime, endTime, window }
+    // On failure, flashes the offending field, toasts a message, returns null.
+    // `requireXlsx` adds the SheetJS-loaded check (used by Run, not Test).
+    function collectInputs(requireXlsx) {
+        const logins = parseLoginList(el.logins.value);
+        const startDate = normalizeDateStr(el.start.value);
+        const endDate = normalizeDateStr(el.end.value);
+
+        // Times are optional, but if one is given the other must be too.
+        const rawStartT = el.startTime.value.trim();
+        const rawEndT = el.endTime.value.trim();
+        const startTime = rawStartT ? normalizeTimeStr(rawStartT) : '';
+        const endTime = rawEndT ? normalizeTimeStr(rawEndT) : '';
+
+        if (!logins.length) { flashField(el.logins); toast('Enter at least one AA login.'); return null; }
+        if (!startDate) { flashField(el.start); toast('Start date must be MM/DD/YYYY.'); return null; }
+        if (!endDate) { flashField(el.end); toast('End date must be MM/DD/YYYY.'); return null; }
+
+        if (rawStartT && startTime === null) { flashField(el.startTime); toast('Start time must be 24h HH:MM:SS (e.g. 18:15:00).'); return null; }
+        if (rawEndT && endTime === null) { flashField(el.endTime); toast('End time must be 24h HH:MM:SS (e.g. 04:45:00).'); return null; }
+        if ((startTime && !endTime) || (!startTime && endTime)) {
+            flashField(startTime ? el.endTime : el.startTime);
+            toast('Enter both start and end time, or leave both blank.');
+            return null;
+        }
+
+        // Date-only ordering check (the time/overnight logic lives in buildWindow).
+        if (parseEventTimestamp(startDate) > parseEventTimestamp(endDate)) {
+            flashField(el.start); flashField(el.end);
+            toast('Start date must be on or before end date.');
+            return null;
+        }
+
+        if (requireXlsx && typeof XLSX === 'undefined') {
+            toast('SheetJS did not load (check @require / network). Cannot export.');
+            return null;
+        }
+
+        // Normalize back into the fields.
+        el.start.value = startDate;
+        el.end.value = endDate;
+        if (startTime) el.startTime.value = startTime;
+        if (endTime) el.endTime.value = endTime;
+        persistInputs();
+
+        const window = buildWindow(startDate, endDate, startTime, endTime);
+        return { logins, startDate, endDate, startTime, endTime, window };
+    }
+
     // Test one AA: fetch + parse the FIRST login only, render a preview table.
     // No gap enrichment math beyond what the preview needs, and no Excel.
     async function onTest() {
         if (isRunning) return;
 
-        const logins = parseLoginList(el.logins.value);
-        const startDate = normalizeDateStr(el.start.value);
-        const endDate = normalizeDateStr(el.end.value);
-
-        if (!logins.length) { flashField(el.logins); return toast('Enter at least one AA login to test.'); }
-        if (!startDate) { flashField(el.start); return toast('Start date must be MM/DD/YYYY.'); }
-        if (!endDate) { flashField(el.end); return toast('End date must be MM/DD/YYYY.'); }
-        if (parseEventTimestamp(startDate) > parseEventTimestamp(endDate)) {
-            flashField(el.start); flashField(el.end);
-            return toast('Start date must be on or before end date.');
-        }
-
-        el.start.value = startDate;
-        el.end.value = endDate;
-        persistInputs();
+        const input = collectInputs(false);
+        if (!input) return;
+        const { logins, startDate, endDate, startTime, endTime, window } = input;
 
         const login = logins[0];
+        const winLabel = fmtWindowLabel(startDate, endDate, startTime, endTime);
 
         isRunning = true;
         cancelRequested = false;
@@ -997,7 +1124,7 @@
         el.preview.innerHTML = `
             <div class="aa-exp-preview-head">
                 <span>Testing <span style="font-family:ui-monospace,Menlo,Consolas,monospace">${escapeHtml(login)}</span>…</span>
-                <span class="meta">${escapeHtml(startDate)} → ${escapeHtml(endDate)}</span>
+                <span class="meta">${escapeHtml(winLabel)}</span>
             </div>
             <div class="aa-exp-preview-empty">Fetching in the background…</div>`;
 
@@ -1019,26 +1146,40 @@
 
         if (cancelRequested) { el.preview.style.display = 'none'; return toast('Test cancelled.'); }
 
-        renderPreview(login, startDate, endDate, raw);
+        renderPreview(login, winLabel, window, raw);
     }
 
-    function renderPreview(login, startDate, endDate, raw) {
+    function renderPreview(login, winLabel, window, raw) {
         if (!raw || !raw.rows || raw.rows.length === 0) {
             el.preview.innerHTML = `
                 <div class="aa-exp-preview-head">
                     <span>Test: <span style="font-family:ui-monospace,Menlo,Consolas,monospace">${escapeHtml(login)}</span></span>
-                    <span class="meta">${escapeHtml(startDate)} → ${escapeHtml(endDate)}</span>
+                    <span class="meta">${escapeHtml(winLabel)}</span>
                 </div>
-                <div class="aa-exp-preview-empty">No rows returned for this AA in that range.
+                <div class="aa-exp-preview-empty">No rows returned for this AA in that date range.
                     (${raw && raw.headers ? raw.headers.length : 0} column header${raw && raw.headers && raw.headers.length === 1 ? '' : 's'} detected.)
                 </div>`;
             return;
         }
 
-        // Run the real gap enrichment so the preview reflects the exact export output.
-        const enriched = enrichWithGaps(raw);
+        const rawCount = raw.rows.length;
+
+        // Run the real gap enrichment + window filter so the preview reflects
+        // the exact export output.
+        const enriched = enrichWithGaps(raw, window);
         const headers = enriched.headers;
         const rows = enriched.rows;
+
+        if (rows.length === 0) {
+            el.preview.innerHTML = `
+                <div class="aa-exp-preview-head">
+                    <span>Test: <span style="font-family:ui-monospace,Menlo,Consolas,monospace">${escapeHtml(login)}</span></span>
+                    <span class="meta">${escapeHtml(winLabel)}</span>
+                </div>
+                <div class="aa-exp-preview-empty">${rawCount} row${rawCount === 1 ? '' : 's'} fetched, but none fall inside the time window.</div>`;
+            return;
+        }
+
         const PREVIEW_MAX = 8;
         const shown = rows.slice(0, PREVIEW_MAX);
 
@@ -1051,7 +1192,7 @@
         el.preview.innerHTML = `
             <div class="aa-exp-preview-head">
                 <span>✓ <span style="font-family:ui-monospace,Menlo,Consolas,monospace">${escapeHtml(login)}</span>
-                    — ${rows.length} row${rows.length === 1 ? '' : 's'}</span>
+                    — ${rows.length} row${rows.length === 1 ? '' : 's'}${window ? ` (of ${rawCount} fetched)` : ''}</span>
                 <span class="meta">ts col: ${escapeHtml(tsHeader || 'n/a')} · span ${escapeHtml(enriched.totalSpan || '—')}</span>
             </div>
             <div class="aa-exp-preview-scroll">
@@ -1068,26 +1209,10 @@
         // A fresh run clears any lingering single-AA preview.
         el.preview.style.display = 'none';
 
-        const logins = parseLoginList(el.logins.value);
-        const startDate = normalizeDateStr(el.start.value);
-        const endDate = normalizeDateStr(el.end.value);
-
-        // Validation
-        if (!logins.length) { flashField(el.logins); return toast('Enter at least one AA login.'); }
-        if (!startDate) { flashField(el.start); return toast('Start date must be MM/DD/YYYY.'); }
-        if (!endDate) { flashField(el.end); return toast('End date must be MM/DD/YYYY.'); }
-        if (parseEventTimestamp(startDate) > parseEventTimestamp(endDate)) {
-            flashField(el.start); flashField(el.end);
-            return toast('Start date must be on or before end date.');
-        }
-        if (typeof XLSX === 'undefined') {
-            return toast('SheetJS did not load (check @require / network). Cannot export.');
-        }
-
-        // Normalize inputs back into the fields.
-        el.start.value = startDate;
-        el.end.value = endDate;
-        persistInputs();
+        const input = collectInputs(true);
+        if (!input) return;
+        const { logins, startDate, endDate, startTime, endTime, window } = input;
+        const winLabel = fmtWindowLabel(startDate, endDate, startTime, endTime);
 
         isRunning = true;
         cancelRequested = false;
@@ -1098,7 +1223,7 @@
 
         let results;
         try {
-            results = await runBatch(logins, startDate, endDate);
+            results = await runBatch(logins, startDate, endDate, window);
         } catch (e) {
             isRunning = false;
             setRunningUI(false);
@@ -1113,18 +1238,18 @@
             return;
         }
 
-        lastResults = { results, startDate, endDate };
+        lastResults = { results, startDate, endDate, startTime, endTime, winLabel };
         el.download.disabled = false;
 
         const anyData = results.some(r => r.status === 'done');
         if (!anyData) {
-            toast('No data found for any AA in that range.');
+            toast('No data found for any AA in that window.');
             return;
         }
 
         try {
-            const wb = buildWorkbook(results, startDate, endDate);
-            downloadWorkbook(wb, startDate, endDate);
+            const wb = buildWorkbook(results, startDate, endDate, winLabel);
+            downloadWorkbook(wb, startDate, endDate, startTime, endTime);
             const ok = results.filter(r => r.status === 'done').length;
             toast(`Exported ${ok} AA sheet${ok === 1 ? '' : 's'} to Excel.`);
         } catch (e) {
@@ -1142,8 +1267,8 @@
     function onReDownload() {
         if (!lastResults) return;
         try {
-            const wb = buildWorkbook(lastResults.results, lastResults.startDate, lastResults.endDate);
-            downloadWorkbook(wb, lastResults.startDate, lastResults.endDate);
+            const wb = buildWorkbook(lastResults.results, lastResults.startDate, lastResults.endDate, lastResults.winLabel);
+            downloadWorkbook(wb, lastResults.startDate, lastResults.endDate, lastResults.startTime, lastResults.endTime);
         } catch (e) {
             toast('Download failed: ' + (e.message || e));
         }
@@ -1157,6 +1282,8 @@
         el.logins.disabled = running;
         el.start.disabled = running;
         el.end.disabled = running;
+        el.startTime.disabled = running;
+        el.endTime.disabled = running;
         el.close.style.visibility = running ? 'hidden' : 'visible';
     }
 
