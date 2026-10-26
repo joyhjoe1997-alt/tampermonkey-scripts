@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AA Inventory History Batch Exporter
 // @namespace    http://tampermonkey.net/
-// @version      1.2
+// @version      1.3
 // @description  Paste a list of AA logins + a date range, pull each AA's Inventory History (background, no navigation) and export a multi-sheet .xlsx (home summary + one sheet per AA).
 // @author       joyhjoe
 // @match        *://qi-fcresearch-eu.corp.amazon.com/*/results?s=*
@@ -88,7 +88,7 @@
     // ═══════════════════════════════════════════════════════════════
     // SECTION 1: CONFIG
     // ═══════════════════════════════════════════════════════════════
-    const VERSION = '1.2';
+    const VERSION = '1.3';
     const STORAGE_KEY = 'aa_inv_exporter_settings_v1';
     const ORIGIN = location.origin;
 
@@ -198,28 +198,6 @@
         // Last resort: let Date try.
         const d = new Date(s);
         return isNaN(d.getTime()) ? null : d;
-    }
-
-    // ── Picker <-> internal format bridges ──
-    // Native <input type="date"> uses YYYY-MM-DD; our internal/stored format and
-    // the FC Research #searchStart field use MM/DD/YYYY.
-    function isoToUsDate(iso) {
-        if (!iso) return '';
-        const m = String(iso).match(/^(\d{4})-(\d{2})-(\d{2})$/);
-        return m ? `${m[2]}/${m[3]}/${m[1]}` : '';
-    }
-    function usToIsoDate(us) {
-        if (!us) return '';
-        const m = String(us).match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
-        if (!m) return '';
-        return `${m[3]}-${String(+m[1]).padStart(2, '0')}-${String(+m[2]).padStart(2, '0')}`;
-    }
-    // Native <input type="time" step="1"> gives HH:MM or HH:MM:SS; pad to HH:MM:SS.
-    function padTime(t) {
-        if (!t) return '';
-        const parts = String(t).split(':');
-        if (parts.length === 2) parts.push('00');
-        return parts.map(p => String(p).padStart(2, '0')).join(':');
     }
 
     // Validate/normalize a 24-hour time string → "HH:MM:SS" or null.
@@ -808,19 +786,63 @@
             }
             .aa-exp-dates { display: flex; gap: 12px; flex-wrap: wrap; }
             .aa-exp-dates .aa-exp-field { flex: 1 1 calc(50% - 6px); min-width: 120px; margin-bottom: 0; }
-            .aa-exp-field input[type=text],
-            .aa-exp-field input[type=date],
-            .aa-exp-field input[type=time] {
+            .aa-exp-field input[type=text] {
                 width: 100%; box-sizing: border-box; border: 1px solid #cbd5e1; border-radius: 8px;
                 padding: 9px 12px; font-size: 14px; text-align: center;
                 font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
                 color: #0f172a; background: #fff; min-height: 38px;
             }
-            .aa-exp-field input[type=date]::-webkit-calendar-picker-indicator,
-            .aa-exp-field input[type=time]::-webkit-calendar-picker-indicator {
-                cursor: pointer; opacity: .6;
-            }
+            .aa-exp-pick { position: relative; }
+            .aa-exp-pick input[readonly] { cursor: pointer; background: #fff; }
+            .aa-exp-pick input[readonly]:hover { border-color: #93c5fd; }
             textarea:focus, input:focus { outline: none; border-color: #2563eb; box-shadow: 0 0 0 3px rgba(37,99,235,.15); }
+
+            /* ── Custom popup (calendar / time) ── */
+            .aa-pop {
+                position: absolute; top: calc(100% + 6px); left: 0; z-index: 2147483010;
+                background: #fff; border: 1px solid #cbd5e1; border-radius: 10px;
+                box-shadow: 0 12px 32px rgba(0,0,0,.22); padding: 10px; min-width: 240px;
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            }
+            .aa-pop.right { left: auto; right: 0; }
+            .aa-cal-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+            .aa-cal-nav {
+                border: none; background: #f1f5f9; color: #334155; width: 28px; height: 28px;
+                border-radius: 7px; cursor: pointer; font-size: 15px; line-height: 1;
+            }
+            .aa-cal-nav:hover { background: #e2e8f0; }
+            .aa-cal-title { font-size: 13px; font-weight: 700; color: #0f172a; }
+            .aa-cal-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 2px; }
+            .aa-cal-dow { font-size: 10px; font-weight: 700; color: #94a3b8; text-align: center; padding: 4px 0; }
+            .aa-cal-day {
+                border: none; background: none; cursor: pointer; border-radius: 6px;
+                font-size: 12.5px; color: #0f172a; height: 30px;
+            }
+            .aa-cal-day:hover { background: #e0e7ff; }
+            .aa-cal-day.other { color: #cbd5e1; }
+            .aa-cal-day.today { outline: 1px solid #93c5fd; }
+            .aa-cal-day.sel { background: #2563eb; color: #fff; font-weight: 700; }
+            .aa-cal-foot { display: flex; justify-content: space-between; margin-top: 8px; }
+            .aa-cal-foot button {
+                border: none; background: none; color: #2563eb; font-size: 12px; font-weight: 600;
+                cursor: pointer; padding: 2px 4px;
+            }
+            .aa-cal-foot button:hover { text-decoration: underline; }
+
+            .aa-time-row { display: flex; align-items: center; gap: 6px; justify-content: center; }
+            .aa-time-row select {
+                border: 1px solid #cbd5e1; border-radius: 7px; padding: 8px 6px; font-size: 14px;
+                background: #fff; color: #0f172a; cursor: pointer;
+                font-family: ui-monospace, Menlo, Consolas, monospace;
+            }
+            .aa-time-sep { font-weight: 700; color: #475569; }
+            .aa-time-foot { display: flex; justify-content: space-between; margin-top: 10px; }
+            .aa-time-foot button {
+                border: none; background: none; font-size: 12px; font-weight: 600; cursor: pointer; padding: 2px 4px;
+            }
+            .aa-time-clear { color: #b91c1c; }
+            .aa-time-done { color: #2563eb; }
+            .aa-time-foot button:hover { text-decoration: underline; }
             .aa-exp-hint { font-size: 11px; color: #94a3b8; margin-top: 6px; }
 
             .aa-exp-actions { display: flex; gap: 10px; margin-top: 20px; align-items: center; }
@@ -927,24 +949,24 @@
                         <div class="aa-exp-hint" id="aa-exp-count">0 logins</div>
                     </div>
                     <div class="aa-exp-dates">
-                        <div class="aa-exp-field">
+                        <div class="aa-exp-field aa-exp-pick" id="aa-exp-start-wrap">
                             <label>Start date</label>
-                            <input type="date" id="aa-exp-start">
+                            <input type="text" id="aa-exp-start" placeholder="MM/DD/YYYY" readonly autocomplete="off">
                         </div>
-                        <div class="aa-exp-field">
+                        <div class="aa-exp-field aa-exp-pick" id="aa-exp-start-time-wrap">
                             <label>Start time</label>
-                            <input type="time" id="aa-exp-start-time" step="1">
+                            <input type="text" id="aa-exp-start-time" placeholder="HH:MM:SS" readonly autocomplete="off">
                         </div>
-                        <div class="aa-exp-field">
+                        <div class="aa-exp-field aa-exp-pick" id="aa-exp-end-wrap">
                             <label>End date</label>
-                            <input type="date" id="aa-exp-end">
+                            <input type="text" id="aa-exp-end" placeholder="MM/DD/YYYY" readonly autocomplete="off">
                         </div>
-                        <div class="aa-exp-field">
+                        <div class="aa-exp-field aa-exp-pick" id="aa-exp-end-time-wrap">
                             <label>End time</label>
-                            <input type="time" id="aa-exp-end-time" step="1">
+                            <input type="text" id="aa-exp-end-time" placeholder="HH:MM:SS" readonly autocomplete="off">
                         </div>
                     </div>
-                    <div class="aa-exp-hint">Same window is applied to every AA. Pick dates and 24h times (seconds supported). Leave both times blank for full days. If end time ≤ start time (e.g. 18:15:00 → 04:45:00) the window is treated as overnight (ends next day).</div>
+                    <div class="aa-exp-hint">Same window is applied to every AA. Click a field to pick. Leave both times blank for full days (use the ✕ in the time popup to clear). If end time ≤ start time (e.g. 18:15:00 → 04:45:00) the window is treated as overnight (ends next day).</div>
 
                     <div class="aa-exp-actions">
                         <button class="aa-exp-btn run" id="aa-exp-run">
@@ -1005,11 +1027,17 @@
 
         // Prefill from settings
         el.logins.value = settings.logins || '';
-        el.start.value = usToIsoDate(settings.startDate || '');
-        el.end.value = usToIsoDate(settings.endDate || '');
+        el.start.value = settings.startDate || '';
+        el.end.value = settings.endDate || '';
         el.startTime.value = settings.startTime || '';
         el.endTime.value = settings.endTime || '';
         updateLoginCount();
+
+        // Wire the custom date/time pickers onto the four readonly fields.
+        attachDatePicker(el.start);
+        attachDatePicker(el.end);
+        attachTimePicker(el.startTime);
+        attachTimePicker(el.endTime);
 
         // Events
         el.close.addEventListener('click', closePanel);
@@ -1032,10 +1060,10 @@
 
     function persistInputs() {
         settings.logins = el.logins.value;
-        settings.startDate = isoToUsDate(el.start.value);
-        settings.endDate = isoToUsDate(el.end.value);
-        settings.startTime = el.startTime.value ? padTime(el.startTime.value) : '';
-        settings.endTime = el.endTime.value ? padTime(el.endTime.value) : '';
+        settings.startDate = el.start.value;
+        settings.endDate = el.end.value;
+        settings.startTime = el.startTime.value;
+        settings.endTime = el.endTime.value;
         saveSettings();
     }
 
@@ -1049,6 +1077,7 @@
     }
     function closePanel() {
         if (isRunning) return; // don't close mid-run
+        closeOpenPop();
         el.overlay.classList.remove('open');
     }
 
@@ -1079,6 +1108,206 @@
     }
 
     // ═══════════════════════════════════════════════════════════════
+    // SECTION 9B: CUSTOM DATE / TIME PICKERS
+    //   Self-contained popups rendered inside the panel — do not rely
+    //   on native <input type=date/time> popups, which the host page
+    //   can suppress. Fields stay readonly text holding MM/DD/YYYY and
+    //   HH:MM:SS directly.
+    // ═══════════════════════════════════════════════════════════════
+
+    // Only one popup open at a time.
+    let openPop = null;
+    function closeOpenPop() {
+        if (openPop && openPop.parentNode) openPop.parentNode.removeChild(openPop);
+        openPop = null;
+        document.removeEventListener('mousedown', onDocDownForPop, true);
+    }
+    function onDocDownForPop(e) {
+        if (openPop && !openPop.contains(e.target) && !(openPop.__anchor && openPop.__anchor.contains(e.target))) {
+            closeOpenPop();
+        }
+    }
+
+    const DOW = ['Su', 'Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa'];
+    const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June',
+                    'July', 'August', 'September', 'October', 'November', 'December'];
+
+    function attachDatePicker(input) {
+        const open = () => {
+            closeOpenPop();
+            const wrap = input.closest('.aa-exp-pick') || input.parentNode;
+            const pop = document.createElement('div');
+            pop.className = 'aa-pop';
+            pop.__anchor = input;
+            // If this is an "end" field on the right half, anchor the popup to the right edge.
+            if (/end/i.test(input.id)) pop.classList.add('right');
+
+            // Seed view month from current value or today.
+            let view;
+            const cur = normalizeDateStr(input.value);
+            if (cur) {
+                const [mm, dd, yy] = cur.split('/').map(Number);
+                view = new Date(yy, mm - 1, 1);
+            } else {
+                view = new Date();
+                view.setDate(1);
+            }
+
+            const render = () => {
+                const y = view.getFullYear();
+                const m = view.getMonth();
+                const first = new Date(y, m, 1);
+                const startDow = first.getDay();
+                const daysInMonth = new Date(y, m + 1, 0).getDate();
+                const today = new Date();
+                const selected = normalizeDateStr(input.value);
+
+                let cells = '';
+                // Leading blanks from previous month
+                const prevDays = new Date(y, m, 0).getDate();
+                for (let i = startDow - 1; i >= 0; i--) {
+                    cells += `<button class="aa-cal-day other" disabled>${prevDays - i}</button>`;
+                }
+                for (let d = 1; d <= daysInMonth; d++) {
+                    const isToday = today.getFullYear() === y && today.getMonth() === m && today.getDate() === d;
+                    const ds = `${String(m + 1).padStart(2, '0')}/${String(d).padStart(2, '0')}/${y}`;
+                    const isSel = selected === ds;
+                    cells += `<button class="aa-cal-day${isToday ? ' today' : ''}${isSel ? ' sel' : ''}" data-d="${d}">${d}</button>`;
+                }
+
+                pop.innerHTML = `
+                    <div class="aa-cal-head">
+                        <button class="aa-cal-nav" data-nav="-1" title="Previous month">&#8249;</button>
+                        <span class="aa-cal-title">${MONTHS[m]} ${y}</span>
+                        <button class="aa-cal-nav" data-nav="1" title="Next month">&#8250;</button>
+                    </div>
+                    <div class="aa-cal-grid">
+                        ${DOW.map(d => `<div class="aa-cal-dow">${d}</div>`).join('')}
+                        ${cells}
+                    </div>
+                    <div class="aa-cal-foot">
+                        <button data-act="today">Today</button>
+                        <button data-act="clear">Clear</button>
+                    </div>`;
+
+                pop.querySelectorAll('[data-nav]').forEach(b => b.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    view.setMonth(view.getMonth() + parseInt(b.dataset.nav, 10));
+                    render();
+                }));
+                pop.querySelectorAll('.aa-cal-day[data-d]').forEach(b => b.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    const d = parseInt(b.dataset.d, 10);
+                    input.value = `${String(m + 1).padStart(2, '0')}/${String(d).padStart(2, '0')}/${y}`;
+                    persistInputs();
+                    closeOpenPop();
+                }));
+                pop.querySelector('[data-act="today"]').addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    const t = new Date();
+                    input.value = `${String(t.getMonth() + 1).padStart(2, '0')}/${String(t.getDate()).padStart(2, '0')}/${t.getFullYear()}`;
+                    persistInputs();
+                    closeOpenPop();
+                });
+                pop.querySelector('[data-act="clear"]').addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    input.value = '';
+                    persistInputs();
+                    closeOpenPop();
+                });
+            };
+
+            render();
+            wrap.appendChild(pop);
+            openPop = pop;
+            setTimeout(() => document.addEventListener('mousedown', onDocDownForPop, true), 0);
+        };
+
+        wireTrigger(input, open);
+    }
+
+    function attachTimePicker(input) {
+        const open = () => {
+            closeOpenPop();
+            const wrap = input.closest('.aa-exp-pick') || input.parentNode;
+            const pop = document.createElement('div');
+            pop.className = 'aa-pop';
+            pop.__anchor = input;
+            if (/end/i.test(input.id)) pop.classList.add('right');
+
+            // Seed from current value or 00:00:00.
+            let h = 0, mi = 0, s = 0;
+            const cur = normalizeTimeStr(input.value);
+            if (cur) { const p = cur.split(':').map(Number); h = p[0]; mi = p[1]; s = p[2]; }
+
+            const opts = (n, sel) => {
+                let o = '';
+                for (let i = 0; i < n; i++) {
+                    o += `<option value="${i}"${i === sel ? ' selected' : ''}>${String(i).padStart(2, '0')}</option>`;
+                }
+                return o;
+            };
+
+            pop.innerHTML = `
+                <div class="aa-time-row">
+                    <select data-u="h" title="Hour">${opts(24, h)}</select>
+                    <span class="aa-time-sep">:</span>
+                    <select data-u="m" title="Minute">${opts(60, mi)}</select>
+                    <span class="aa-time-sep">:</span>
+                    <select data-u="s" title="Second">${opts(60, s)}</select>
+                </div>
+                <div class="aa-time-foot">
+                    <button class="aa-time-clear" data-act="clear">✕ Clear</button>
+                    <button class="aa-time-done" data-act="done">Done</button>
+                </div>`;
+
+            const apply = () => {
+                const hh = pop.querySelector('[data-u="h"]').value;
+                const mm = pop.querySelector('[data-u="m"]').value;
+                const ss = pop.querySelector('[data-u="s"]').value;
+                input.value = `${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}:${String(ss).padStart(2, '0')}`;
+                persistInputs();
+            };
+
+            pop.querySelectorAll('select').forEach(sel => sel.addEventListener('change', (e) => { e.stopPropagation(); apply(); }));
+            pop.querySelector('[data-act="done"]').addEventListener('click', (e) => { e.stopPropagation(); apply(); closeOpenPop(); });
+            pop.querySelector('[data-act="clear"]').addEventListener('click', (e) => {
+                e.stopPropagation();
+                input.value = '';
+                persistInputs();
+                closeOpenPop();
+            });
+
+            wrap.appendChild(pop);
+            openPop = pop;
+            setTimeout(() => document.addEventListener('mousedown', onDocDownForPop, true), 0);
+        };
+
+        wireTrigger(input, open);
+    }
+
+    // Shared trigger: toggle the popup on mousedown. Using mousedown (capture)
+    // and preventing default avoids the readonly-input focus race and any host
+    // page handlers. A field that already owns the open popup toggles closed.
+    function wireTrigger(input, open) {
+        input.addEventListener('mousedown', (e) => {
+            if (input.disabled) return;
+            e.preventDefault();
+            e.stopPropagation();
+            const ownsOpen = openPop && openPop.__anchor === input;
+            if (ownsOpen) { closeOpenPop(); } else { open(); }
+        });
+        // Keyboard access: Enter/Space opens.
+        input.addEventListener('keydown', (e) => {
+            if (input.disabled) return;
+            if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                if (!(openPop && openPop.__anchor === input)) open();
+            }
+        });
+    }
+
+    // ═══════════════════════════════════════════════════════════════
     // SECTION 10: RUN / CANCEL / DOWNLOAD handlers
     // ═══════════════════════════════════════════════════════════════
     // Validate + normalize all inputs. On success returns
@@ -1087,16 +1316,15 @@
     // `requireXlsx` adds the SheetJS-loaded check (used by Run, not Test).
     function collectInputs(requireXlsx) {
         const logins = parseLoginList(el.logins.value);
-        // Date pickers give YYYY-MM-DD; convert to internal MM/DD/YYYY.
-        const startDate = normalizeDateStr(isoToUsDate(el.start.value));
-        const endDate = normalizeDateStr(isoToUsDate(el.end.value));
+        // Fields hold the internal formats directly (MM/DD/YYYY and HH:MM:SS).
+        const startDate = normalizeDateStr(el.start.value);
+        const endDate = normalizeDateStr(el.end.value);
 
         // Times are optional, but if one is given the other must be too.
-        // Time pickers give HH:MM or HH:MM:SS.
         const rawStartT = el.startTime.value.trim();
         const rawEndT = el.endTime.value.trim();
-        const startTime = rawStartT ? normalizeTimeStr(padTime(rawStartT)) : '';
-        const endTime = rawEndT ? normalizeTimeStr(padTime(rawEndT)) : '';
+        const startTime = rawStartT ? normalizeTimeStr(rawStartT) : '';
+        const endTime = rawEndT ? normalizeTimeStr(rawEndT) : '';
 
         if (!logins.length) { flashField(el.logins); toast('Enter at least one AA login.'); return null; }
         if (!startDate) { flashField(el.start); toast('Pick a start date.'); return null; }
@@ -1122,9 +1350,9 @@
             return null;
         }
 
-        // Normalize back into the fields (date pickers want ISO).
-        el.start.value = usToIsoDate(startDate);
-        el.end.value = usToIsoDate(endDate);
+        // Normalize back into the fields.
+        el.start.value = startDate;
+        el.end.value = endDate;
         if (startTime) el.startTime.value = startTime;
         if (endTime) el.endTime.value = endTime;
         persistInputs();
