@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Sideline - Multi-Tote Deletion Automation
 // @author       joyhjoe
-// @version      6.6
+// @version      6.7
 // @description  Automated tote processing for AFT Poirot V3 with multi-item price lookup
 // @match        https://aft-poirot-website-dub.dub.proxy.amazon.com/*
 // @match        https://river-dub.amazon.com/*
@@ -19,7 +19,7 @@
 // ==/UserScript==
 
 /**
- * SIDELINE v6.6 - AFT Poirot Tote Automation
+ * SIDELINE v6.7 - AFT Poirot Tote Automation
  *
  * Features:
  *   - Paste tote IDs, auto-processes them sequentially
@@ -92,7 +92,7 @@
     const FCR_BASE = 'https://qi-fcresearch-eu.corp.amazon.com';
 
     /** Current running version + where to check/download updates */
-    const VERSION = '6.6';
+    const VERSION = '6.7';
     const UPDATE_URL = 'https://github.com/joyhjoe1997-alt/tampermonkey-scripts/raw/main/sideline.user.js';
 
     // =========================================================================
@@ -1557,6 +1557,7 @@
         const toteLabel = payload.toteId ? ` for ${payload.toteId}` : '';
         let bandDone = false;
         let step2Done = false;
+        let step2CommentWaits = 0;
 
         // --- Phase 1: tick the band radio (does NOT consume the handoff) ---
         function tryBand() {
@@ -1586,6 +1587,52 @@
             return els.find(e => e.offsetParent !== null) || els[0] || null;
         };
 
+        // Prefers a visible element from a list (same rule as pick()).
+        const preferVisible = (els) => els.find(e => e.offsetParent !== null) || els[0] || null;
+
+        /**
+         * Finds the "Enter the adjustment comment below" textarea robustly.
+         * The exact ng-model can vary, so try, in order:
+         *   1. known ng-model bindings (data.commentAreaS / commentArea)
+         *   2. a textarea whose label / placeholder / aria-label mentions
+         *      "adjustment comment", then just "comment"
+         *   3. the last visible textarea on the step (comment is the big one)
+         * Never returns the Root Cause comment field (that stays manual), so
+         * matches mentioning "root cause" are excluded.
+         */
+        function findCommentField() {
+            const byModel = document.querySelector(
+                '[ng-model="data.commentAreaS"],[ng-model="data.commentArea"],textarea[ng-model*="comment" i]'
+            );
+            if (byModel && byModel.offsetParent !== null) return byModel;
+
+            const areas = [...document.querySelectorAll('textarea')].filter(t => t.offsetParent !== null);
+            if (!areas.length) return byModel || null;
+
+            // Build a searchable text blob per textarea from its labels/attrs.
+            const blobOf = (t) => {
+                let s = `${t.placeholder || ''} ${t.getAttribute('aria-label') || ''} ${t.name || ''} ${t.id || ''}`;
+                if (t.id) {
+                    const lab = document.querySelector(`label[for="${CSS.escape(t.id)}"]`);
+                    if (lab) s += ' ' + (lab.textContent || '');
+                }
+                // Nearby label/heading text (previous siblings + parent block).
+                const near = t.closest('div, fieldset, .form-group, li');
+                if (near) s += ' ' + (near.textContent || '');
+                return s.toLowerCase();
+            };
+
+            const notRootCause = (t) => !blobOf(t).includes('root cause');
+            const adj = areas.filter(t => blobOf(t).includes('adjustment comment') && notRootCause(t));
+            if (adj.length) return preferVisible(adj);
+            const cmt = areas.filter(t => blobOf(t).includes('comment') && notRootCause(t));
+            if (cmt.length) return preferVisible(cmt);
+
+            // Last resort: the known binding, else the last non-root-cause area.
+            const fallback = areas.filter(notRootCause);
+            return byModel || fallback[fallback.length - 1] || null;
+        }
+
         function tryStep2() {
             if (step2Done) return;
             // Step 2 is identified by the container input (ng-model data.containerInputS).
@@ -1596,11 +1643,20 @@
             const qtyEl     = pick('[ng-model="data.qtyInputS"]');
             const valueEl   = pick('[ng-model="data.totalCostInputS"]');
             const toolSel   = pick('select[ng-model="data.toolDropdownS"]');
-            const commentEl = pick('[ng-model="data.commentAreaS"]');
+            const commentEl = findCommentField();
 
             // Total value: rounded to a whole number, no decimals (field is int-only).
             const valueInt = String(Math.round(Number(payload.gt) || 0));
             const qtyInt   = String(Math.round(Number(payload.qty) || 0));
+
+            // If a comment is expected but its textarea hasn't rendered yet,
+            // don't finish this pass — let the observer retry. (We track how
+            // many times we've waited so we give up gracefully rather than
+            // looping forever if the field genuinely never appears.)
+            if (payload.comment && !commentEl) {
+                step2CommentWaits = (step2CommentWaits || 0) + 1;
+                if (step2CommentWaits < 20) return; // ~retry as the DOM settles
+            }
 
             const filled = [];
             if (toolSel && setCsSelect(toolSel, 'Sideline')) filled.push('Tool=Sideline');
@@ -1610,18 +1666,28 @@
             if (setNgText(valueEl, valueInt)) filled.push('Value');
             // Comment: FC Research history lines, built on the Poirot tab.
             // Root Cause dropdown + its comment stay MANUAL (user decides those).
-            if (payload.comment && commentEl && setNgText(commentEl, payload.comment)) filled.push('Comment');
+            let commentNote = '';
+            if (!payload.comment) {
+                commentNote = 'Comment: none built (no OP=A & RS=A history on Poirot tab).';
+            } else if (!commentEl) {
+                commentNote = 'Comment: field not found - paste manually.';
+            } else if (setNgText(commentEl, payload.comment)) {
+                filled.push('Comment');
+            } else {
+                commentNote = 'Comment: fill failed - paste manually.';
+            }
 
             step2Done = true;
             // Consume the handoff now — step 2 is the last thing we auto-fill.
             try { GM_setValue(DL_HANDOFF_KEY, ''); } catch { }
 
             dlToast(
-                `\u2705 Auto-filled: ${filled.join(', ')}.\n` +
+                `\u2705 Auto-filled: ${filled.join(', ') || '(nothing)'}.\n` +
                 `Tote ${payload.toteId || '-'} | ASIN ${payload.asin || '(none)'} | ` +
                 `Qty ${qtyInt} | Value £${valueInt}.\n` +
+                (commentNote ? `\u26A0 ${commentNote}\n` : '') +
                 `Now set Root Cause + comments, then review & submit.`,
-                '#27ae60'
+                commentNote ? '#f39c12' : '#27ae60'
             );
         }
 
