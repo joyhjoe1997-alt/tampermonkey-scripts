@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Sideline - Multi-Tote Deletion Automation
 // @author       joyhjoe
-// @version      7.0
+// @version      7.1
 // @description  Automated tote processing for AFT Poirot V3 with multi-item price lookup
 // @match        https://aft-poirot-website-dub.dub.proxy.amazon.com/*
 // @match        https://river-dub.amazon.com/*
@@ -19,7 +19,7 @@
 // ==/UserScript==
 
 /**
- * SIDELINE v7.0 - AFT Poirot Tote Automation
+ * SIDELINE v7.1 - AFT Poirot Tote Automation
  *
  * Features:
  *   - Paste tote IDs, auto-processes them sequentially
@@ -94,7 +94,7 @@
     const FCR_BASE = 'https://qi-fcresearch-eu.corp.amazon.com';
 
     /** Current running version + where to check/download updates */
-    const VERSION = '7.0';
+    const VERSION = '7.1';
     const UPDATE_URL = 'https://github.com/joyhjoe1997-alt/tampermonkey-scripts/raw/main/sideline.user.js';
 
     // =========================================================================
@@ -713,21 +713,32 @@
      * Matches by button text so it survives markup changes; skips our own panels
      * and ignores a button that's already been clicked (data-sideline-clicked).
      */
-    function clickLoadAllRows() {
-        const btns = [...document.querySelectorAll('alchemy-button, button')]
-            .filter(b => !b.closest('#pvt-panel,#pvt-cc-dialog,#pvt-hq-dialog,#bpeta-panel'));
-        for (const b of btns) {
-            const txt = (b.innerText || b.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
-            if (txt.includes('load all rows') && !b.dataset.sidelineClicked) {
-                b.dataset.sidelineClicked = '1';
-                // alchemy-button may host a real <button> in light/shadow DOM;
-                // click the inner control if present, else the element itself.
-                const inner = b.querySelector('button') || b;
-                inner.click();
-                return true;
+    /** Returns the live, unclicked "Load All Rows" button, or null. */
+    function findLoadAllRowsButton() {
+        try {
+            const btns = [...document.querySelectorAll('alchemy-button, button')]
+                .filter(b => !b.closest('#pvt-panel,#pvt-cc-dialog,#pvt-hq-dialog,#bpeta-panel'));
+            for (const b of btns) {
+                const txt = (b.innerText || b.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                if (txt.includes('load all rows') && b.getAttribute('data-sideline-clicked') !== '1') {
+                    return b;
+                }
             }
-        }
-        return false;
+        } catch { /* never let a lookup error abort the caller */ }
+        return null;
+    }
+
+    function clickLoadAllRows() {
+        const b = findLoadAllRowsButton();
+        if (!b) return false;
+        try {
+            b.setAttribute('data-sideline-clicked', '1');
+            // alchemy-button may host a real <button> in light/shadow DOM;
+            // click the inner control if present, else the element itself.
+            const inner = b.querySelector('button') || b;
+            inner.click();
+            return true;
+        } catch { return false; }
     }
 
     /** Waits until all item rows have rendered on the Change Container page.
@@ -741,6 +752,7 @@
             const expected = getExpectedRowCount();
             let lastCount = 0;
             let stableTimer = null;
+            let loadAllClicked = false; // did we expand a capped list this run?
 
             function countItems() {
                 return [...document.querySelectorAll('alchemy-tag')]
@@ -758,10 +770,8 @@
                 // Expand a capped list: if a "Load All Rows" button is showing,
                 // click it and keep waiting for the remaining rows to render.
                 const clicked = clickLoadAllRows();
-                const loadAllPresent = !![...document.querySelectorAll('alchemy-button, button')]
-                    .filter(b => !b.closest('#pvt-panel,#pvt-cc-dialog,#pvt-hq-dialog,#bpeta-panel'))
-                    .find(b => (b.innerText || b.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase().includes('load all rows')
-                        && !b.dataset.sidelineClicked);
+                if (clicked) loadAllClicked = true;
+                const loadAllPresent = !!findLoadAllRowsButton();
 
                 setStatus(
                     `Loading items... ${count}/${expected > 0 ? expected : '?'} rows (${elapsed}s)` +
@@ -799,7 +809,7 @@
                 finished = true;
                 observer.disconnect();
                 clearBgInterval(tick);
-                resolve();
+                resolve({ loadAllClicked, count: countItems(), expected });
             }
 
             // Observe DOM mutations — fires instantly when new elements are added
@@ -1231,8 +1241,27 @@
 
                 // --- Step 6: Wait for items to render, then read them ---
                 setStatus('Loading items...', '#8e44ad');
-                await waitForItemsRendered();
+                const waitInfo = await waitForItemsRendered();
+
+                // If we expanded a capped list, give the re-render a moment to
+                // settle, then re-read so we never parse a mid-render DOM.
+                if (waitInfo && waitInfo.loadAllClicked) {
+                    setStatus('Expanding all rows...', '#8e44ad');
+                    await bgSleep(700);
+                }
+
                 let items = readAllItems();
+
+                // If the page told us how many rows to expect and we read fewer,
+                // the list may still be settling — retry a couple of times before
+                // giving up, so we never proceed with a partial (missing) read.
+                const expectedRows = (waitInfo && waitInfo.expected) || getExpectedRowCount();
+                for (let tries = 0; expectedRows > 0 && items.length < expectedRows && tries < 6; tries++) {
+                    setStatus(`Re-reading rows ${items.length}/${expectedRows}...`, '#8e44ad');
+                    await bgSleep(400);
+                    clickLoadAllRows(); // in case the button reappeared
+                    items = readAllItems();
+                }
 
                 // Fallback: text scan if alchemy-tags not found
                 if (!items.length) {
