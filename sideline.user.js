@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Sideline - Multi-Tote Deletion Automation
 // @author       joyhjoe
-// @version      6.4
+// @version      6.5
 // @description  Automated tote processing for AFT Poirot V3 with multi-item price lookup
 // @match        https://aft-poirot-website-dub.dub.proxy.amazon.com/*
 // @match        https://river-dub.amazon.com/*
@@ -19,7 +19,7 @@
 // ==/UserScript==
 
 /**
- * SIDELINE v6.4 - AFT Poirot Tote Automation
+ * SIDELINE v6.5 - AFT Poirot Tote Automation
  *
  * Features:
  *   - Paste tote IDs, auto-processes them sequentially
@@ -38,7 +38,10 @@
  *   - High quantity (>100) warning before emptying
  *   - High-value totes (>£1,000) show a "Create DL" button that opens the
  *     river-dub Large Adjustment SIM in a new tab and auto-selects the matching
- *     threshold band (value/units -> adjustmentType radio; UNRECEIVE excluded)
+ *     threshold band (value/units -> adjustmentType radio; UNRECEIVE excluded).
+ *     After the user clicks "Confirm & Continue", step 2 is auto-filled:
+ *     Tool=Sideline, Container=tote, ASIN=first row, Qty=units, Value=round(gt).
+ *     Root Cause + comments stay manual; nothing is auto-submitted.
  *   - Persists progress across page reloads (skip = refresh + auto-resume)
  *   - Draggable, collapsible floating panel
  *
@@ -852,7 +855,9 @@
 
         // Wire the "Create DL" button (inside the high-value warning banner).
         // Reads the LIVE grand total from #pvt-gt (it changes after ASIN pastes),
-        // stashes { gt, qty, toteId } for the river-dub tab, and opens the SIM.
+        // stashes { gt, qty, toteId, asin } for the river-dub tab, and opens the
+        // SIM. The river-dub half fills step 1 (band radio) and, after the user
+        // clicks Confirm & Continue, step 2 (Tool/Container/ASIN/Qty/Value).
         function wireCreateDlButton(tId, tQty) {
             const btn = document.getElementById('pvt-create-dl');
             if (!btn || btn.dataset.wired) return;
@@ -860,7 +865,17 @@
             btn.onclick = () => {
                 const gtEl = document.getElementById('pvt-gt');
                 const liveGt = gtEl ? parseFloat((gtEl.textContent || '').replace(/[^0-9.]/g, '')) : gt;
-                const payload = { gt: isNaN(liveGt) ? gt : liveGt, qty: tQty, toteId: tId, ts: Date.now() };
+                // ASIN for step 2: first item's resolved ASIN if available, else
+                // its FNSKU (the first FNSKU/ASIN row on the high-value tote page).
+                const first = (items && items[0]) || null;
+                const asin = first ? (first.resolvedAsin || first.fnsku || '') : '';
+                const payload = {
+                    gt: isNaN(liveGt) ? gt : liveGt,
+                    qty: tQty,
+                    toteId: tId,
+                    asin,
+                    ts: Date.now(),
+                };
                 try { GM_setValue(DL_HANDOFF_KEY, JSON.stringify(payload)); } catch { }
                 setStatus(`Opening DL (£${payload.gt.toFixed(2)}, ${payload.qty} units)...`, '#8e44ad');
                 window.open(DL_URL, '_blank', 'noopener');
@@ -1310,18 +1325,84 @@
         return radio.checked;
     }
 
+    /**
+     * Sets a text input/textarea value so AngularJS's ng-model updates. Uses the
+     * native value setter (bypasses any framework override) then fires
+     * input/change/keyup, and also drives $apply via a triggerHandler-style
+     * dispatch so ng-pristine/ng-invalid flip correctly.
+     */
+    function setNgText(el, val) {
+        if (!el) return false;
+        const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+        const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+        if (setter) setter.call(el, String(val)); else el.value = String(val);
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+        el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }));
+        return true;
+    }
+
+    /**
+     * Selects an option in the river-dub custom cs-select dropdown by its value.
+     * The widget is a <div class="cs-select-wrapper"> containing a visible
+     * trigger + a hidden native <select ng-model=...>. We set the native select
+     * (so Angular's ng-model updates) AND the visible trigger label + the
+     * matching option's selected class (so the UI reflects the choice).
+     * `selectEl` is the hidden <select> element; `value` is the option value.
+     */
+    function setCsSelect(selectEl, value) {
+        if (!selectEl) return false;
+        const opt = [...selectEl.options].find(o => o.value === value);
+        if (!opt) return false;
+        selectEl.value = value;
+        selectEl.dispatchEvent(new Event('change', { bubbles: true }));
+        selectEl.dispatchEvent(new Event('input', { bubbles: true }));
+        // Update the visible cs-select UI so the user sees the selection.
+        const wrapper = selectEl.closest('.cs-select-wrapper');
+        if (wrapper) {
+            const label = wrapper.querySelector('.cs-select-trigger-text');
+            if (label) label.textContent = value;
+            wrapper.querySelectorAll('.cs-select-option').forEach(o => {
+                const sel = o.getAttribute('data-value') === value;
+                o.classList.toggle('cs-select-option-selected', sel);
+                const check = o.querySelector('.cs-select-check');
+                if (check) check.style.visibility = sel ? '' : 'hidden';
+            });
+        }
+        return true;
+    }
+
     /** Shows a small toast banner on the river-dub page (fixed, dismissable). */
     function dlToast(message, color = '#8e44ad') {
         document.getElementById('sideline-dl-toast')?.remove();
         const t = document.createElement('div');
         t.id = 'sideline-dl-toast';
-        t.style.cssText = `position:fixed;top:16px;right:16px;z-index:2147483647;background:${color};color:#fff;padding:12px 16px;border-radius:10px;font:600 13px Segoe UI,system-ui,sans-serif;box-shadow:0 8px 24px rgba(0,0,0,.3);max-width:360px;line-height:1.4`;
+        t.style.cssText = `position:fixed;top:16px;right:16px;z-index:2147483647;background:${color};color:#fff;padding:12px 16px;border-radius:10px;font:600 13px Segoe UI,system-ui,sans-serif;box-shadow:0 8px 24px rgba(0,0,0,.3);max-width:380px;line-height:1.4;white-space:pre-line`;
         t.textContent = message;
         document.body.appendChild(t);
-        setTimeout(() => t.remove(), 8000);
+        setTimeout(() => t.remove(), 12000);
     }
 
-    /** Polls for the adjustmentType radios and selects the computed band. */
+    const DL_BAND_LABELS = {
+        extraSmall: '< 100 units / £1,000',
+        small: '100-200 units / £1,000-2,000',
+        medium: '200-1,000 units / £2,000-7,500',
+        large: '>1,000 units / £7,500-15,000',
+        extraLarge: '£15,000-30,000',
+        extraExtraLarge: '£30,000+',
+        extraExtraMegaLarge: '£500,000+',
+    };
+
+    /**
+     * river-dub driver. Two phases, both driven by a single long-lived
+     * MutationObserver because river-dub is an AngularJS SPA (step 2 replaces
+     * step 1's DOM without a page reload):
+     *   Phase 1 — tick the adjustmentType band radio (handoff kept).
+     *   Phase 2 — after the user clicks "Confirm & Continue", the step-2 form
+     *             renders; fill Tool=Sideline, Container=toteId, ASIN, Qty,
+     *             Total value (rounded, no decimals), then CONSUME the handoff.
+     * UNRECEIVE is never auto-selected. Nothing is submitted; the user reviews.
+     */
     function riverDubAutoSelect() {
         let raw;
         try { raw = GM_getValue(DL_HANDOFF_KEY, ''); } catch { raw = ''; }
@@ -1331,48 +1412,88 @@
         try { payload = JSON.parse(raw); } catch { return; }
         if (!payload || typeof payload.gt !== 'number') return;
 
-        // Ignore a stale handoff (older than the TTL) so an old value never
-        // auto-ticks a fresh manual visit.
+        // Ignore a stale handoff so an old value never auto-fills a fresh visit.
         if (!payload.ts || (Date.now() - payload.ts) > DL_HANDOFF_TTL) return;
 
         const band = mapAdjustmentBand(payload.gt, payload.qty);
         if (!band) return;
 
-        const start = Date.now();
-        const timeoutMs = 20000;
-        const iv = setInterval(() => {
-            const radios = document.querySelectorAll('input[type="radio"][name="adjustmentType"]');
-            if (radios.length) {
-                const target = [...radios].find(r => r.value === band);
-                if (target) {
-                    clearInterval(iv);
-                    // Consume the handoff so a reload / another tab can't re-tick.
-                    try { GM_setValue(DL_HANDOFF_KEY, ''); } catch { }
-                    const ok = setAngularRadio(target);
-                    const bandLabels = {
-                        extraSmall: '< 100 units / £1,000',
-                        small: '100-200 units / £1,000-2,000',
-                        medium: '200-1,000 units / £2,000-7,500',
-                        large: '>1,000 units / £7,500-15,000',
-                        extraLarge: '£15,000-30,000',
-                        extraExtraLarge: '£30,000+',
-                        extraExtraMegaLarge: '£500,000+',
-                    };
-                    const tote = payload.toteId ? ` for ${payload.toteId}` : '';
-                    dlToast(
-                        ok
-                            ? `\u2705 Auto-selected: ${bandLabels[band] || band} (£${payload.gt.toFixed(2)}, ${payload.qty} units)${tote}. Verify, then click Next.`
-                            : `\u26A0 Could not auto-select the band. Please pick it manually (£${payload.gt.toFixed(2)}, ${payload.qty} units).`,
-                        ok ? '#27ae60' : '#e74c3c'
-                    );
-                    return;
-                }
-            }
-            if (Date.now() - start > timeoutMs) {
-                clearInterval(iv);
-                dlToast('\u26A0 Sideline: adjustment options did not load in time. Please select the band manually.', '#e74c3c');
-            }
-        }, 300);
+        const toteLabel = payload.toteId ? ` for ${payload.toteId}` : '';
+        let bandDone = false;
+        let step2Done = false;
+
+        // --- Phase 1: tick the band radio (does NOT consume the handoff) ---
+        function tryBand() {
+            if (bandDone) return;
+            const radios = [...document.querySelectorAll('input[type="radio"][name="adjustmentType"]')];
+            if (!radios.length) return;
+            const matches = radios.filter(r => r.value === band);
+            // Prefer the visible instance (vertical vs paged flow copies exist).
+            const target = matches.find(r => r.offsetParent !== null) || matches[0];
+            if (!target) return;
+            bandDone = true;
+            const ok = setAngularRadio(target);
+            dlToast(
+                ok
+                    ? `\u2705 Band selected: ${DL_BAND_LABELS[band] || band} (£${payload.gt.toFixed(2)}, ${payload.qty} units)${toteLabel}.\nClick "Confirm & Continue" to fill the form.`
+                    : `\u26A0 Could not auto-select the band. Pick it manually (£${payload.gt.toFixed(2)}, ${payload.qty} units).`,
+                ok ? '#27ae60' : '#e74c3c'
+            );
+        }
+
+        // --- Phase 2: fill the step-2 form once it renders ---
+        // river-dub renders BOTH a vertical-flow and a paged-flow copy of the
+        // form (one hidden via ng-show). Pick the VISIBLE element so the fill is
+        // also reflected on screen (offsetParent !== null means it's visible).
+        const pick = (sel) => {
+            const els = [...document.querySelectorAll(sel)];
+            return els.find(e => e.offsetParent !== null) || els[0] || null;
+        };
+
+        function tryStep2() {
+            if (step2Done) return;
+            // Step 2 is identified by the container input (ng-model data.containerInputS).
+            const container = pick('[ng-model="data.containerInputS"]');
+            if (!container) return;
+
+            const asinEl   = pick('[ng-model="data.asinInputS"]');
+            const qtyEl    = pick('[ng-model="data.qtyInputS"]');
+            const valueEl  = pick('[ng-model="data.totalCostInputS"]');
+            const toolSel  = pick('select[ng-model="data.toolDropdownS"]');
+
+            // Total value: rounded to a whole number, no decimals (field is int-only).
+            const valueInt = String(Math.round(Number(payload.gt) || 0));
+            const qtyInt   = String(Math.round(Number(payload.qty) || 0));
+
+            const filled = [];
+            if (toolSel && setCsSelect(toolSel, 'Sideline')) filled.push('Tool=Sideline');
+            if (setNgText(container, payload.toteId || '')) filled.push('Container');
+            if (payload.asin && asinEl && setNgText(asinEl, payload.asin)) filled.push('ASIN');
+            if (setNgText(qtyEl, qtyInt)) filled.push('Qty');
+            if (setNgText(valueEl, valueInt)) filled.push('Value');
+
+            step2Done = true;
+            // Consume the handoff now — step 2 is the last thing we auto-fill.
+            try { GM_setValue(DL_HANDOFF_KEY, ''); } catch { }
+
+            dlToast(
+                `\u2705 Auto-filled: ${filled.join(', ')}.\n` +
+                `Tote ${payload.toteId || '-'} | ASIN ${payload.asin || '(none)'} | ` +
+                `Qty ${qtyInt} | Value £${valueInt}.\n` +
+                `Now set Root Cause + comments, then review & submit.`,
+                '#27ae60'
+            );
+        }
+
+        // Run once now (page may already be on step 1), then watch for changes.
+        tryBand();
+        tryStep2();
+
+        const obs = new MutationObserver(() => { tryBand(); tryStep2(); });
+        obs.observe(document.body, { childList: true, subtree: true });
+
+        // Safety: stop observing after the handoff TTL window regardless.
+        setTimeout(() => obs.disconnect(), DL_HANDOFF_TTL);
     }
 
     // =========================================================================
