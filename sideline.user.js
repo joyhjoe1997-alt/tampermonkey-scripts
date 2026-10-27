@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Sideline - Multi-Tote Deletion Automation
 // @author       joyhjoe
-// @version      7.3
+// @version      7.4
 // @description  Automated tote processing for AFT Poirot V3 with multi-item price lookup
 // @match        https://aft-poirot-website-dub.dub.proxy.amazon.com/*
 // @match        https://river-dub.amazon.com/*
@@ -19,7 +19,7 @@
 // ==/UserScript==
 
 /**
- * SIDELINE v7.3 - AFT Poirot Tote Automation
+ * SIDELINE v7.4 - AFT Poirot Tote Automation
  *
  * Features:
  *   - Paste tote IDs, auto-processes them sequentially
@@ -94,7 +94,7 @@
     const FCR_BASE = 'https://qi-fcresearch-eu.corp.amazon.com';
 
     /** Current running version + where to check/download updates */
-    const VERSION = '7.3';
+    const VERSION = '7.4';
     const UPDATE_URL = 'https://github.com/joyhjoe1997-alt/tampermonkey-scripts/raw/main/sideline.user.js';
 
     // =========================================================================
@@ -701,11 +701,17 @@
                         setTimeout(() => fetchAmazonPrice(asin, 1).then(resolve), 1000);
                         return;
                     }
-                    priceCache[asin] = price;
+                    // Only cache SUCCESSFUL prices. Caching failures (N/A/Error/
+                    // Timeout) would make the same ASIN in a later tote — or a
+                    // manual ASIN re-entry — return the stale failure without
+                    // ever re-fetching.
+                    if (price !== 'N/A' && price !== 'Error' && price !== 'Timeout') {
+                        priceCache[asin] = price;
+                    }
                     resolve(price);
                 },
-                onerror() { priceCache[asin] = 'Error'; resolve('Error'); },
-                ontimeout() { priceCache[asin] = 'Timeout'; resolve('Timeout'); },
+                onerror() { resolve('Error'); },
+                ontimeout() { resolve('Timeout'); },
             });
         });
     }
@@ -1069,13 +1075,21 @@
             input.addEventListener('input', async () => {
                 const val = input.value.trim().toUpperCase();
                 if (!/^B[A-Z0-9]{9}$/.test(val)) return;
-                input.style.borderColor = '#2ecc71';
-                input.disabled = true;
+                input.style.borderColor = '#f39c12';
+                input.disabled = true; // lock while fetching to avoid overlap
                 const idx = +input.dataset.idx;
                 const price = await fetchAmazonPrice(val);
                 items[idx].price = price;
                 // Update cells
                 const bad = !price || ['N/A', 'Error', 'Timeout'].includes(price);
+                // Carry the manually-entered ASIN onto the item so downstream
+                // consumers (e.g. the Create DL handoff) use it too. (Leave
+                // isAsin as-is — the fnsku field is still the original FNSKU.)
+                items[idx].resolvedAsin = val;
+                // Keep the input usable on failure (so a corrected ASIN can be
+                // re-pasted); only lock it green once a real price comes back.
+                if (bad) { input.disabled = false; input.style.borderColor = '#e74c3c'; }
+                else { input.style.borderColor = '#2ecc71'; }
                 document.getElementById(`pvt-p-${idx}`).innerHTML = bad ? `<span style="color:#e74c3c">${price}</span>` : `<span style="color:#27ae60;font-weight:700">${price}</span>`;
                 const num = parseFloat((price || '').replace(/[^0-9.]/g, ''));
                 document.getElementById(`pvt-lt-${idx}`).textContent = isNaN(num) ? '-' : '\u00A3' + (num * items[idx].qty).toFixed(2);
