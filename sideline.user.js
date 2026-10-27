@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Sideline - Multi-Tote Deletion Automation
 // @author       joyhjoe
-// @version      6.9
+// @version      7.0
 // @description  Automated tote processing for AFT Poirot V3 with multi-item price lookup
 // @match        https://aft-poirot-website-dub.dub.proxy.amazon.com/*
 // @match        https://river-dub.amazon.com/*
@@ -19,7 +19,7 @@
 // ==/UserScript==
 
 /**
- * SIDELINE v6.9 - AFT Poirot Tote Automation
+ * SIDELINE v7.0 - AFT Poirot Tote Automation
  *
  * Features:
  *   - Paste tote IDs, auto-processes them sequentially
@@ -30,7 +30,9 @@
  *   - Silent duplicate removal on Load List (persists across reloads)
  *   - Detects blocking scan errors (e.g. Reverse Logistics) instantly and
  *     shows a "Cannot Process" skip/stop dialog
- *   - Reads all items (FNSKU/ASIN + qty) from the Change Container page
+ *   - Reads all items (FNSKU/ASIN + qty) from the Change Container page,
+ *     auto-clicking "Load All Rows" first so capped lists (e.g. 25 of 27)
+ *     fully expand before reading — otherwise rows are missed downstream
  *   - Resolves X0 FNSKUs to ASINs via FC Research /results/product API
  *   - Fetches live Amazon.co.uk prices (parallel batches of 3)
  *   - Shows confirmation dialog with item table, prices, and grand total
@@ -92,7 +94,7 @@
     const FCR_BASE = 'https://qi-fcresearch-eu.corp.amazon.com';
 
     /** Current running version + where to check/download updates */
-    const VERSION = '6.9';
+    const VERSION = '7.0';
     const UPDATE_URL = 'https://github.com/joyhjoe1997-alt/tampermonkey-scripts/raw/main/sideline.user.js';
 
     // =========================================================================
@@ -703,8 +705,34 @@
         });
     }
 
+    /**
+     * Finds and clicks the "Load All Rows" button if present. The scan page
+     * only renders a capped number of rows (e.g. 25 of 27) until this button
+     * is clicked — without it readAllItems() misses items and the grand total
+     * in the next step is wrong. Returns true if a button was clicked this call.
+     * Matches by button text so it survives markup changes; skips our own panels
+     * and ignores a button that's already been clicked (data-sideline-clicked).
+     */
+    function clickLoadAllRows() {
+        const btns = [...document.querySelectorAll('alchemy-button, button')]
+            .filter(b => !b.closest('#pvt-panel,#pvt-cc-dialog,#pvt-hq-dialog,#bpeta-panel'));
+        for (const b of btns) {
+            const txt = (b.innerText || b.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
+            if (txt.includes('load all rows') && !b.dataset.sidelineClicked) {
+                b.dataset.sidelineClicked = '1';
+                // alchemy-button may host a real <button> in light/shadow DOM;
+                // click the inner control if present, else the element itself.
+                const inner = b.querySelector('button') || b;
+                inner.click();
+                return true;
+            }
+        }
+        return false;
+    }
+
     /** Waits until all item rows have rendered on the Change Container page.
      *  Uses MutationObserver for instant detection (no polling delay).
+     *  Clicks "Load All Rows" first (if present) so capped lists fully expand.
      *  Resolves when rendered count matches expected, or stabilizes for 500ms.
      */
     function waitForItemsRendered() {
@@ -726,10 +754,30 @@
             function check() {
                 const count = countItems();
                 const elapsed = Math.round((Date.now() - start) / 1000);
-                setStatus(`Loading items... ${count}/${expected > 0 ? expected : '?'} rows (${elapsed}s)`, '#8e44ad');
 
-                // Exact match with expected row count — done immediately
-                if (expected > 0 && count >= expected) { done(); return; }
+                // Expand a capped list: if a "Load All Rows" button is showing,
+                // click it and keep waiting for the remaining rows to render.
+                const clicked = clickLoadAllRows();
+                const loadAllPresent = !![...document.querySelectorAll('alchemy-button, button')]
+                    .filter(b => !b.closest('#pvt-panel,#pvt-cc-dialog,#pvt-hq-dialog,#bpeta-panel'))
+                    .find(b => (b.innerText || b.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase().includes('load all rows')
+                        && !b.dataset.sidelineClicked);
+
+                setStatus(
+                    `Loading items... ${count}/${expected > 0 ? expected : '?'} rows (${elapsed}s)` +
+                    (clicked ? ' [Load All Rows]' : ''),
+                    '#8e44ad'
+                );
+
+                // If we just clicked Load All Rows, reset the stability window so
+                // we wait for the newly-expanded rows instead of finishing early.
+                if (clicked) { lastCount = count; stableSince = 0; return; }
+
+                // Exact match with expected row count — done immediately, but
+                // only once no "Load All Rows" button remains (the expected count
+                // can equal the pre-expansion cap, so don't finish while more
+                // rows are still hidden behind the button).
+                if (expected > 0 && count >= expected && !loadAllPresent) { done(); return; }
 
                 // Count changed — reset stability window
                 if (count !== lastCount) {
@@ -737,8 +785,9 @@
                     stableSince = count > 0 ? Date.now() : 0;
                 }
 
-                // Stable for 500ms with items present — assume all loaded
-                if (stableSince && Date.now() - stableSince >= 500) { done(); return; }
+                // Stable for 500ms with items present — but NOT while an unclicked
+                // "Load All Rows" button is still on the page (more rows pending).
+                if (stableSince && Date.now() - stableSince >= 500 && !loadAllPresent) { done(); return; }
 
                 // Safety timeout
                 if (Date.now() - start > TIMING.itemsTimeout) { done(); }
