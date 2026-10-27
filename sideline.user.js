@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Sideline - Multi-Tote Deletion Automation
 // @author       joyhjoe
-// @version      7.2
+// @version      7.3
 // @description  Automated tote processing for AFT Poirot V3 with multi-item price lookup
 // @match        https://aft-poirot-website-dub.dub.proxy.amazon.com/*
 // @match        https://river-dub.amazon.com/*
@@ -19,7 +19,7 @@
 // ==/UserScript==
 
 /**
- * SIDELINE v7.2 - AFT Poirot Tote Automation
+ * SIDELINE v7.3 - AFT Poirot Tote Automation
  *
  * Features:
  *   - Paste tote IDs, auto-processes them sequentially
@@ -94,7 +94,7 @@
     const FCR_BASE = 'https://qi-fcresearch-eu.corp.amazon.com';
 
     /** Current running version + where to check/download updates */
-    const VERSION = '7.2';
+    const VERSION = '7.3';
     const UPDATE_URL = 'https://github.com/joyhjoe1997-alt/tampermonkey-scripts/raw/main/sideline.user.js';
 
     // =========================================================================
@@ -226,8 +226,6 @@
     }
 
     // =========================================================================
-    // =========================================================================
-// =========================================================================
     //  UTILITIES
     // =========================================================================
 
@@ -1301,13 +1299,19 @@
 
                 // --- Step 7: Resolve FNSKUs, fetch prices + PS count in parallel ---
                 if (items.length) {
-                    // Phase 1: Resolve X0 FNSKUs via FC Research (sequential - same domain)
+                    // Phase 1: Resolve X0 FNSKUs via FC Research in parallel batches.
+                    // (Previously sequential — one request at a time — which was the
+                    // biggest delay on large totes. BATCH_SIZE keeps FCR load sane.)
+                    const toResolve = items.filter(i => !i.isAsin);
                     let resolved = 0;
-                    for (const item of items.filter(i => !i.isAsin)) {
-                        resolved++;
-                        setStatus(`Resolving FNSKU ${resolved}/${items.filter(i => !i.isAsin).length}...`, '#8e44ad');
+                    const resolveJobs = toResolve.map(item => async () => {
                         const fcr = await fetchFCResearch(item.fnsku);
                         if (fcr?.asin) { item.resolvedAsin = fcr.asin; item.fcPrice = fcr.fcPrice; item.title = item.title || fcr.title; }
+                        resolved++;
+                        setStatus(`Resolving FNSKUs ${resolved}/${toResolve.length}...`, '#8e44ad');
+                    });
+                    for (let i = 0; i < resolveJobs.length; i += BATCH_SIZE) {
+                        await Promise.all(resolveJobs.slice(i, i + BATCH_SIZE).map(fn => fn()));
                     }
 
                     // Phase 2: Fetch Amazon prices + PS count in parallel batches
@@ -1348,8 +1352,7 @@
                 changeBtn.click();
 
                 const yesBtn = await waitForYesButton();
-                if (yesBtn) { yesBtn.click(); }
-                else { }
+                if (yesBtn) yesBtn.click();
             }
 
             // --- Step 10: Mark done and wait for next scan page ---
@@ -1447,13 +1450,29 @@
     // =========================================================================
 
     function buildPanel() {
+        // Inject hover/active polish for the panel controls once.
+        if (!document.getElementById('pvt-ui-style')) {
+            const st = document.createElement('style');
+            st.id = 'pvt-ui-style';
+            st.textContent = `
+                #pvt-panel button{transition:filter .15s,transform .05s,box-shadow .15s}
+                #pvt-panel button:hover{filter:brightness(1.08)}
+                #pvt-panel button:active{transform:translateY(1px)}
+                #pvt-panel #pvt-collapse:hover{opacity:1}
+                #pvt-panel textarea:focus{outline:none;border-color:#1abc9c;box-shadow:0 0 0 2px rgba(26,188,156,.18)}
+                #pvt-list-wrap::-webkit-scrollbar{width:8px}
+                #pvt-list-wrap::-webkit-scrollbar-thumb{background:#cfd8dc;border-radius:4px}
+                #pvt-list-wrap::-webkit-scrollbar-thumb:hover{background:#b0bec5}`;
+            document.head.appendChild(st);
+        }
+
         const panel = document.createElement('div');
         panel.id = 'pvt-panel';
         panel.style.cssText = 'position:fixed;top:80px;right:20px;z-index:999999;width:310px;background:#fff;border:2px solid #0b3948;border-radius:14px;box-shadow:0 8px 30px rgba(0,0,0,.22);font:13px Segoe UI,system-ui,sans-serif;color:#2c3e50;overflow:hidden';
         panel.innerHTML = `
             <div id="pvt-header" style="background:linear-gradient(135deg,#0b3948,#1abc9c);color:#fff;padding:12px 14px;display:flex;align-items:center;gap:8px;font:700 14px Segoe UI;cursor:move;user-select:none">
                 <span>Sideline v${VERSION}</span>
-                <span id="pvt-collapse" style="margin-left:auto;cursor:pointer;font-size:18px;opacity:.8">-</span>
+                <span id="pvt-collapse" title="Collapse / expand" style="margin-left:auto;cursor:pointer;font-size:18px;line-height:1;opacity:.8;padding:0 4px">\u2212</span>
             </div>
             <div id="pvt-body" style="padding:12px 14px">
                 <textarea id="pvt-ta" placeholder="Paste tote IDs (one per line)" style="width:100%;height:100px;padding:8px;box-sizing:border-box;border:2px solid #e0e0e0;border-radius:8px;font:12px monospace;resize:vertical"></textarea>
@@ -1470,16 +1489,38 @@
             </div>`;
         document.body.appendChild(panel);
 
-        // Make panel draggable by header
+        // Make panel draggable by header, clamped to the viewport so it can
+        // never be dragged out of reach. The ignore-on-controls guard keeps the
+        // collapse button clickable.
         let sx, sy;
         const hdr = panel.querySelector('#pvt-header');
+        const clamp = (v, min, max) => Math.max(min, Math.min(max, v));
         hdr.addEventListener('mousedown', e => {
-            e.preventDefault(); sx = e.clientX; sy = e.clientY;
-            const move = ev => { panel.style.top = (panel.offsetTop + ev.clientY - sy) + 'px'; panel.style.left = (panel.offsetLeft + ev.clientX - sx) + 'px'; panel.style.right = 'auto'; sx = ev.clientX; sy = ev.clientY; };
-            const stop = () => document.removeEventListener('mousemove', move);
+            if (e.target.closest('#pvt-collapse')) return; // don't drag on the toggle
+            e.preventDefault();
+            sx = e.clientX; sy = e.clientY;
+            const move = ev => {
+                const maxLeft = Math.max(0, window.innerWidth - panel.offsetWidth);
+                const maxTop = Math.max(0, window.innerHeight - 40); // keep header reachable
+                panel.style.left = clamp(panel.offsetLeft + ev.clientX - sx, 0, maxLeft) + 'px';
+                panel.style.top = clamp(panel.offsetTop + ev.clientY - sy, 0, maxTop) + 'px';
+                panel.style.right = 'auto';
+                sx = ev.clientX; sy = ev.clientY;
+            };
+            const stop = () => {
+                document.removeEventListener('mousemove', move);
+                // Remember where the user parked it (survives reloads).
+                try { ls.set('pvt_pos', JSON.stringify({ t: panel.style.top, l: panel.style.left })); } catch { }
+            };
             document.addEventListener('mousemove', move);
             document.addEventListener('mouseup', stop, { once: true });
         });
+
+        // Restore a saved panel position (if any) from a previous drag.
+        try {
+            const pos = JSON.parse(ls.get('pvt_pos', 'null'));
+            if (pos && pos.t && pos.l) { panel.style.top = pos.t; panel.style.left = pos.l; panel.style.right = 'auto'; }
+        } catch { }
 
         return panel;
     }
@@ -1589,8 +1630,15 @@
             const btn = document.getElementById('pvt-collapse');
             const hidden = body.style.display === 'none';
             body.style.display = hidden ? '' : 'none';
-            btn.textContent = hidden ? '-' : '+';
+            btn.textContent = hidden ? '+' : '\u2212'; // + when collapsed, − when open
+            ls.set('pvt_collapsed', hidden ? '0' : '1');
         };
+        // Restore collapsed state from a previous session.
+        if (ls.get('pvt_collapsed', '0') === '1') {
+            const body = document.getElementById('pvt-body');
+            const btn = document.getElementById('pvt-collapse');
+            if (body && btn) { body.style.display = 'none'; btn.textContent = '+'; }
+        }
     }
 
     // =========================================================================
