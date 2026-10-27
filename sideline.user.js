@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Sideline - Multi-Tote Deletion Automation
 // @author       joyhjoe
-// @version      6.8
+// @version      6.9
 // @description  Automated tote processing for AFT Poirot V3 with multi-item price lookup
 // @match        https://aft-poirot-website-dub.dub.proxy.amazon.com/*
 // @match        https://river-dub.amazon.com/*
@@ -19,7 +19,7 @@
 // ==/UserScript==
 
 /**
- * SIDELINE v6.8 - AFT Poirot Tote Automation
+ * SIDELINE v6.9 - AFT Poirot Tote Automation
  *
  * Features:
  *   - Paste tote IDs, auto-processes them sequentially
@@ -92,7 +92,7 @@
     const FCR_BASE = 'https://qi-fcresearch-eu.corp.amazon.com';
 
     /** Current running version + where to check/download updates */
-    const VERSION = '6.8';
+    const VERSION = '6.9';
     const UPDATE_URL = 'https://github.com/joyhjoe1997-alt/tampermonkey-scripts/raw/main/sideline.user.js';
 
     // =========================================================================
@@ -459,9 +459,10 @@
     /**
      * Builds the river-dub adjustment comment from FC Research for a tote.
      *
-     * Fetches the FULL results page ("/<WH>/results?s=<toteId>") once so both
-     * the Inventory History and Receive History tables come back in a single
-     * request. Then:
+     * Fetches TWO server-rendered partials ("/<WH>/results/inventory-history"
+     * and "/<WH>/results/receive-history", ?s=<toteId>) in parallel — the full
+     * "/results?s=" page is a JS shell with no tables, so the partials are used.
+     * Then:
      *   - Keeps Inventory History rows where OP == 'A' AND RS == 'A'.
      *   - Joins each kept row to a Receive History PO on FNSKU (nearest date
      *     when a FNSKU appears more than once).
@@ -469,7 +470,7 @@
      *       "<date>, <WH> received <qty> units of <fnsku> in <oldBin> using <tool>"
      *     plus " from PO : <po>" when a PO is found.
      *
-     * Returns a Promise<string> (joined with "\n"); '' if nothing qualifies.
+     * Returns Promise<{ text, diag }>; text is '' if nothing qualifies.
      *
      * Column layouts (tbody <td> indexes):
      *   #table-inventory-history: Date(0) OP(1) RS(2) ASIN(3) FNSku(4) FCSku(5)
@@ -477,34 +478,45 @@
      *     NewOwner(12) Tool(13)
      *   #table-receive-history: Date(0) Receiver(1) ProcessPath(2) SKU/FNSKU(3)
      *     LPN(4) Quantity(5) Container(6) Shipment(7) PurchaseOrder(8)
+     *
+     * GETs a server-rendered FC Research HTML fragment and returns a parsed
+     * Document (or null on failure). The FULL "/results?s=" page is a JS shell
+     * with no data tables, so we hit the PARTIAL endpoints (same ones the site's
+     * own tabs load), which come back server-rendered with the <table> present.
      */
-    function buildAdjustmentComment(toteId) {
-        const wh = getWarehouseId();
-        const url = `${FCR_BASE}/${wh}/results?s=${encodeURIComponent(toteId)}`;
+    function fetchFcrPartial(path, s) {
+        const url = `${FCR_BASE}/${getWarehouseId()}/${path}?s=${encodeURIComponent(s)}`;
         return new Promise(resolve => {
             GM_xmlhttpRequest({
                 method: 'GET', url,
                 headers: { 'Accept': 'text/html', 'Accept-Language': 'en-GB,en;q=0.9' },
                 onload(resp) {
                     try {
-                        const html = resp.responseText || '';
-                        const doc = new DOMParser().parseFromString(html, 'text/html');
-                        const hasTable = !!doc.querySelector('#table-inventory-history');
-                        const r = composeComment(doc, wh);
-                        resolve({
-                            text: r.text,
-                            diag: hasTable
-                                ? r.diag
-                                : `no inv table (http ${resp.status}, ${html.length}b)`,
-                        });
-                    } catch (e) {
-                        resolve({ text: '', diag: 'parse error: ' + (e && e.message) });
-                    }
+                        const doc = new DOMParser().parseFromString(resp.responseText || '', 'text/html');
+                        resolve({ doc, status: resp.status, len: (resp.responseText || '').length });
+                    } catch (e) { resolve({ doc: null, status: resp.status, len: 0 }); }
                 },
-                onerror(e) { resolve({ text: '', diag: 'request failed' }); },
-                ontimeout() { resolve({ text: '', diag: 'request timeout' }); },
+                onerror() { resolve({ doc: null, status: 0, len: 0 }); },
+                ontimeout() { resolve({ doc: null, status: 0, len: 0 }); },
             });
         });
+    }
+
+    function buildAdjustmentComment(toteId) {
+        const wh = getWarehouseId();
+        // Fetch both partials in parallel: inventory-history (known-good, same
+        // endpoint checkProblemSolve uses) and receive-history (same pattern).
+        return Promise.all([
+            fetchFcrPartial('results/inventory-history', toteId),
+            fetchFcrPartial('results/receive-history', toteId),
+        ]).then(([inv, rec]) => {
+            const invDoc = inv.doc;
+            if (!invDoc || !invDoc.querySelector('#table-inventory-history')) {
+                return { text: '', diag: `no inv table (http ${inv.status}, ${inv.len}b)` };
+            }
+            const r = composeComment(invDoc, wh, rec.doc);
+            return { text: r.text, diag: r.diag };
+        }).catch(e => ({ text: '', diag: 'build error: ' + (e && e.message) }));
     }
 
     /** Parses a date-ish string to epoch ms for nearest-date matching (NaN-safe). */
@@ -515,12 +527,15 @@
 
     /**
      * Pure DOM -> comment transform (split out so it is unit-testable without a
-     * network call). Takes the parsed results document and warehouse id.
+     * network call). `invDoc` holds #table-inventory-history; `recDoc` holds
+     * #table-receive-history (a separate partial fetch). `recDoc` may be null.
      */
-    function composeComment(doc, wh) {
+    function composeComment(invDoc, wh, recDoc) {
+        const doc = invDoc;
+        const recScope = recDoc || invDoc;
         // --- Receive History: FNSKU -> [{ po, when }] for nearest-date joining ---
         const poByFnsku = new Map();
-        const recRows = doc.querySelectorAll('#table-receive-history tbody tr');
+        const recRows = recScope.querySelectorAll('#table-receive-history tbody tr');
         for (const row of recRows) {
             const c = row.querySelectorAll('td');
             if (c.length < 9) continue;
@@ -582,10 +597,11 @@
         // Diagnostic string: how the parse saw the page. Surfaced in the toast
         // only when no line was built, so you can tell WHY (empty table vs.
         // OP/RS never 'A' vs. wrong columns).
+        const recTable = !!recScope.querySelector('#table-receive-history');
         const diag =
             `inv-rows=${invRows.length}` +
             (invRows.length && !lines.length ? ` oprs=[${seenOpRs.join(',')}]` : '') +
-            ` rec-POs=${poByFnsku.size}`;
+            ` rec-table=${recTable ? 'y' : 'n'} rec-POs=${poByFnsku.size}`;
 
         return { text: lines.join('\n'), diag };
     }
