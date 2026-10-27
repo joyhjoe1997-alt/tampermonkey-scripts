@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Sideline - Multi-Tote Deletion Automation
 // @author       joyhjoe
-// @version      6.5
+// @version      6.6
 // @description  Automated tote processing for AFT Poirot V3 with multi-item price lookup
 // @match        https://aft-poirot-website-dub.dub.proxy.amazon.com/*
 // @match        https://river-dub.amazon.com/*
@@ -19,7 +19,7 @@
 // ==/UserScript==
 
 /**
- * SIDELINE v6.5 - AFT Poirot Tote Automation
+ * SIDELINE v6.6 - AFT Poirot Tote Automation
  *
  * Features:
  *   - Paste tote IDs, auto-processes them sequentially
@@ -41,7 +41,10 @@
  *     threshold band (value/units -> adjustmentType radio; UNRECEIVE excluded).
  *     After the user clicks "Confirm & Continue", step 2 is auto-filled:
  *     Tool=Sideline, Container=tote, ASIN=first row, Qty=units, Value=round(gt).
- *     Root Cause + comments stay manual; nothing is auto-submitted.
+ *     The adjustment Comment is built from FC Research (Inventory History rows
+ *     where OP=A & RS=A, joined to Receive History POs on FNSKU) on the Poirot
+ *     tab before the SIM opens. Root Cause + its comment stay manual; nothing
+ *     is auto-submitted.
  *   - Persists progress across page reloads (skip = refresh + auto-resume)
  *   - Draggable, collapsible floating panel
  *
@@ -89,7 +92,7 @@
     const FCR_BASE = 'https://qi-fcresearch-eu.corp.amazon.com';
 
     /** Current running version + where to check/download updates */
-    const VERSION = '6.4';
+    const VERSION = '6.6';
     const UPDATE_URL = 'https://github.com/joyhjoe1997-alt/tampermonkey-scripts/raw/main/sideline.user.js';
 
     // =========================================================================
@@ -451,6 +454,114 @@
                 ontimeout() { resolve({ hasProblemSolve: false, count: 0, totalQty: 0, lastDate: '' }); },
             });
         });
+    }
+
+    /**
+     * Builds the river-dub adjustment comment from FC Research for a tote.
+     *
+     * Fetches the FULL results page ("/<WH>/results?s=<toteId>") once so both
+     * the Inventory History and Receive History tables come back in a single
+     * request. Then:
+     *   - Keeps Inventory History rows where OP == 'A' AND RS == 'A'.
+     *   - Joins each kept row to a Receive History PO on FNSKU (nearest date
+     *     when a FNSKU appears more than once).
+     *   - Emits one line per kept row:
+     *       "<date>, <WH> received <qty> units of <fnsku> in <oldBin> using <tool>"
+     *     plus " from PO : <po>" when a PO is found.
+     *
+     * Returns a Promise<string> (joined with "\n"); '' if nothing qualifies.
+     *
+     * Column layouts (tbody <td> indexes):
+     *   #table-inventory-history: Date(0) OP(1) RS(2) ASIN(3) FNSku(4) FCSku(5)
+     *     LPN(6) Quantity(7) Person(8) OldBin(9) NewBin(10) OldOwner(11)
+     *     NewOwner(12) Tool(13)
+     *   #table-receive-history: Date(0) Receiver(1) ProcessPath(2) SKU/FNSKU(3)
+     *     LPN(4) Quantity(5) Container(6) Shipment(7) PurchaseOrder(8)
+     */
+    function buildAdjustmentComment(toteId) {
+        const wh = getWarehouseId();
+        const url = `${FCR_BASE}/${wh}/results?s=${encodeURIComponent(toteId)}`;
+        return new Promise(resolve => {
+            GM_xmlhttpRequest({
+                method: 'GET', url,
+                headers: { 'Accept': 'text/html', 'Accept-Language': 'en-GB,en;q=0.9' },
+                onload(resp) {
+                    try {
+                        const doc = new DOMParser().parseFromString(resp.responseText || '', 'text/html');
+                        resolve(composeComment(doc, wh));
+                    } catch (e) {
+                        resolve('');
+                    }
+                },
+                onerror() { resolve(''); },
+                ontimeout() { resolve(''); },
+            });
+        });
+    }
+
+    /** Parses a date-ish string to epoch ms for nearest-date matching (NaN-safe). */
+    function parseFcrDate(s) {
+        const t = Date.parse(String(s || '').trim());
+        return isNaN(t) ? null : t;
+    }
+
+    /**
+     * Pure DOM -> comment transform (split out so it is unit-testable without a
+     * network call). Takes the parsed results document and warehouse id.
+     */
+    function composeComment(doc, wh) {
+        // --- Receive History: FNSKU -> [{ po, when }] for nearest-date joining ---
+        const poByFnsku = new Map();
+        const recRows = doc.querySelectorAll('#table-receive-history tbody tr');
+        for (const row of recRows) {
+            const c = row.querySelectorAll('td');
+            if (c.length < 9) continue;
+            const sku = (c[3]?.textContent || '').trim();
+            const po  = (c[8]?.textContent || '').trim();
+            if (!sku || !po) continue;
+            const when = parseFcrDate(c[0]?.textContent);
+            if (!poByFnsku.has(sku)) poByFnsku.set(sku, []);
+            poByFnsku.get(sku).push({ po, when });
+        }
+
+        // Picks the PO for a FNSKU whose receive date is closest to the inv date.
+        const poFor = (fnsku, invWhen) => {
+            const list = poByFnsku.get(fnsku);
+            if (!list || !list.length) return '';
+            if (list.length === 1 || invWhen == null) return list[0].po;
+            let best = list[0];
+            let bestGap = Infinity;
+            for (const e of list) {
+                if (e.when == null) continue;
+                const gap = Math.abs(e.when - invWhen);
+                if (gap < bestGap) { bestGap = gap; best = e; }
+            }
+            return best.po;
+        };
+
+        // --- Inventory History: keep OP=='A' && RS=='A', build one line each ---
+        const lines = [];
+        const invRows = doc.querySelectorAll('#table-inventory-history tbody tr');
+        for (const row of invRows) {
+            const c = row.querySelectorAll('td');
+            if (c.length < 14) continue;
+            const op = (c[1]?.textContent || '').trim();
+            const rs = (c[2]?.textContent || '').trim();
+            if (op !== 'A' || rs !== 'A') continue;
+
+            const date   = (c[0]?.textContent || '').trim();
+            const fnsku  = (c[4]?.textContent || '').trim();
+            const qty    = (c[7]?.textContent || '').trim();
+            const oldBin = (c[9]?.textContent || '').trim();
+            const tool   = (c[13]?.textContent || '').trim();
+
+            let line = `${date}, ${wh} received ${qty} units of ${fnsku} in ${oldBin} using ${tool}`;
+            const po = poFor(fnsku, parseFcrDate(date));
+            if (po) line += ` from PO : ${po}`;
+            lines.push(line);
+        }
+
+        return lines.join('\n');
     }
 
     /**
@@ -862,7 +973,8 @@
             const btn = document.getElementById('pvt-create-dl');
             if (!btn || btn.dataset.wired) return;
             btn.dataset.wired = '1';
-            btn.onclick = () => {
+            btn.onclick = async () => {
+                if (btn.dataset.busy) return; // guard against double-click re-entry
                 const gtEl = document.getElementById('pvt-gt');
                 const liveGt = gtEl ? parseFloat((gtEl.textContent || '').replace(/[^0-9.]/g, '')) : gt;
                 // ASIN for step 2: first item's resolved ASIN if available, else
@@ -874,10 +986,34 @@
                     qty: tQty,
                     toteId: tId,
                     asin,
+                    comment: '',
                     ts: Date.now(),
                 };
+
+                // Over £1,000: build the adjustment comment from FC Research
+                // (Inventory + Receive History) on THIS tab before opening the
+                // SIM, so the handoff carries the finished text to river-dub.
+                if (payload.gt > 1000) {
+                    btn.dataset.busy = '1';
+                    const label = btn.textContent;
+                    btn.textContent = '\u23F3 Building comment...';
+                    setStatus('Building adjustment comment from FC Research...', '#8e44ad');
+                    try {
+                        payload.comment = await buildAdjustmentComment(tId);
+                    } catch { payload.comment = ''; }
+                    btn.textContent = label;
+                    delete btn.dataset.busy;
+                    setStatus(
+                        payload.comment
+                            ? `Comment ready (${payload.comment.split('\n').length} line(s)). Opening DL...`
+                            : 'No FC Research history matched (OP=A & RS=A). Opening DL...',
+                        payload.comment ? '#27ae60' : '#f39c12'
+                    );
+                } else {
+                    setStatus(`Opening DL (£${payload.gt.toFixed(2)}, ${payload.qty} units)...`, '#8e44ad');
+                }
+
                 try { GM_setValue(DL_HANDOFF_KEY, JSON.stringify(payload)); } catch { }
-                setStatus(`Opening DL (£${payload.gt.toFixed(2)}, ${payload.qty} units)...`, '#8e44ad');
                 window.open(DL_URL, '_blank', 'noopener');
             };
         }
@@ -1456,10 +1592,11 @@
             const container = pick('[ng-model="data.containerInputS"]');
             if (!container) return;
 
-            const asinEl   = pick('[ng-model="data.asinInputS"]');
-            const qtyEl    = pick('[ng-model="data.qtyInputS"]');
-            const valueEl  = pick('[ng-model="data.totalCostInputS"]');
-            const toolSel  = pick('select[ng-model="data.toolDropdownS"]');
+            const asinEl    = pick('[ng-model="data.asinInputS"]');
+            const qtyEl     = pick('[ng-model="data.qtyInputS"]');
+            const valueEl   = pick('[ng-model="data.totalCostInputS"]');
+            const toolSel   = pick('select[ng-model="data.toolDropdownS"]');
+            const commentEl = pick('[ng-model="data.commentAreaS"]');
 
             // Total value: rounded to a whole number, no decimals (field is int-only).
             const valueInt = String(Math.round(Number(payload.gt) || 0));
@@ -1471,6 +1608,9 @@
             if (payload.asin && asinEl && setNgText(asinEl, payload.asin)) filled.push('ASIN');
             if (setNgText(qtyEl, qtyInt)) filled.push('Qty');
             if (setNgText(valueEl, valueInt)) filled.push('Value');
+            // Comment: FC Research history lines, built on the Poirot tab.
+            // Root Cause dropdown + its comment stay MANUAL (user decides those).
+            if (payload.comment && commentEl && setNgText(commentEl, payload.comment)) filled.push('Comment');
 
             step2Done = true;
             // Consume the handoff now — step 2 is the last thing we auto-fill.
