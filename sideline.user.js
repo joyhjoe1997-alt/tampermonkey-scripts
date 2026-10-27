@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Sideline - Multi-Tote Deletion Automation
 // @author       joyhjoe
-// @version      6.7
+// @version      6.8
 // @description  Automated tote processing for AFT Poirot V3 with multi-item price lookup
 // @match        https://aft-poirot-website-dub.dub.proxy.amazon.com/*
 // @match        https://river-dub.amazon.com/*
@@ -19,7 +19,7 @@
 // ==/UserScript==
 
 /**
- * SIDELINE v6.7 - AFT Poirot Tote Automation
+ * SIDELINE v6.8 - AFT Poirot Tote Automation
  *
  * Features:
  *   - Paste tote IDs, auto-processes them sequentially
@@ -92,7 +92,7 @@
     const FCR_BASE = 'https://qi-fcresearch-eu.corp.amazon.com';
 
     /** Current running version + where to check/download updates */
-    const VERSION = '6.7';
+    const VERSION = '6.8';
     const UPDATE_URL = 'https://github.com/joyhjoe1997-alt/tampermonkey-scripts/raw/main/sideline.user.js';
 
     // =========================================================================
@@ -487,14 +487,22 @@
                 headers: { 'Accept': 'text/html', 'Accept-Language': 'en-GB,en;q=0.9' },
                 onload(resp) {
                     try {
-                        const doc = new DOMParser().parseFromString(resp.responseText || '', 'text/html');
-                        resolve(composeComment(doc, wh));
+                        const html = resp.responseText || '';
+                        const doc = new DOMParser().parseFromString(html, 'text/html');
+                        const hasTable = !!doc.querySelector('#table-inventory-history');
+                        const r = composeComment(doc, wh);
+                        resolve({
+                            text: r.text,
+                            diag: hasTable
+                                ? r.diag
+                                : `no inv table (http ${resp.status}, ${html.length}b)`,
+                        });
                     } catch (e) {
-                        resolve('');
+                        resolve({ text: '', diag: 'parse error: ' + (e && e.message) });
                     }
                 },
-                onerror() { resolve(''); },
-                ontimeout() { resolve(''); },
+                onerror(e) { resolve({ text: '', diag: 'request failed' }); },
+                ontimeout() { resolve({ text: '', diag: 'request timeout' }); },
             });
         });
     }
@@ -539,14 +547,24 @@
             return best.po;
         };
 
+        // Normalises an OP/RS status cell. These render the letter inside a
+        // tooltip wrapper, so textContent may carry stray whitespace or a title
+        // string; take the first non-space character and compare case-insensitively.
+        const statusLetter = (cell) => {
+            const t = (cell?.textContent || '').replace(/\s+/g, '').toUpperCase();
+            return t ? t[0] : '';
+        };
+
         // --- Inventory History: keep OP=='A' && RS=='A', build one line each ---
         const lines = [];
         const invRows = doc.querySelectorAll('#table-inventory-history tbody tr');
+        let seenOpRs = []; // diagnostics: what OP/RS pairs we actually read
         for (const row of invRows) {
             const c = row.querySelectorAll('td');
             if (c.length < 14) continue;
-            const op = (c[1]?.textContent || '').trim();
-            const rs = (c[2]?.textContent || '').trim();
+            const op = statusLetter(c[1]);
+            const rs = statusLetter(c[2]);
+            if (seenOpRs.length < 6) seenOpRs.push(`${op || '-'}/${rs || '-'}`);
             if (op !== 'A' || rs !== 'A') continue;
 
             const date   = (c[0]?.textContent || '').trim();
@@ -561,7 +579,15 @@
             lines.push(line);
         }
 
-        return lines.join('\n');
+        // Diagnostic string: how the parse saw the page. Surfaced in the toast
+        // only when no line was built, so you can tell WHY (empty table vs.
+        // OP/RS never 'A' vs. wrong columns).
+        const diag =
+            `inv-rows=${invRows.length}` +
+            (invRows.length && !lines.length ? ` oprs=[${seenOpRs.join(',')}]` : '') +
+            ` rec-POs=${poByFnsku.size}`;
+
+        return { text: lines.join('\n'), diag };
     }
 
     /**
@@ -998,15 +1024,19 @@
                     const label = btn.textContent;
                     btn.textContent = '\u23F3 Building comment...';
                     setStatus('Building adjustment comment from FC Research...', '#8e44ad');
+                    let diag = '';
                     try {
-                        payload.comment = await buildAdjustmentComment(tId);
-                    } catch { payload.comment = ''; }
+                        const r = await buildAdjustmentComment(tId);
+                        payload.comment = (r && r.text) || '';
+                        diag = (r && r.diag) || '';
+                    } catch (e) { payload.comment = ''; diag = 'exception'; }
+                    payload.commentDiag = diag; // carried to river-dub for the toast
                     btn.textContent = label;
                     delete btn.dataset.busy;
                     setStatus(
                         payload.comment
                             ? `Comment ready (${payload.comment.split('\n').length} line(s)). Opening DL...`
-                            : 'No FC Research history matched (OP=A & RS=A). Opening DL...',
+                            : `No comment built [${diag}]. Opening DL...`,
                         payload.comment ? '#27ae60' : '#f39c12'
                     );
                 } else {
@@ -1668,7 +1698,7 @@
             // Root Cause dropdown + its comment stay MANUAL (user decides those).
             let commentNote = '';
             if (!payload.comment) {
-                commentNote = 'Comment: none built (no OP=A & RS=A history on Poirot tab).';
+                commentNote = `Comment: none built [${payload.commentDiag || 'no history'}].`;
             } else if (!commentEl) {
                 commentNote = 'Comment: field not found - paste manually.';
             } else if (setNgText(commentEl, payload.comment)) {
