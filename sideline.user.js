@@ -1,14 +1,17 @@
 // ==UserScript==
 // @name         Sideline - Multi-Tote Deletion Automation
 // @author       joyhjoe
-// @version      6.3
+// @version      6.4
 // @description  Automated tote processing for AFT Poirot V3 with multi-item price lookup
 // @match        https://aft-poirot-website-dub.dub.proxy.amazon.com/*
+// @match        https://river-dub.amazon.com/*
 // @icon         https://cdn-icons-png.flaticon.com/512/3687/3687412.png
 // @updateURL    https://github.com/joyhjoe1997-alt/tampermonkey-scripts/raw/main/sideline.user.js
 // @downloadURL  https://github.com/joyhjoe1997-alt/tampermonkey-scripts/raw/main/sideline.user.js
 // @run-at       document-idle
 // @grant        GM_xmlhttpRequest
+// @grant        GM_setValue
+// @grant        GM_getValue
 // @connect      amazon.co.uk
 // @connect      qi-fcresearch-eu.corp.amazon.com
 // @connect      github.com
@@ -16,7 +19,7 @@
 // ==/UserScript==
 
 /**
- * SIDELINE v6.3 - AFT Poirot Tote Automation
+ * SIDELINE v6.4 - AFT Poirot Tote Automation
  *
  * Features:
  *   - Paste tote IDs, auto-processes them sequentially
@@ -33,6 +36,9 @@
  *   - Shows confirmation dialog with item table, prices, and grand total
  *   - Skips vt/pa/numeric totes with warning
  *   - High quantity (>100) warning before emptying
+ *   - High-value totes (>£1,000) show a "Create DL" button that opens the
+ *     river-dub Large Adjustment SIM in a new tab and auto-selects the matching
+ *     threshold band (value/units -> adjustmentType radio; UNRECEIVE excluded)
  *   - Persists progress across page reloads (skip = refresh + auto-resume)
  *   - Draggable, collapsible floating panel
  *
@@ -80,8 +86,47 @@
     const FCR_BASE = 'https://qi-fcresearch-eu.corp.amazon.com';
 
     /** Current running version + where to check/download updates */
-    const VERSION = '6.3';
+    const VERSION = '6.4';
     const UPDATE_URL = 'https://github.com/joyhjoe1997-alt/tampermonkey-scripts/raw/main/sideline.user.js';
+
+    // =========================================================================
+    //  CREATE DL (river-dub Large Adjustment SIM) CONFIG
+    // =========================================================================
+    // "Create DL" button (shown on the HIGH VALUE TOTE warning) opens this
+    // river-dub workflow in a NEW TAB. Sideline stashes the tote's grand total
+    // and unit count via GM_setValue; the river-dub half of this script (see the
+    // RIVER-DUB AUTO-SELECT section at the bottom) reads that payload and ticks
+    // the matching "adjustmentType" radio using an Angular-safe event dispatch.
+
+    /** The river-dub Large Adjustment workflow URL opened by "Create DL". */
+    const DL_URL = 'https://river-dub.amazon.com/EMA4/workflows?buildingType=fc&q0=e48846d7-01a3-42d0-abcd-5a843986e187&q1=01a54358-f9df-463a-97a1-4cee2946bb3b&id=01a54358-f9df-463a-97a1-4cee2946bb3b';
+
+    /** Cross-tab handoff key (GM storage) carrying { gt, qty, ts } to river-dub. */
+    const DL_HANDOFF_KEY = 'sideline_dl_handoff';
+
+    /** How long a stashed handoff is considered fresh (ms). */
+    const DL_HANDOFF_TTL = 5 * 60 * 1000; // 5 minutes
+
+    /**
+     * Maps a tote's grand-total value (£) and unit count to the river-dub
+     * "adjustmentType" radio value. When units and value disagree, the HIGHER
+     * (stricter) band wins, so the SIM routes to the correct approval process.
+     * UNRECEIVE (unreceiveProcess) is NEVER auto-selected — user picks it manually.
+     * Returns null if no band can be determined.
+     */
+    function mapAdjustmentBand(gt, qty) {
+        const v = Number(gt) || 0;
+        const u = Number(qty) || 0;
+        // Value-driven upper bands (value alone decides these).
+        if (v > 500000) return 'extraExtraMegaLarge';   // > £/€500,000
+        if (v > 30000)  return 'extraExtraLarge';        // > £/€30,000
+        if (v >= 15000) return 'extraLarge';             // £/€15,000–30,000
+        // Mixed units-or-value bands: higher of the two wins.
+        if (u > 1000 || v >= 7500) return 'large';       // >1,000 units OR £/€7,500–15,000
+        if (u >= 200 || v >= 2000) return 'medium';      // 200–1,000 units OR £/€2,000–7,500
+        if (u >= 100 || v >= 1000) return 'small';       // 100–200 units OR £/€1,000–2,000
+        return 'extraSmall';                             // < 100 units AND < £/€1,000
+    }
 
     /** localStorage keys */
     const LS = {
@@ -735,7 +780,7 @@
         const overlay = createDialog('pvt-cc-dialog', `
             <div id="pvt-cc-box" style="background:${highValue ? '#fff5f5' : '#fff'};border-radius:14px;width:800px;max-width:95vw;max-height:90vh;display:flex;flex-direction:column;box-shadow:0 16px 50px rgba(0,0,0,.35);overflow:hidden;${highValue ? 'border:3px solid #e74c3c' : ''}">
                 <div style="background:${highValue ? 'linear-gradient(135deg,#c0392b,#e74c3c)' : 'linear-gradient(135deg,#0b3948,#1abc9c)'};color:#fff;padding:16px 20px;font:700 20px Segoe UI">Change Container - Tote ${toteNum}/${total}</div>
-                ${highValue ? '<div id="pvt-hv-warn" style="background:#e74c3c;color:#fff;padding:12px 20px;font:700 19px Segoe UI;text-align:center;animation:pvt-blink 1s infinite">&#9888; HIGH VALUE TOTE - Grand Total exceeds \u00A31,000! Verify before proceeding.</div>' : ''}
+                ${highValue ? '<div id="pvt-hv-warn" style="background:#e74c3c;color:#fff;padding:12px 20px;font:700 19px Segoe UI;text-align:center;animation:pvt-blink 1s infinite">&#9888; HIGH VALUE TOTE - Grand Total exceeds \u00A31,000! Verify before proceeding.<br><button id="pvt-create-dl" style="margin-top:10px;padding:8px 18px;border:none;border-radius:8px;font:700 14px Segoe UI;cursor:pointer;background:#fff;color:#c0392b;animation:none">\uD83D\uDCCB Create DL</button></div>' : ''}
                 <div style="padding:16px 20px;overflow-y:auto;flex:1">
                     <div style="display:flex;justify-content:space-between;font-size:18px;color:#555;margin-bottom:12px;padding-bottom:10px;border-bottom:1px solid #eee">
                         <span><b>Tote:</b> <a href="${FCR_BASE}/${getWarehouseId()}/results?s=${encodeURIComponent(toteId)}" target="_blank" rel="noopener" style="color:#8e44ad;text-decoration:none;font-weight:700" title="Open in FC Research">${escapeHtml(toteId)}</a></span><span><b>Items:</b> ${items.length} rows, ${totalQty} units</span>
@@ -793,8 +838,9 @@
                         const w = document.createElement('div');
                         w.id = 'pvt-hv-warn';
                         w.style.cssText = 'background:#e74c3c;color:#fff;padding:10px 18px;font:700 13px Segoe UI;text-align:center;animation:pvt-blink 1s infinite';
-                        w.innerHTML = '&#9888; HIGH VALUE TOTE - Grand Total exceeds \u00A31,000! Verify before proceeding.';
+                        w.innerHTML = '&#9888; HIGH VALUE TOTE - Grand Total exceeds \u00A31,000! Verify before proceeding.<br><button id="pvt-create-dl" style="margin-top:8px;padding:7px 16px;border:none;border-radius:8px;font:700 13px Segoe UI;cursor:pointer;background:#fff;color:#c0392b;animation:none">\uD83D\uDCCB Create DL</button>';
                         hdr.after(w);
+                        wireCreateDlButton(toteId, totalQty);
                     }
                 } else {
                     gtEl.style.color = '#27ae60';
@@ -803,6 +849,26 @@
                 }
             });
         });
+
+        // Wire the "Create DL" button (inside the high-value warning banner).
+        // Reads the LIVE grand total from #pvt-gt (it changes after ASIN pastes),
+        // stashes { gt, qty, toteId } for the river-dub tab, and opens the SIM.
+        function wireCreateDlButton(tId, tQty) {
+            const btn = document.getElementById('pvt-create-dl');
+            if (!btn || btn.dataset.wired) return;
+            btn.dataset.wired = '1';
+            btn.onclick = () => {
+                const gtEl = document.getElementById('pvt-gt');
+                const liveGt = gtEl ? parseFloat((gtEl.textContent || '').replace(/[^0-9.]/g, '')) : gt;
+                const payload = { gt: isNaN(liveGt) ? gt : liveGt, qty: tQty, toteId: tId, ts: Date.now() };
+                try { GM_setValue(DL_HANDOFF_KEY, JSON.stringify(payload)); } catch { }
+                setStatus(`Opening DL (£${payload.gt.toFixed(2)}, ${payload.qty} units)...`, '#8e44ad');
+                window.open(DL_URL, '_blank', 'noopener');
+            };
+        }
+
+        // Wire the initial banner's button (present when the tote opens high-value).
+        wireCreateDlButton(toteId, totalQty);
 
         return new Promise(resolve => {
             document.getElementById('pvt-cc-yes').onclick = () => { overlay.remove(); resolve('yes'); };
@@ -1225,8 +1291,101 @@
         };
     }
 
-    // Entry point
-    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
-    else init();
+    // =========================================================================
+    //  RIVER-DUB AUTO-SELECT (runs only on river-dub.amazon.com)
+    // =========================================================================
+    // Reads the handoff stashed by "Create DL" on the Poirot tab, computes the
+    // adjustment band from the tote's value/units, waits for the AngularJS radio
+    // group to render, ticks the matching radio, and notifies Angular so its
+    // ng-model ("data.adjustmentType") updates. UNRECEIVE is never auto-selected.
+
+    /** Ticks a radio in an Angular-safe way (sets .checked + fires events). */
+    function setAngularRadio(radio) {
+        if (!radio || radio.checked) return radio && radio.checked;
+        radio.checked = true;
+        // AngularJS binds to click for radios; also fire input/change for safety.
+        radio.dispatchEvent(new Event('click', { bubbles: true }));
+        radio.dispatchEvent(new Event('input', { bubbles: true }));
+        radio.dispatchEvent(new Event('change', { bubbles: true }));
+        return radio.checked;
+    }
+
+    /** Shows a small toast banner on the river-dub page (fixed, dismissable). */
+    function dlToast(message, color = '#8e44ad') {
+        document.getElementById('sideline-dl-toast')?.remove();
+        const t = document.createElement('div');
+        t.id = 'sideline-dl-toast';
+        t.style.cssText = `position:fixed;top:16px;right:16px;z-index:2147483647;background:${color};color:#fff;padding:12px 16px;border-radius:10px;font:600 13px Segoe UI,system-ui,sans-serif;box-shadow:0 8px 24px rgba(0,0,0,.3);max-width:360px;line-height:1.4`;
+        t.textContent = message;
+        document.body.appendChild(t);
+        setTimeout(() => t.remove(), 8000);
+    }
+
+    /** Polls for the adjustmentType radios and selects the computed band. */
+    function riverDubAutoSelect() {
+        let raw;
+        try { raw = GM_getValue(DL_HANDOFF_KEY, ''); } catch { raw = ''; }
+        if (!raw) return; // No handoff -> user opened river-dub directly; do nothing.
+
+        let payload;
+        try { payload = JSON.parse(raw); } catch { return; }
+        if (!payload || typeof payload.gt !== 'number') return;
+
+        // Ignore a stale handoff (older than the TTL) so an old value never
+        // auto-ticks a fresh manual visit.
+        if (!payload.ts || (Date.now() - payload.ts) > DL_HANDOFF_TTL) return;
+
+        const band = mapAdjustmentBand(payload.gt, payload.qty);
+        if (!band) return;
+
+        const start = Date.now();
+        const timeoutMs = 20000;
+        const iv = setInterval(() => {
+            const radios = document.querySelectorAll('input[type="radio"][name="adjustmentType"]');
+            if (radios.length) {
+                const target = [...radios].find(r => r.value === band);
+                if (target) {
+                    clearInterval(iv);
+                    // Consume the handoff so a reload / another tab can't re-tick.
+                    try { GM_setValue(DL_HANDOFF_KEY, ''); } catch { }
+                    const ok = setAngularRadio(target);
+                    const bandLabels = {
+                        extraSmall: '< 100 units / £1,000',
+                        small: '100-200 units / £1,000-2,000',
+                        medium: '200-1,000 units / £2,000-7,500',
+                        large: '>1,000 units / £7,500-15,000',
+                        extraLarge: '£15,000-30,000',
+                        extraExtraLarge: '£30,000+',
+                        extraExtraMegaLarge: '£500,000+',
+                    };
+                    const tote = payload.toteId ? ` for ${payload.toteId}` : '';
+                    dlToast(
+                        ok
+                            ? `\u2705 Auto-selected: ${bandLabels[band] || band} (£${payload.gt.toFixed(2)}, ${payload.qty} units)${tote}. Verify, then click Next.`
+                            : `\u26A0 Could not auto-select the band. Please pick it manually (£${payload.gt.toFixed(2)}, ${payload.qty} units).`,
+                        ok ? '#27ae60' : '#e74c3c'
+                    );
+                    return;
+                }
+            }
+            if (Date.now() - start > timeoutMs) {
+                clearInterval(iv);
+                dlToast('\u26A0 Sideline: adjustment options did not load in time. Please select the band manually.', '#e74c3c');
+            }
+        }, 300);
+    }
+
+    // =========================================================================
+    //  ENTRY POINT — route by host
+    // =========================================================================
+    if (location.hostname.indexOf('river-dub') !== -1) {
+        // river-dub tab: only run the auto-select (no Poirot panel here).
+        if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', riverDubAutoSelect);
+        else riverDubAutoSelect();
+    } else {
+        // Poirot tab: run the full automation panel.
+        if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
+        else init();
+    }
 
 })();
