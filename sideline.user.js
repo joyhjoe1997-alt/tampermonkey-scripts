@@ -5,8 +5,8 @@
 // @description  Automated tote processing for AFT Poirot V3 with multi-item price lookup
 // @match        https://aft-poirot-website-dub.dub.proxy.amazon.com/*
 // @icon         https://cdn-icons-png.flaticon.com/512/3687/3687412.png
-// @updateURL    https://github.com/joyhjoe1997-alt/tampermonkey-scripts/raw/main/sideline-6.0.user.js
-// @downloadURL  https://github.com/joyhjoe1997-alt/tampermonkey-scripts/raw/main/sideline-6.0.user.js
+// @updateURL    https://github.com/joyhjoe1997-alt/tampermonkey-scripts/raw/main/sideline.user.js
+// @downloadURL  https://github.com/joyhjoe1997-alt/tampermonkey-scripts/raw/main/sideline.user.js
 // @run-at       document-idle
 // @grant        GM_xmlhttpRequest
 // @connect      amazon.co.uk
@@ -81,7 +81,7 @@
 
     /** Current running version + where to check/download updates */
     const VERSION = '6.3';
-    const UPDATE_URL = 'https://github.com/joyhjoe1997-alt/tampermonkey-scripts/raw/main/sideline-6.0.user.js';
+    const UPDATE_URL = 'https://github.com/joyhjoe1997-alt/tampermonkey-scripts/raw/main/sideline.user.js';
 
     /** localStorage keys */
     const LS = {
@@ -177,6 +177,16 @@
 // =========================================================================
     //  UTILITIES
     // =========================================================================
+
+    /** Escapes a string for safe interpolation into innerHTML. */
+    function escapeHtml(s) {
+        return String(s ?? '')
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
+    }
 
     /** Sets a React-compatible input value and fires synthetic events */
     function setNativeValue(el, val) {
@@ -640,7 +650,7 @@
                     <div style="font-size:40px">&#9940;</div>
                     <div style="font-size:17px;font-weight:700;color:#e74c3c;margin:12px 0">Do Not Process</div>
                     <div style="font-size:14px;color:#2c3e50;line-height:1.6;margin-bottom:20px">
-                        Tote <b>${toteId}</b> is <b>${reason}</b><br>and should not be emptied.
+                        Tote <b>${escapeHtml(toteId)}</b> is <b>${escapeHtml(reason)}</b><br>and should not be emptied.
                     </div>
                     <div style="display:flex;gap:10px;justify-content:center">
                         <button id="pvt-skip-next" style="padding:10px 22px;border:none;border-radius:8px;font:600 13px Segoe UI;cursor:pointer;background:#f39c12;color:#fff">Skip to next</button>
@@ -663,7 +673,7 @@
                     <div style="font-size:40px">&#9940;</div>
                     <div style="font-size:17px;font-weight:700;color:#e74c3c;margin:12px 0">Cannot Process</div>
                     <div style="font-size:14px;color:#2c3e50;line-height:1.6;margin-bottom:16px">
-                        Tote <b>${toteId}</b> returned an error:
+                        Tote <b>${escapeHtml(toteId)}</b> returned an error:
                     </div>
                     <div style="font-size:13px;color:#c0392b;background:#fdf0ef;border:1px solid #f5c6cb;border-radius:8px;padding:12px;line-height:1.5;margin-bottom:20px;text-align:left">${safeMsg}</div>
                     <div style="display:flex;gap:10px;justify-content:center">
@@ -684,7 +694,7 @@
                     <div style="font-size:40px">&#9888;</div>
                     <div style="font-size:17px;font-weight:700;color:#c0392b;margin:12px 0">High Item Count</div>
                     <div style="font-size:14px;color:#2c3e50;line-height:1.6;margin-bottom:20px">
-                        Tote <b>${toteId}</b> has <b>${qty} items</b> (threshold: ${HIGH_QTY_THRESHOLD}).<br><br>Proceed with emptying?
+                        Tote <b>${escapeHtml(toteId)}</b> has <b>${qty} items</b> (threshold: ${HIGH_QTY_THRESHOLD}).<br><br>Proceed with emptying?
                     </div>
                     <div style="display:flex;gap:10px;justify-content:center">
                         <button id="pvt-hq-yes" style="padding:10px 22px;border:none;border-radius:8px;font:600 13px Segoe UI;cursor:pointer;background:#e74c3c;color:#fff">Yes, empty it</button>
@@ -708,11 +718,13 @@
                     : `<input type="text" class="pvt-asin-in" data-idx="${i}" placeholder="Paste ASIN" maxlength="10" style="font:700 10px monospace;width:85px;border:1.5px solid #ddd;border-radius:4px;padding:2px 4px;text-transform:uppercase">`;
             const num = hasPrice ? parseFloat(item.price.replace(/[^0-9.]/g, '')) : NaN;
             const lineTotal = isNaN(num) ? '-' : '\u00A3' + (num * item.qty).toFixed(2);
-            const id = `<a href="${FCR_BASE}/${getWarehouseId()}/results?s=${item.fnsku}" target="_blank" rel="noopener" style="color:#8e44ad;text-decoration:none" title="Open in FC Research">${item.fnsku}</a>` + (item.resolvedAsin ? ` <span style="color:#27ae60;font-size:15px">\u2192 <a href="${FCR_BASE}/${getWarehouseId()}/results?s=${item.resolvedAsin}" target="_blank" rel="noopener" style="color:#27ae60;text-decoration:none" title="Open in FC Research">${item.resolvedAsin}</a></span>` : '');
+            const fnskuEnc = encodeURIComponent(item.fnsku);
+            const fnskuTxt = escapeHtml(item.fnsku);
+            const id = `<a href="${FCR_BASE}/${getWarehouseId()}/results?s=${fnskuEnc}" target="_blank" rel="noopener" style="color:#8e44ad;text-decoration:none" title="Open in FC Research">${fnskuTxt}</a>` + (item.resolvedAsin ? ` <span style="color:#27ae60;font-size:15px">\u2192 <a href="${FCR_BASE}/${getWarehouseId()}/results?s=${encodeURIComponent(item.resolvedAsin)}" target="_blank" rel="noopener" style="color:#27ae60;text-decoration:none" title="Open in FC Research">${escapeHtml(item.resolvedAsin)}</a></span>` : '');
             const psCount = item.problemSolve?.totalQty || 0;
             const psEntries = item.problemSolve?.count || 0;
-            const psBadge = psCount > 0 ? `<span style="background:#e74c3c;color:#fff;font:700 15px Segoe UI;padding:2px 8px;border-radius:3px" title="${psEntries} Problem Solve entries, total qty: ${psCount}, last: ${item.problemSolve.lastDate}">${psCount} PS</span>` : '<span style="color:#ccc;font-size:15px">0</span>';
-            return `<tr><td style="font:600 16px monospace">${id}</td><td style="text-align:center;font-weight:700">${item.qty}</td><td style="white-space:nowrap" id="pvt-p-${i}">${priceHtml}</td><td style="white-space:nowrap;font-weight:600" id="pvt-lt-${i}">${lineTotal}</td><td style="text-align:center">${psBadge}</td><td style="font-size:16px;color:#666;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${(item.title || '').substring(0, 50)}</td></tr>`;
+            const psBadge = psCount > 0 ? `<span style="background:#e74c3c;color:#fff;font:700 15px Segoe UI;padding:2px 8px;border-radius:3px" title="${escapeHtml(psEntries)} Problem Solve entries, total qty: ${escapeHtml(psCount)}, last: ${escapeHtml(item.problemSolve.lastDate)}">${psCount} PS</span>` : '<span style="color:#ccc;font-size:15px">0</span>';
+            return `<tr><td style="font:600 16px monospace">${id}</td><td style="text-align:center;font-weight:700">${item.qty}</td><td style="white-space:nowrap" id="pvt-p-${i}">${priceHtml}</td><td style="white-space:nowrap;font-weight:600" id="pvt-lt-${i}">${lineTotal}</td><td style="text-align:center">${psBadge}</td><td style="font-size:16px;color:#666;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml((item.title || '').substring(0, 50))}</td></tr>`;
         }).join('');
 
         // Calculate grand total
@@ -726,7 +738,7 @@
                 ${highValue ? '<div id="pvt-hv-warn" style="background:#e74c3c;color:#fff;padding:12px 20px;font:700 19px Segoe UI;text-align:center;animation:pvt-blink 1s infinite">&#9888; HIGH VALUE TOTE - Grand Total exceeds \u00A31,000! Verify before proceeding.</div>' : ''}
                 <div style="padding:16px 20px;overflow-y:auto;flex:1">
                     <div style="display:flex;justify-content:space-between;font-size:18px;color:#555;margin-bottom:12px;padding-bottom:10px;border-bottom:1px solid #eee">
-                        <span><b>Tote:</b> <a href="${FCR_BASE}/${getWarehouseId()}/results?s=${toteId}" target="_blank" rel="noopener" style="color:#8e44ad;text-decoration:none;font-weight:700" title="Open in FC Research">${toteId}</a></span><span><b>Items:</b> ${items.length} rows, ${totalQty} units</span>
+                        <span><b>Tote:</b> <a href="${FCR_BASE}/${getWarehouseId()}/results?s=${encodeURIComponent(toteId)}" target="_blank" rel="noopener" style="color:#8e44ad;text-decoration:none;font-weight:700" title="Open in FC Research">${escapeHtml(toteId)}</a></span><span><b>Items:</b> ${items.length} rows, ${totalQty} units</span>
                     </div>
                     <table style="width:100%;border-collapse:collapse;font-size:17px">
                         <thead><tr style="background:#f4f6f8"><th style="padding:8px 10px;text-align:left;font-size:16px;text-transform:uppercase;border-bottom:2px solid #ddd">FNSKU/ASIN</th><th style="padding:8px;text-align:center;font-size:16px;text-transform:uppercase;border-bottom:2px solid #ddd">Qty</th><th style="padding:8px 10px;font-size:16px;text-transform:uppercase;border-bottom:2px solid #ddd">Price</th><th style="padding:8px 10px;font-size:16px;text-transform:uppercase;border-bottom:2px solid #ddd">Total</th><th style="padding:8px 10px;font-size:16px;text-transform:uppercase;border-bottom:2px solid #ddd;text-align:center">PS</th><th style="padding:8px 10px;font-size:16px;text-transform:uppercase;border-bottom:2px solid #ddd">Title</th></tr></thead>
@@ -1072,7 +1084,7 @@
         panel.style.cssText = 'position:fixed;top:80px;right:20px;z-index:999999;width:310px;background:#fff;border:2px solid #0b3948;border-radius:14px;box-shadow:0 8px 30px rgba(0,0,0,.22);font:13px Segoe UI,system-ui,sans-serif;color:#2c3e50;overflow:hidden';
         panel.innerHTML = `
             <div id="pvt-header" style="background:linear-gradient(135deg,#0b3948,#1abc9c);color:#fff;padding:12px 14px;display:flex;align-items:center;gap:8px;font:700 14px Segoe UI;cursor:move;user-select:none">
-                <span>Sideline v6.0</span>
+                <span>Sideline v${VERSION}</span>
                 <span id="pvt-collapse" style="margin-left:auto;cursor:pointer;font-size:18px;opacity:.8">-</span>
             </div>
             <div id="pvt-body" style="padding:12px 14px">
