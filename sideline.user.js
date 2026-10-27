@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Sideline - Multi-Tote Deletion Automation
 // @author       joyhjoe
-// @version      7.1
+// @version      7.2
 // @description  Automated tote processing for AFT Poirot V3 with multi-item price lookup
 // @match        https://aft-poirot-website-dub.dub.proxy.amazon.com/*
 // @match        https://river-dub.amazon.com/*
@@ -19,7 +19,7 @@
 // ==/UserScript==
 
 /**
- * SIDELINE v7.1 - AFT Poirot Tote Automation
+ * SIDELINE v7.2 - AFT Poirot Tote Automation
  *
  * Features:
  *   - Paste tote IDs, auto-processes them sequentially
@@ -94,7 +94,7 @@
     const FCR_BASE = 'https://qi-fcresearch-eu.corp.amazon.com';
 
     /** Current running version + where to check/download updates */
-    const VERSION = '7.1';
+    const VERSION = '7.2';
     const UPDATE_URL = 'https://github.com/joyhjoe1997-alt/tampermonkey-scripts/raw/main/sideline.user.js';
 
     // =========================================================================
@@ -359,6 +359,50 @@
             items.push({ fnsku, qty, title, isAsin: ASIN_RE.test(fnsku), price: null, resolvedAsin: null, fcPrice: null });
         }
         return items;
+    }
+
+    /**
+     * Reads items the instant they are fully parseable — event-driven, no fixed
+     * delay. Resolves as soon as readAllItems() returns `expected` rows (when the
+     * page's "Number of rows" is known), otherwise when a non-zero count holds
+     * steady for two consecutive ticks. Re-clicks "Load All Rows" if it reappears.
+     * Falls back to whatever was read once the items timeout elapses, so it never
+     * hangs. Runs on the background ticker so it isn't throttled in background tabs.
+     */
+    function readItemsWhenReady(expected) {
+        return new Promise(resolve => {
+            const start = Date.now();
+            let prevCount = -1;
+            let settled = false;
+            const finish = (id, items) => { clearBgInterval(id); resolve(items); };
+            const id = bgInterval(() => {
+                const clicked = clickLoadAllRows(); // no-op once expanded/absent
+                const items = readAllItems();
+                const n = items.length;
+                const loadAllGone = !findLoadAllRowsButton();
+
+                setStatus(
+                    `Loading items... ${n}${expected > 0 ? '/' + expected : ''} rows` +
+                    (clicked ? ' [Load All Rows]' : ''),
+                    '#8e44ad'
+                );
+
+                // Known target row count: resolve the moment we reach it.
+                if (expected > 0 && n >= expected && loadAllGone) { finish(id, items); return; }
+
+                // Unknown target: resolve once a non-zero count repeats (stable)
+                // across two ticks and nothing is still waiting to expand.
+                if (expected <= 0 && n > 0 && n === prevCount && loadAllGone) {
+                    if (settled) { finish(id, items); return; }
+                    settled = true;
+                } else {
+                    settled = false;
+                }
+                prevCount = n;
+
+                if (Date.now() - start > TIMING.itemsTimeout) { finish(id, items); }
+            });
+        });
     }
 
     // =========================================================================
@@ -1239,29 +1283,12 @@
                     }
                 }
 
-                // --- Step 6: Wait for items to render, then read them ---
+                // --- Step 6: Read items the moment they're ready (event-driven) ---
+                // readItemsWhenReady both waits and reads in one non-throttled
+                // loop: it clicks "Load All Rows" if present and resolves the
+                // instant the full row set is parseable — no fixed delays.
                 setStatus('Loading items...', '#8e44ad');
-                const waitInfo = await waitForItemsRendered();
-
-                // If we expanded a capped list, give the re-render a moment to
-                // settle, then re-read so we never parse a mid-render DOM.
-                if (waitInfo && waitInfo.loadAllClicked) {
-                    setStatus('Expanding all rows...', '#8e44ad');
-                    await bgSleep(700);
-                }
-
-                let items = readAllItems();
-
-                // If the page told us how many rows to expect and we read fewer,
-                // the list may still be settling — retry a couple of times before
-                // giving up, so we never proceed with a partial (missing) read.
-                const expectedRows = (waitInfo && waitInfo.expected) || getExpectedRowCount();
-                for (let tries = 0; expectedRows > 0 && items.length < expectedRows && tries < 6; tries++) {
-                    setStatus(`Re-reading rows ${items.length}/${expectedRows}...`, '#8e44ad');
-                    await bgSleep(400);
-                    clickLoadAllRows(); // in case the button reappeared
-                    items = readAllItems();
-                }
+                let items = await readItemsWhenReady(getExpectedRowCount());
 
                 // Fallback: text scan if alchemy-tags not found
                 if (!items.length) {
