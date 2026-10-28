@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Sideline - Multi-Tote Deletion Automation
 // @author       joyhjoe
-// @version      7.8
+// @version      7.9
 // @description  Automated tote processing for AFT Poirot V3 with multi-item price lookup
 // @match        https://aft-poirot-website-dub.dub.proxy.amazon.com/*
 // @match        https://river-dub.amazon.com/*
@@ -19,7 +19,7 @@
 // ==/UserScript==
 
 /**
- * SIDELINE v7.8 - AFT Poirot Tote Automation
+ * SIDELINE v7.9 - AFT Poirot Tote Automation
  *
  * Features:
  *   - Paste tote IDs, auto-processes them sequentially
@@ -90,13 +90,20 @@
     };
 
     const HIGH_QTY_THRESHOLD = 100;   // warn if total items exceed this
-    const BATCH_SIZE = 3;             // parallel Amazon price requests
+    // Parallelism is split by target because the two sources throttle very
+    // differently. FC Research is an internal endpoint that handles concurrent
+    // requests well, so Phase 1 runs a wider batch. Amazon.co.uk throttles
+    // public automated traffic aggressively, so Phase 2 stays conservative —
+    // going wider there just causes N/A retries, which is slower, not faster.
+    const FCR_BATCH_SIZE = 8;         // parallel FC Research requests (Phase 1)
+    const AMZN_BATCH_SIZE = 3;        // parallel Amazon price requests (Phase 2)
+    const BATCH_SIZE = AMZN_BATCH_SIZE; // back-compat alias (Amazon default)
     const ASIN_RE = /\bB[A-Z0-9]{9}\b/;
     const FNSKU_RE = /\bX[A-Z0-9]{9}\b/;
     const FCR_BASE = 'https://qi-fcresearch-eu.corp.amazon.com';
 
     /** Current running version + where to check/download updates */
-    const VERSION = '7.8';
+    const VERSION = '7.9';
     const UPDATE_URL = 'https://github.com/joyhjoe1997-alt/tampermonkey-scripts/raw/main/sideline.user.js';
 
     // =========================================================================
@@ -1369,8 +1376,8 @@
                         resolved++;
                         setStatus(`FC Research ${resolved}/${items.length}...`, '#8e44ad');
                     });
-                    for (let i = 0; i < fcrJobs.length; i += BATCH_SIZE) {
-                        await Promise.all(fcrJobs.slice(i, i + BATCH_SIZE).map(fn => fn()));
+                    for (let i = 0; i < fcrJobs.length; i += FCR_BATCH_SIZE) {
+                        await Promise.all(fcrJobs.slice(i, i + FCR_BATCH_SIZE).map(fn => fn()));
                     }
 
                     // Phase 2: Resolve each item's price + PS count in parallel.
@@ -1405,8 +1412,8 @@
                         done++;
                         setStatus(`Fetching prices: ${done}/${items.length}`, '#8e44ad');
                     });
-                    for (let i = 0; i < jobs.length; i += BATCH_SIZE) {
-                        await Promise.all(jobs.slice(i, i + BATCH_SIZE).map(fn => fn()));
+                    for (let i = 0; i < jobs.length; i += AMZN_BATCH_SIZE) {
+                        await Promise.all(jobs.slice(i, i + AMZN_BATCH_SIZE).map(fn => fn()));
                     }
                 }
 
