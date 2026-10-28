@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Sideline - Multi-Tote Deletion Automation
 // @author       joyhjoe
-// @version      7.9
+// @version      8.0
 // @description  Automated tote processing for AFT Poirot V3 with multi-item price lookup
 // @match        https://aft-poirot-website-dub.dub.proxy.amazon.com/*
 // @match        https://river-dub.amazon.com/*
@@ -19,7 +19,7 @@
 // ==/UserScript==
 
 /**
- * SIDELINE v7.9 - AFT Poirot Tote Automation
+ * SIDELINE v8.0 - AFT Poirot Tote Automation
  *
  * Features:
  *   - Paste tote IDs, auto-processes them sequentially
@@ -87,6 +87,7 @@
         yesTimeout:     12000, // max wait for Yes popup
         pageTimeout:    12000, // max wait for page transitions
         itemsTimeout:   60000, // max wait for items to render (60s for large totes)
+        fetchTimeout:   15000, // max wait for a single FCR/Amazon HTTP request
     };
 
     const HIGH_QTY_THRESHOLD = 100;   // warn if total items exceed this
@@ -103,7 +104,7 @@
     const FCR_BASE = 'https://qi-fcresearch-eu.corp.amazon.com';
 
     /** Current running version + where to check/download updates */
-    const VERSION = '7.9';
+    const VERSION = '8.0';
     const UPDATE_URL = 'https://github.com/joyhjoe1997-alt/tampermonkey-scripts/raw/main/sideline.user.js';
 
     // =========================================================================
@@ -395,10 +396,11 @@
                 const n = items.length;
                 const loadAllGone = !findLoadAllRowsButton();
 
-                setStatus(
-                    `Loading items... ${n}${expected > 0 ? '/' + expected : ''} rows` +
-                    (clicked ? ' [Load All Rows]' : ''),
-                    '#8e44ad'
+                setStatus('Reading tote items...', '#8e44ad');
+                setTaskProgress(
+                    clicked ? 'Loading items (expanding all rows)' : 'Loading items',
+                    n, expected > 0 ? expected : 0,
+                    expected > 0 ? `${n} of ${expected} rows rendered` : `${n} rows so far`
                 );
 
                 // Known target row count: resolve the moment we reach it.
@@ -433,6 +435,7 @@
         return new Promise(resolve => {
             GM_xmlhttpRequest({
                 method: 'GET', url,
+                timeout: TIMING.fetchTimeout,
                 headers: { 'Accept': 'text/html', 'Accept-Language': 'en-GB,en;q=0.9' },
                 onload(resp) {
                     try {
@@ -497,6 +500,7 @@
         return new Promise(resolve => {
             GM_xmlhttpRequest({
                 method: 'GET', url,
+                timeout: TIMING.fetchTimeout,
                 headers: { 'Accept': 'text/html', 'Accept-Language': 'en-GB,en;q=0.9' },
                 onload(resp) {
                     try {
@@ -565,6 +569,7 @@
         return new Promise(resolve => {
             GM_xmlhttpRequest({
                 method: 'GET', url,
+                timeout: TIMING.fetchTimeout,
                 headers: { 'Accept': 'text/html', 'Accept-Language': 'en-GB,en;q=0.9' },
                 onload(resp) {
                     try {
@@ -694,6 +699,7 @@
             GM_xmlhttpRequest({
                 method: 'GET',
                 url: `https://www.amazon.co.uk/gp/product/${encodeURIComponent(asin)}?th=1`,
+                timeout: TIMING.fetchTimeout,
                 headers: { 'Accept': 'text/html,application/xhtml+xml', 'Accept-Language': 'en-GB,en;q=0.9', 'Cache-Control': 'no-cache' },
                 onload(resp) {
                     let price = 'N/A';
@@ -1366,6 +1372,8 @@
                     // The FCR /results/product endpoint accepts an ASIN or an FNSKU
                     // as its search term, so the same call serves both cases.
                     let resolved = 0;
+                    setStatus('Looking up FC Research...', '#8e44ad');
+                    setTaskProgress('FC Research (ASIN + price)', 0, items.length, `0 of ${items.length} looked up`);
                     const fcrJobs = items.map(item => async () => {
                         // Search term is the scanned code (ASIN or FNSKU); FCR
                         // /results/product accepts either.
@@ -1374,7 +1382,7 @@
                         if (fcr?.title) item.title = item.title || fcr.title;
                         if (fcr?.fcPrice) item.fcPrice = fcr.fcPrice; // FC Research price for the fallback chain
                         resolved++;
-                        setStatus(`FC Research ${resolved}/${items.length}...`, '#8e44ad');
+                        setTaskProgress('FC Research (ASIN + price)', resolved, items.length, `Looked up ${item.fnsku}`);
                     });
                     for (let i = 0; i < fcrJobs.length; i += FCR_BATCH_SIZE) {
                         await Promise.all(fcrJobs.slice(i, i + FCR_BATCH_SIZE).map(fn => fn()));
@@ -1410,11 +1418,19 @@
                         item.problemSolve = await psPromise;
 
                         done++;
-                        setStatus(`Fetching prices: ${done}/${items.length}`, '#8e44ad');
+                        const code = item.resolvedAsin || item.fnsku;
+                        setTaskProgress(
+                            'Finalising prices',
+                            done, items.length,
+                            `${code}: ${item.price}${source ? ' (' + source + ')' : ''}`
+                        );
                     });
+                    setStatus('Fetching prices...', '#8e44ad');
+                    setTaskProgress('Finalising prices', 0, items.length, `0 of ${items.length} priced`);
                     for (let i = 0; i < jobs.length; i += AMZN_BATCH_SIZE) {
                         await Promise.all(jobs.slice(i, i + AMZN_BATCH_SIZE).map(fn => fn()));
                     }
+                    hideTaskProgress(); // phases done; dialog is about to show
                 }
 
                 // --- Step 8: Show confirmation dialog ---
@@ -1443,10 +1459,12 @@
             saveState();
             renderList();
             setStatus('Returning to scan page...', '#3498db');
+            hideTaskProgress();
             await waitFor(SEL.scanInput, TIMING.pageTimeout);
         }
 
         // --- Finished ---
+        hideTaskProgress();
         if (autoRunning && currentIdx >= toteList.length) {
             setStatus(`Done! All ${toteList.length} totes processed.`, '#27ae60');
             clearState();
@@ -1463,6 +1481,39 @@
     function setStatus(msg, color = '#7f8c8d') {
         const el = document.getElementById('pvt-status');
         if (el) { el.textContent = msg; el.style.color = color; }
+    }
+
+    /**
+     * Shows the detailed per-task progress bar: a phase label, a done/total
+     * counter, a fill proportional to done/total, and an optional sub-line
+     * (e.g. the current item code). Call hideTaskProgress() when the phase ends.
+     *   label: phase name ("Loading items", "FC Research", "Fetching prices")
+     *   done, total: progress counts (total 0 => indeterminate, shows a pulse)
+     *   sub: optional detail line under the bar
+     */
+    function setTaskProgress(label, done, total, sub = '') {
+        const box = document.getElementById('pvt-task');
+        if (!box) return;
+        box.style.display = '';
+        const lbl = document.getElementById('pvt-task-label');
+        const cnt = document.getElementById('pvt-task-count');
+        const fill = document.getElementById('pvt-task-fill');
+        const subEl = document.getElementById('pvt-task-sub');
+        if (lbl) lbl.textContent = label;
+        if (cnt) cnt.textContent = total > 0 ? `${done}/${total}` : '';
+        if (fill) {
+            const pct = total > 0 ? Math.round(Math.min(done, total) / total * 100) : 100;
+            fill.style.width = pct + '%';
+            // Dim the bar while indeterminate (total unknown) so it reads as "busy".
+            fill.style.opacity = total > 0 ? '1' : '.5';
+        }
+        if (subEl) subEl.textContent = sub || '';
+    }
+
+    /** Hides the per-task progress bar (phase complete or automation idle). */
+    function hideTaskProgress() {
+        const box = document.getElementById('pvt-task');
+        if (box) box.style.display = 'none';
     }
 
     function renderList() {
@@ -1522,6 +1573,7 @@
         ls.set(LS.list, '');
         clearState();
         renderList();
+        hideTaskProgress();
         setStatus('Cleared', '#7f8c8d');
         document.getElementById('pvt-btn-auto').style.display = '';
         document.getElementById('pvt-btn-stop').style.display = 'none';
@@ -1567,6 +1619,14 @@
                 </div>
                 <div id="pvt-list-wrap" style="max-height:190px;overflow-y:auto;border:1px solid #eee;border-radius:8px"></div>
                 <div id="pvt-status" style="margin-top:8px;padding:6px 10px;border-radius:7px;font:600 11px Segoe UI;text-align:center;background:#f8f9fa;color:#7f8c8d;min-height:28px;display:flex;align-items:center;justify-content:center">Ready</div>
+                <!-- Per-task progress (item load / FC Research / prices). Hidden when idle. -->
+                <div id="pvt-task" style="display:none;margin-top:8px">
+                    <div style="display:flex;justify-content:space-between;align-items:center;font:600 10px Segoe UI;color:#7f8c8d;margin-bottom:3px">
+                        <span id="pvt-task-label">Working...</span><span id="pvt-task-count"></span>
+                    </div>
+                    <div style="height:8px;background:#eceff1;border-radius:4px;overflow:hidden"><div id="pvt-task-fill" style="height:100%;width:0%;background:linear-gradient(90deg,#8e44ad,#1abc9c);border-radius:4px;transition:width .2s"></div></div>
+                    <div id="pvt-task-sub" style="font:500 9px Segoe UI;color:#b0b6bb;margin-top:3px;text-align:center;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"></div>
+                </div>
                 <div style="height:5px;background:#e0e0e0;border-radius:3px;overflow:hidden;margin-top:6px"><div id="pvt-prog-fill" style="height:100%;background:linear-gradient(90deg,#2ecc71,#1abc9c);width:0%;transition:width .35s;border-radius:3px"></div></div>
             </div>`;
         document.body.appendChild(panel);
@@ -1703,7 +1763,7 @@
         document.getElementById('pvt-btn-clear').onclick = clearAll;
         document.getElementById('pvt-btn-auto').onclick = () => { if (!autoRunning) autoRun(); };
         document.getElementById('pvt-btn-stop').onclick = () => {
-            autoRunning = false; clearState(); setStatus('Stopped', '#e74c3c');
+            autoRunning = false; clearState(); hideTaskProgress(); setStatus('Stopped', '#e74c3c');
             document.getElementById('pvt-btn-auto').style.display = '';
             document.getElementById('pvt-btn-stop').style.display = 'none';
         };
