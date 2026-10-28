@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Sideline - Multi-Tote Deletion Automation
 // @author       joyhjoe
-// @version      8.2
+// @version      8.3
 // @description  Automated tote processing for AFT Poirot V3 with multi-item price lookup
 // @match        https://aft-poirot-website-dub.dub.proxy.amazon.com/*
 // @match        https://river-dub.amazon.com/*
@@ -19,7 +19,7 @@
 // ==/UserScript==
 
 /**
- * SIDELINE v8.2 - AFT Poirot Tote Automation
+ * SIDELINE v8.3 - AFT Poirot Tote Automation
  *
  * Features:
  *   - Paste tote IDs, auto-processes them sequentially
@@ -104,7 +104,7 @@
     const FCR_BASE = 'https://qi-fcresearch-eu.corp.amazon.com';
 
     /** Current running version + where to check/download updates */
-    const VERSION = '8.2';
+    const VERSION = '8.3';
     const UPDATE_URL = 'https://github.com/joyhjoe1997-alt/tampermonkey-scripts/raw/main/sideline.user.js';
 
     // =========================================================================
@@ -350,13 +350,22 @@
             const container = qtyTag.parentElement;
             if (!container || qty === 0) continue;
 
-            // Find FNSKU in sibling alchemy-tags
-            let fnsku = null;
+            // Identify the item. Prefer FNSKU, then FCSKU, then LPN — some rows
+            // (e.g. a customer-damaged return) have NO FNSKU tag, only an LPN +
+            // FCSKU. Skipping those lost a row (the "21/22" short read). FC
+            // Research's /results/product accepts an FNSKU, FCSKU, or LPN as its
+            // search term, so any of them lets us resolve the ASIN and price.
+            let fnsku = null, fcsku = null, lpn = null;
             for (const tag of container.querySelectorAll('alchemy-tag')) {
-                const match = getText(tag).match(/^FNSKU:\s*([A-Z0-9]{6,14})$/);
-                if (match) { fnsku = match[1]; break; }
+                const txt = getText(tag);
+                let m;
+                if (!fnsku && (m = txt.match(/^FNSKU:\s*([A-Z0-9]{6,14})$/))) fnsku = m[1];
+                else if (!fcsku && (m = txt.match(/^FCSKU:\s*([A-Z0-9]{6,14})$/))) fcsku = m[1];
+                else if (!lpn && (m = txt.match(/^LPN:\s*([A-Z0-9]{6,20})$/))) lpn = m[1];
             }
-            if (!fnsku) continue;
+            const code = fnsku || fcsku || lpn;
+            if (!code) continue; // truly nothing to identify this row — skip
+            fnsku = code; // downstream treats `fnsku` as the search term
 
             // Find product title in parent column layout
             let title = '';
