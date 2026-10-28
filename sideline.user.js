@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Sideline - Multi-Tote Deletion Automation
 // @author       joyhjoe
-// @version      7.5
+// @version      7.6
 // @description  Automated tote processing for AFT Poirot V3 with multi-item price lookup
 // @match        https://aft-poirot-website-dub.dub.proxy.amazon.com/*
 // @match        https://river-dub.amazon.com/*
@@ -19,7 +19,7 @@
 // ==/UserScript==
 
 /**
- * SIDELINE v7.5 - AFT Poirot Tote Automation
+ * SIDELINE v7.6 - AFT Poirot Tote Automation
  *
  * Features:
  *   - Paste tote IDs, auto-processes them sequentially
@@ -96,7 +96,7 @@
     const FCR_BASE = 'https://qi-fcresearch-eu.corp.amazon.com';
 
     /** Current running version + where to check/download updates */
-    const VERSION = '7.5';
+    const VERSION = '7.6';
     const UPDATE_URL = 'https://github.com/joyhjoe1997-alt/tampermonkey-scripts/raw/main/sideline.user.js';
 
     // =========================================================================
@@ -1032,8 +1032,14 @@
             // No usable price (NIL from the FCR->Amazon chain) -> show the
             // "Paste ASIN" box so it can still be corrected manually, with a
             // red "NIL" hint beside it.
-            const srcTag = (item.priceSource === 'FCR' || item.priceSource === 'Amazon')
-                ? `<span style="color:#95a5a6;font-size:11px;margin-left:5px">${item.priceSource}</span>` : '';
+            // Source tag. When the price came from Amazon (FCR fell back), also
+            // show what FCR returned so it's visible why FCR wasn't used.
+            let srcTag = '';
+            if (item.priceSource === 'FCR') {
+                srcTag = `<span style="color:#95a5a6;font-size:11px;margin-left:5px">FCR</span>`;
+            } else if (item.priceSource === 'Amazon') {
+                srcTag = `<span style="color:#95a5a6;font-size:11px;margin-left:5px" title="FC Research price: ${escapeHtml(item.fcPriceRaw || '(none)')}">Amazon</span>`;
+            }
             const priceHtml = hasPrice
                 ? `<span style="color:#27ae60;font-weight:700">${escapeHtml(item.price)}</span>${srcTag}`
                 : `<span style="color:#e74c3c;font-weight:700;margin-right:6px">NIL</span><input type="text" class="pvt-asin-in" data-idx="${i}" placeholder="Paste ASIN" maxlength="10" style="font:700 10px monospace;width:85px;border:1.5px solid #ddd;border-radius:4px;padding:2px 4px;text-transform:uppercase">`;
@@ -1357,6 +1363,9 @@
                         // 1) FC Research price (already fetched during Phase 1).
                         let price = isValidPrice(item.fcPrice) ? item.fcPrice : null;
                         let source = price ? 'FCR' : '';
+                        // Diagnostic: record what FCR actually returned so we can
+                        // see WHY it fell back (e.g. fcPrice was 'N/A'/empty).
+                        item.fcPriceRaw = item.fcPrice ?? '(none)';
 
                         // 2) Fall back to the live Amazon price when FCR had none.
                         if (!price && asin) {
