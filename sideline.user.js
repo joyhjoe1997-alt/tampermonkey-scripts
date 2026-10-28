@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Sideline - Multi-Tote Deletion Automation
 // @author       joyhjoe
-// @version      7.7
+// @version      7.8
 // @description  Automated tote processing for AFT Poirot V3 with multi-item price lookup
 // @match        https://aft-poirot-website-dub.dub.proxy.amazon.com/*
 // @match        https://river-dub.amazon.com/*
@@ -19,7 +19,7 @@
 // ==/UserScript==
 
 /**
- * SIDELINE v7.7 - AFT Poirot Tote Automation
+ * SIDELINE v7.8 - AFT Poirot Tote Automation
  *
  * Features:
  *   - Paste tote IDs, auto-processes them sequentially
@@ -96,7 +96,7 @@
     const FCR_BASE = 'https://qi-fcresearch-eu.corp.amazon.com';
 
     /** Current running version + where to check/download updates */
-    const VERSION = '7.7';
+    const VERSION = '7.8';
     const UPDATE_URL = 'https://github.com/joyhjoe1997-alt/tampermonkey-scripts/raw/main/sideline.user.js';
 
     // =========================================================================
@@ -1347,22 +1347,30 @@
                     fnskus.forEach(f => items.push({ fnsku: f, qty: 1, title: '', isAsin: false, price: null, resolvedAsin: null, fcPrice: null }));
                 }
 
-                // --- Step 7: Resolve FNSKUs, fetch prices + PS count in parallel ---
+                // --- Step 7: FC Research (ASIN + price) then Amazon, in parallel ---
                 if (items.length) {
-                    // Phase 1: Resolve X0 FNSKUs via FC Research in parallel batches.
-                    // (Previously sequential — one request at a time — which was the
-                    // biggest delay on large totes. BATCH_SIZE keeps FCR load sane.)
-                    const toResolve = items.filter(i => !i.isAsin);
+                    // Phase 1: Query FC Research for EVERY item in parallel batches.
+                    //   - FNSKU items (isAsin=false): resolves the ASIN AND gets the
+                    //     FC Research List Price.
+                    //   - ASIN items (isAsin=true): no resolve needed, but we STILL
+                    //     query FCR to get its List Price, so the price chain is
+                    //     FC Research first for all items (ASINs no longer skip FCR
+                    //     straight to Amazon — that was the "Amazon first" cause).
+                    // The FCR /results/product endpoint accepts an ASIN or an FNSKU
+                    // as its search term, so the same call serves both cases.
                     let resolved = 0;
-                    const resolveJobs = toResolve.map(item => async () => {
+                    const fcrJobs = items.map(item => async () => {
+                        // Search term is the scanned code (ASIN or FNSKU); FCR
+                        // /results/product accepts either.
                         const fcr = await fetchFCResearch(item.fnsku);
-                        if (fcr?.asin) { item.resolvedAsin = fcr.asin; item.title = item.title || fcr.title; }
-                        if (fcr?.fcPrice) item.fcPrice = fcr.fcPrice; // keep the FC Research price for the fallback chain
+                        if (fcr?.asin && !item.isAsin) { item.resolvedAsin = fcr.asin; }
+                        if (fcr?.title) item.title = item.title || fcr.title;
+                        if (fcr?.fcPrice) item.fcPrice = fcr.fcPrice; // FC Research price for the fallback chain
                         resolved++;
-                        setStatus(`Resolving FNSKUs ${resolved}/${toResolve.length}...`, '#8e44ad');
+                        setStatus(`FC Research ${resolved}/${items.length}...`, '#8e44ad');
                     });
-                    for (let i = 0; i < resolveJobs.length; i += BATCH_SIZE) {
-                        await Promise.all(resolveJobs.slice(i, i + BATCH_SIZE).map(fn => fn()));
+                    for (let i = 0; i < fcrJobs.length; i += BATCH_SIZE) {
+                        await Promise.all(fcrJobs.slice(i, i + BATCH_SIZE).map(fn => fn()));
                     }
 
                     // Phase 2: Resolve each item's price + PS count in parallel.
