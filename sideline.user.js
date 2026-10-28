@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Sideline - Multi-Tote Deletion Automation
 // @author       joyhjoe
-// @version      8.1
+// @version      8.2
 // @description  Automated tote processing for AFT Poirot V3 with multi-item price lookup
 // @match        https://aft-poirot-website-dub.dub.proxy.amazon.com/*
 // @match        https://river-dub.amazon.com/*
@@ -19,7 +19,7 @@
 // ==/UserScript==
 
 /**
- * SIDELINE v8.1 - AFT Poirot Tote Automation
+ * SIDELINE v8.2 - AFT Poirot Tote Automation
  *
  * Features:
  *   - Paste tote IDs, auto-processes them sequentially
@@ -104,7 +104,7 @@
     const FCR_BASE = 'https://qi-fcresearch-eu.corp.amazon.com';
 
     /** Current running version + where to check/download updates */
-    const VERSION = '8.1';
+    const VERSION = '8.2';
     const UPDATE_URL = 'https://github.com/joyhjoe1997-alt/tampermonkey-scripts/raw/main/sideline.user.js';
 
     // =========================================================================
@@ -395,9 +395,12 @@
             // an exact match would hang until the long itemsTimeout. 2.5s of no
             // change means the DOM has finished rendering whatever it will render.
             const STABLE_MS = 2500;
+            log(`Item read start (expected rows: ${expected > 0 ? expected : 'unknown'})`);
             const finish = (id, items) => { clearBgInterval(id); hideTaskProgress(); resolve(items); };
+            let loggedClick = false;
             const id = bgInterval(() => {
                 const clicked = clickLoadAllRows(); // no-op once expanded/absent
+                if (clicked && !loggedClick) { loggedClick = true; log('Clicked "Load All Rows"'); }
                 const items = readAllItems();
                 const n = items.length;
                 const loadAllGone = !findLoadAllRowsButton();
@@ -428,6 +431,9 @@
                 if (stableSince && loadAllGone && (Date.now() - stableSince) >= STABLE_MS) {
                     if (expected > 0 && n < expected) {
                         setStatus(`Read ${n} of ${expected} rows (1 not parseable) - continuing`, '#f39c12');
+                        log(`Item read settled SHORT: ${n}/${expected} rows after ${elapsed}s`, 'warn');
+                    } else {
+                        log(`Item read complete: ${n} rows (stable ${STABLE_MS}ms)`);
                     }
                     finish(id, items); return;
                 }
@@ -437,6 +443,7 @@
                     if (expected > 0 && n < expected) {
                         setStatus(`Timed out reading rows (${n}/${expected}) - continuing`, '#f39c12');
                     }
+                    log(`Item read TIMEOUT at ${n}/${expected > 0 ? expected : '?'} after ${elapsed}s`, 'error');
                     finish(id, items);
                 }
             });
@@ -758,6 +765,7 @@
 
                     // Auto-retry once on failure (handles transient throttling)
                     if (price === 'N/A' && retry < 1) {
+                        log(`  Amazon ${asin} N/A - retrying once`, 'warn');
                         setTimeout(() => fetchAmazonPrice(asin, 1).then(resolve), 1000);
                         return;
                     }
@@ -770,8 +778,8 @@
                     }
                     resolve(price);
                 },
-                onerror() { resolve('Error'); },
-                ontimeout() { resolve('Timeout'); },
+                onerror() { log(`  Amazon ${asin} request error`, 'warn'); resolve('Error'); },
+                ontimeout() { log(`  Amazon ${asin} TIMEOUT (${TIMING.fetchTimeout}ms)`, 'error'); resolve('Timeout'); },
             });
         });
     }
@@ -1275,6 +1283,7 @@
             const toteId = toteList[currentIdx];
             const idx = currentIdx;
             const lower = toteId.toLowerCase();
+            log(`=== Tote ${idx + 1}/${toteList.length}: ${toteId} ===`);
 
             // --- Guard: skip vt/pa/numeric totes (virtual, pallet, shipment IDs) ---
             if (lower.startsWith('vt') || lower.startsWith('pa') || /^\d+$/.test(toteId)) {
@@ -1396,6 +1405,7 @@
                     let resolved = 0;
                     setStatus('Looking up FC Research...', '#8e44ad');
                     setTaskProgress('FC Research (ASIN + price)', 0, items.length, `0 of ${items.length} looked up`);
+                    log(`FC Research phase: ${items.length} items, batch ${FCR_BATCH_SIZE}`);
                     const fcrJobs = items.map(item => async () => {
                         // Search term is the scanned code (ASIN or FNSKU); FCR
                         // /results/product accepts either.
@@ -1404,6 +1414,8 @@
                         if (fcr?.title) item.title = item.title || fcr.title;
                         if (fcr?.fcPrice) item.fcPrice = fcr.fcPrice; // FC Research price for the fallback chain
                         resolved++;
+                        log(`  FCR ${item.fnsku} -> asin=${fcr?.asin || '-'} price=${fcr?.fcPrice || '-'}`,
+                            (fcr?.fcPrice === 'Timeout' || fcr?.fcPrice === 'Error') ? 'warn' : 'info');
                         setTaskProgress('FC Research (ASIN + price)', resolved, items.length, `Looked up ${item.fnsku}`);
                     });
                     for (let i = 0; i < fcrJobs.length; i += FCR_BATCH_SIZE) {
@@ -1441,6 +1453,8 @@
 
                         done++;
                         const code = item.resolvedAsin || item.fnsku;
+                        log(`  price ${code} = ${item.price} via ${item.priceSource}`,
+                            item.price === 'NIL' ? 'warn' : 'info');
                         setTaskProgress(
                             'Finalising prices',
                             done, items.length,
@@ -1449,14 +1463,17 @@
                     });
                     setStatus('Fetching prices...', '#8e44ad');
                     setTaskProgress('Finalising prices', 0, items.length, `0 of ${items.length} priced`);
+                    log(`Price phase: ${items.length} items, Amazon batch ${AMZN_BATCH_SIZE}`);
                     for (let i = 0; i < jobs.length; i += AMZN_BATCH_SIZE) {
                         await Promise.all(jobs.slice(i, i + AMZN_BATCH_SIZE).map(fn => fn()));
                     }
                     hideTaskProgress(); // phases done; dialog is about to show
+                    log(`Prices done. Showing dialog for ${items.length} items.`);
                 }
 
                 // --- Step 8: Show confirmation dialog ---
                 const decision = await confirmChangeContainer(toteId, idx + 1, toteList.length, items, qty);
+                log(`Dialog decision: ${decision}`);
 
                 if (decision === 'skip') {
                     currentIdx++;
@@ -1503,6 +1520,66 @@
     function setStatus(msg, color = '#7f8c8d') {
         const el = document.getElementById('pvt-status');
         if (el) { el.textContent = msg; el.style.color = color; }
+    }
+
+    // =========================================================================
+    //  DIAGNOSTIC LOG - timestamped trace of what the automation is doing
+    // =========================================================================
+    const LOG_MAX = 400;          // keep the last N entries (memory + panel cap)
+    const logBuffer = [];
+    const t0 = Date.now();
+
+    /**
+     * Appends a timestamped line to the diagnostic log: console + in-panel view.
+     * level is one of 'info' | 'warn' | 'error' and tints the panel line.
+     * Use this liberally at phase boundaries and on failures so a stuck run
+     * leaves a trail showing exactly where it stopped.
+     */
+    function log(msg, level = 'info') {
+        const ts = ((Date.now() - t0) / 1000).toFixed(1).padStart(6, ' ');
+        const line = `[${ts}s] ${msg}`;
+        logBuffer.push({ line, level });
+        if (logBuffer.length > LOG_MAX) logBuffer.shift();
+        // Console (prefixed so it's filterable in DevTools).
+        const c = level === 'error' ? console.error : level === 'warn' ? console.warn : console.log;
+        try { c('[Sideline]', line); } catch { }
+        // In-panel view (only re-render when it's open, to stay cheap).
+        const pre = document.getElementById('pvt-log');
+        if (pre && pre.style.display !== 'none') renderLog();
+    }
+
+    /** Renders the log buffer into the panel's <pre>, colour-coded by level. */
+    function renderLog() {
+        const pre = document.getElementById('pvt-log');
+        if (!pre) return;
+        const color = l => l === 'error' ? '#ff8a80' : l === 'warn' ? '#ffd27f' : '#9fe8d4';
+        pre.innerHTML = logBuffer
+            .map(e => `<span style="color:${color(e.level)}">${escapeHtml(e.line)}</span>`)
+            .join('\n');
+        pre.scrollTop = pre.scrollHeight; // auto-scroll to newest
+    }
+
+    /** Wires the Log toggle / Copy / Clear controls. Called once from init. */
+    function wireLogControls() {
+        const toggle = document.getElementById('pvt-log-toggle');
+        const pre = document.getElementById('pvt-log');
+        const copy = document.getElementById('pvt-log-copy');
+        const clear = document.getElementById('pvt-log-clear');
+        if (!toggle || !pre) return;
+        toggle.onclick = () => {
+            const open = pre.style.display === 'none';
+            pre.style.display = open ? '' : 'none';
+            toggle.textContent = (open ? '\u25BE' : '\u25B8') + ' Log';
+            if (copy) copy.style.display = open ? '' : 'none';
+            if (clear) clear.style.display = open ? '' : 'none';
+            if (open) renderLog();
+        };
+        if (copy) copy.onclick = async () => {
+            const text = logBuffer.map(e => e.line).join('\n');
+            try { await navigator.clipboard.writeText(text); copy.textContent = 'Copied'; setTimeout(() => copy.textContent = 'Copy', 1200); }
+            catch { copy.textContent = 'Copy failed'; setTimeout(() => copy.textContent = 'Copy', 1200); }
+        };
+        if (clear) clear.onclick = () => { logBuffer.length = 0; renderLog(); };
     }
 
     /**
@@ -1650,6 +1727,14 @@
                     <div id="pvt-task-sub" style="font:500 9px Segoe UI;color:#b0b6bb;margin-top:3px;text-align:center;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"></div>
                 </div>
                 <div style="height:5px;background:#e0e0e0;border-radius:3px;overflow:hidden;margin-top:6px"><div id="pvt-prog-fill" style="height:100%;background:linear-gradient(90deg,#2ecc71,#1abc9c);width:0%;transition:width .35s;border-radius:3px"></div></div>
+                <!-- Diagnostic log (collapsed by default). Toggle to see a timestamped trace. -->
+                <div style="display:flex;align-items:center;gap:6px;margin-top:8px;font:600 10px Segoe UI;color:#95a5a6">
+                    <span id="pvt-log-toggle" style="cursor:pointer;user-select:none">\u25B8 Log</span>
+                    <span style="flex:1"></span>
+                    <span id="pvt-log-copy" title="Copy log" style="cursor:pointer;display:none">Copy</span>
+                    <span id="pvt-log-clear" title="Clear log" style="cursor:pointer;display:none">Clear</span>
+                </div>
+                <pre id="pvt-log" style="display:none;margin:4px 0 0;max-height:150px;overflow:auto;background:#0b1e26;color:#9fe8d4;border-radius:6px;padding:6px 8px;font:500 9.5px/1.45 Consolas,monospace;white-space:pre-wrap;word-break:break-word"></pre>
             </div>`;
         document.body.appendChild(panel);
 
@@ -1752,6 +1837,8 @@
     function init() {
         if (document.getElementById('pvt-panel')) return;
         buildPanel();
+        wireLogControls();
+        log(`Sideline v${VERSION} ready on ${getWarehouseId()} (${location.hostname})`);
 
         // Check GitHub for a newer version (non-blocking)
         checkForUpdate();
