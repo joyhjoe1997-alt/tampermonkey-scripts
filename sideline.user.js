@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Sideline - Multi-Tote Deletion Automation
 // @author       joyhjoe
-// @version      8.3
+// @version      8.4
 // @description  Automated tote processing for AFT Poirot V3 with multi-item price lookup
 // @match        https://aft-poirot-website-dub.dub.proxy.amazon.com/*
 // @match        https://river-dub.amazon.com/*
@@ -19,7 +19,7 @@
 // ==/UserScript==
 
 /**
- * SIDELINE v8.3 - AFT Poirot Tote Automation
+ * SIDELINE v8.4 - AFT Poirot Tote Automation
  *
  * Features:
  *   - Paste tote IDs, auto-processes them sequentially
@@ -104,7 +104,7 @@
     const FCR_BASE = 'https://qi-fcresearch-eu.corp.amazon.com';
 
     /** Current running version + where to check/download updates */
-    const VERSION = '8.3';
+    const VERSION = '8.4';
     const UPDATE_URL = 'https://github.com/joyhjoe1997-alt/tampermonkey-scripts/raw/main/sideline.user.js';
 
     // =========================================================================
@@ -239,11 +239,14 @@
     //  UTILITIES
     // =========================================================================
 
-    /** True when a price string is a real, usable price (contains a number and
-     *  is not one of our failure sentinels). Used for the FC Research -> Amazon
-     *  -> NIL fallback chain. */
+    /** True when a price string is a real, usable price: not a failure sentinel,
+     *  contains a number, AND that number is greater than zero. A £0.00 (or 0)
+     *  value is treated as NOT usable so the FC Research -> Amazon -> NIL chain
+     *  falls through to Amazon rather than accepting a bogus zero. */
     function isValidPrice(p) {
-        return !!p && !['N/A', 'NIL', 'Error', 'Timeout'].includes(p) && /\d/.test(p);
+        if (!p || ['N/A', 'NIL', 'Error', 'Timeout'].includes(p)) return false;
+        const n = parseFloat(String(p).replace(/[^0-9.]/g, ''));
+        return !isNaN(n) && n > 0;
     }
 
     /** Escapes a string for safe interpolation into innerHTML. */
