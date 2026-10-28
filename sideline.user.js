@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Sideline - Multi-Tote Deletion Automation
 // @author       joyhjoe
-// @version      7.4
+// @version      7.5
 // @description  Automated tote processing for AFT Poirot V3 with multi-item price lookup
 // @match        https://aft-poirot-website-dub.dub.proxy.amazon.com/*
 // @match        https://river-dub.amazon.com/*
@@ -19,7 +19,7 @@
 // ==/UserScript==
 
 /**
- * SIDELINE v7.4 - AFT Poirot Tote Automation
+ * SIDELINE v7.5 - AFT Poirot Tote Automation
  *
  * Features:
  *   - Paste tote IDs, auto-processes them sequentially
@@ -34,7 +34,9 @@
  *     auto-clicking "Load All Rows" first so capped lists (e.g. 25 of 27)
  *     fully expand before reading — otherwise rows are missed downstream
  *   - Resolves X0 FNSKUs to ASINs via FC Research /results/product API
- *   - Fetches live Amazon.co.uk prices (parallel batches of 3)
+ *   - Prices use a fallback chain: FC Research "List Price" first, then the
+ *     live Amazon.co.uk price, and "NIL" if neither returns a usable value
+ *     (parallel batches of 3; source shown per row)
  *   - Shows confirmation dialog with item table, prices, and grand total
  *   - Skips vt/pa/numeric totes with warning
  *   - High quantity (>100) warning before emptying
@@ -94,7 +96,7 @@
     const FCR_BASE = 'https://qi-fcresearch-eu.corp.amazon.com';
 
     /** Current running version + where to check/download updates */
-    const VERSION = '7.4';
+    const VERSION = '7.5';
     const UPDATE_URL = 'https://github.com/joyhjoe1997-alt/tampermonkey-scripts/raw/main/sideline.user.js';
 
     // =========================================================================
@@ -228,6 +230,13 @@
     // =========================================================================
     //  UTILITIES
     // =========================================================================
+
+    /** True when a price string is a real, usable price (contains a number and
+     *  is not one of our failure sentinels). Used for the FC Research -> Amazon
+     *  -> NIL fallback chain. */
+    function isValidPrice(p) {
+        return !!p && !['N/A', 'NIL', 'Error', 'Timeout'].includes(p) && /\d/.test(p);
+    }
 
     /** Escapes a string for safe interpolation into innerHTML. */
     function escapeHtml(s) {
@@ -1018,12 +1027,16 @@
     function confirmChangeContainer(toteId, toteNum, total, items, totalQty) {
         // Build table rows
         const rows = items.map((item, i) => {
-            const hasPrice = item.price && !['N/A', 'Error', 'Timeout'].includes(item.price);
+            const hasPrice = isValidPrice(item.price);
+            // Valid price -> green, with a small FCR/Amazon source tag.
+            // No usable price (NIL from the FCR->Amazon chain) -> show the
+            // "Paste ASIN" box so it can still be corrected manually, with a
+            // red "NIL" hint beside it.
+            const srcTag = (item.priceSource === 'FCR' || item.priceSource === 'Amazon')
+                ? `<span style="color:#95a5a6;font-size:11px;margin-left:5px">${item.priceSource}</span>` : '';
             const priceHtml = hasPrice
-                ? `<span style="color:#27ae60;font-weight:700">${item.price}</span>`
-                : item.price !== null
-                    ? `<span style="color:#e74c3c">${item.price || 'N/A'}</span>`
-                    : `<input type="text" class="pvt-asin-in" data-idx="${i}" placeholder="Paste ASIN" maxlength="10" style="font:700 10px monospace;width:85px;border:1.5px solid #ddd;border-radius:4px;padding:2px 4px;text-transform:uppercase">`;
+                ? `<span style="color:#27ae60;font-weight:700">${escapeHtml(item.price)}</span>${srcTag}`
+                : `<span style="color:#e74c3c;font-weight:700;margin-right:6px">NIL</span><input type="text" class="pvt-asin-in" data-idx="${i}" placeholder="Paste ASIN" maxlength="10" style="font:700 10px monospace;width:85px;border:1.5px solid #ddd;border-radius:4px;padding:2px 4px;text-transform:uppercase">`;
             const num = hasPrice ? parseFloat(item.price.replace(/[^0-9.]/g, '')) : NaN;
             const lineTotal = isNaN(num) ? '-' : '\u00A3' + (num * item.qty).toFixed(2);
             const fnskuEnc = encodeURIComponent(item.fnsku);
@@ -1053,7 +1066,7 @@
                         <tbody>${rows}</tbody>
                         <tfoot><tr><td colspan="4" style="text-align:right;font-weight:700;padding:10px;border-top:2px solid #ddd;font-size:17px">Grand Total:</td><td id="pvt-gt" style="font-weight:700;color:${highValue ? '#e74c3c' : '#27ae60'};padding:10px;border-top:2px solid #ddd;font-size:19px">\u00A3${gt.toFixed(2)}</td><td style="border-top:2px solid #ddd"></td></tr></tfoot>
                     </table>
-                    <div style="font-size:10px;color:#888;margin-top:6px;font-style:italic">${items.some(i => !i.price) ? 'Paste ASIN for unresolved items - auto-fetches on paste' : 'All prices fetched'}</div>
+                    <div style="font-size:10px;color:#888;margin-top:6px;font-style:italic">${items.some(i => !isValidPrice(i.price)) ? 'Prices tried FC Research then Amazon. Paste an ASIN for any NIL row - auto-fetches on paste.' : 'All prices fetched'}</div>
                 </div>
                 <div style="display:flex;gap:8px;padding:14px 18px;background:#f8f9fa;border-top:1px solid #eee">
                     <button id="pvt-cc-yes" style="flex:1;padding:12px;border:none;border-radius:8px;font:600 18px Segoe UI;cursor:pointer;background:#2ecc71;color:#fff">Yes, change it</button>
@@ -1079,9 +1092,10 @@
                 input.disabled = true; // lock while fetching to avoid overlap
                 const idx = +input.dataset.idx;
                 const price = await fetchAmazonPrice(val);
-                items[idx].price = price;
+                items[idx].price = isValidPrice(price) ? price : 'NIL';
                 // Update cells
-                const bad = !price || ['N/A', 'Error', 'Timeout'].includes(price);
+                const bad = !isValidPrice(items[idx].price);
+                const shownPrice = items[idx].price;
                 // Carry the manually-entered ASIN onto the item so downstream
                 // consumers (e.g. the Create DL handoff) use it too. (Leave
                 // isAsin as-is — the fnsku field is still the original FNSKU.)
@@ -1090,8 +1104,8 @@
                 // re-pasted); only lock it green once a real price comes back.
                 if (bad) { input.disabled = false; input.style.borderColor = '#e74c3c'; }
                 else { input.style.borderColor = '#2ecc71'; }
-                document.getElementById(`pvt-p-${idx}`).innerHTML = bad ? `<span style="color:#e74c3c">${price}</span>` : `<span style="color:#27ae60;font-weight:700">${price}</span>`;
-                const num = parseFloat((price || '').replace(/[^0-9.]/g, ''));
+                document.getElementById(`pvt-p-${idx}`).innerHTML = bad ? `<span style="color:#e74c3c">${escapeHtml(shownPrice)}</span>` : `<span style="color:#27ae60;font-weight:700">${escapeHtml(shownPrice)}</span>`;
+                const num = parseFloat((shownPrice || '').replace(/[^0-9.]/g, ''));
                 document.getElementById(`pvt-lt-${idx}`).textContent = isNaN(num) ? '-' : '\u00A3' + (num * items[idx].qty).toFixed(2);
                 // Recalculate grand total
                 let newGt = 0;
@@ -1320,7 +1334,8 @@
                     let resolved = 0;
                     const resolveJobs = toResolve.map(item => async () => {
                         const fcr = await fetchFCResearch(item.fnsku);
-                        if (fcr?.asin) { item.resolvedAsin = fcr.asin; item.fcPrice = fcr.fcPrice; item.title = item.title || fcr.title; }
+                        if (fcr?.asin) { item.resolvedAsin = fcr.asin; item.title = item.title || fcr.title; }
+                        if (fcr?.fcPrice) item.fcPrice = fcr.fcPrice; // keep the FC Research price for the fallback chain
                         resolved++;
                         setStatus(`Resolving FNSKUs ${resolved}/${toResolve.length}...`, '#8e44ad');
                     });
@@ -1328,19 +1343,32 @@
                         await Promise.all(resolveJobs.slice(i, i + BATCH_SIZE).map(fn => fn()));
                     }
 
-                    // Phase 2: Fetch Amazon prices + PS count in parallel batches
+                    // Phase 2: Resolve each item's price + PS count in parallel.
+                    // Price fallback chain: FC Research "List Price" first, then
+                    // the live Amazon.co.uk price, and finally "NIL" if neither
+                    // returns a usable number.
                     let done = 0;
                     const jobs = items.map(item => async () => {
                         const asin = item.isAsin ? item.fnsku : item.resolvedAsin;
-                        if (asin) {
-                            // Fetch price and PS count simultaneously
-                            const [price, ps] = await Promise.all([
-                                fetchAmazonPrice(asin),
-                                checkProblemSolve(asin),
-                            ]);
-                            item.price = price;
-                            item.problemSolve = ps;
+
+                        // PS count still comes from FC Research by ASIN (unchanged).
+                        const psPromise = asin ? checkProblemSolve(asin) : Promise.resolve(null);
+
+                        // 1) FC Research price (already fetched during Phase 1).
+                        let price = isValidPrice(item.fcPrice) ? item.fcPrice : null;
+                        let source = price ? 'FCR' : '';
+
+                        // 2) Fall back to the live Amazon price when FCR had none.
+                        if (!price && asin) {
+                            const amz = await fetchAmazonPrice(asin);
+                            if (isValidPrice(amz)) { price = amz; source = 'Amazon'; }
                         }
+
+                        // 3) Neither source produced a usable price -> NIL.
+                        item.price = price || 'NIL';
+                        item.priceSource = source || 'none';
+                        item.problemSolve = await psPromise;
+
                         done++;
                         setStatus(`Fetching prices: ${done}/${items.length}`, '#8e44ad');
                     });
