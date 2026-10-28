@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Sideline - Multi-Tote Deletion Automation
 // @author       joyhjoe
-// @version      7.6
+// @version      7.7
 // @description  Automated tote processing for AFT Poirot V3 with multi-item price lookup
 // @match        https://aft-poirot-website-dub.dub.proxy.amazon.com/*
 // @match        https://river-dub.amazon.com/*
@@ -19,7 +19,7 @@
 // ==/UserScript==
 
 /**
- * SIDELINE v7.6 - AFT Poirot Tote Automation
+ * SIDELINE v7.7 - AFT Poirot Tote Automation
  *
  * Features:
  *   - Paste tote IDs, auto-processes them sequentially
@@ -96,7 +96,7 @@
     const FCR_BASE = 'https://qi-fcresearch-eu.corp.amazon.com';
 
     /** Current running version + where to check/download updates */
-    const VERSION = '7.6';
+    const VERSION = '7.7';
     const UPDATE_URL = 'https://github.com/joyhjoe1997-alt/tampermonkey-scripts/raw/main/sideline.user.js';
 
     // =========================================================================
@@ -433,15 +433,28 @@
                         const doc = new DOMParser().parseFromString(html, 'text/html');
                         let asin = null, fcPrice = 'N/A', title = '';
 
-                        // Strategy 1: Parse the product key-value table
+                        // Normalises an FC Research "List Price" cell to a clean
+                        // price string. The cell looks like "\n\n GBP 69.99 \n\n":
+                        // collapse whitespace, drop the 3-letter currency code,
+                        // and prefix a £ so it displays like the Amazon price.
+                        // Returns 'N/A' when there's no numeric value.
+                        const normFcPrice = (raw) => {
+                            const s = (raw || '').replace(/\s+/g, ' ').trim();
+                            const m = s.match(/(\d[\d,]*\.?\d*)/); // first number
+                            if (!m) return 'N/A';
+                            return '\u00A3' + m[1].replace(/,/g, '');
+                        };
+
+                        // Strategy 1: Parse the product key-value table.
+                        // Row shape: <th>List Price</th><td> GBP 69.99 </td>
                         const table = doc.querySelector('table.a-keyvalue[data-row-id]');
                         if (table) {
                             asin = table.getAttribute('data-row-id');
                             for (const row of table.querySelectorAll('tr')) {
-                                const th = row.querySelector('th')?.textContent.trim();
-                                const td = row.querySelector('td')?.textContent.trim();
-                                if (th === 'List Price' && td) fcPrice = td.replace(/^[A-Z]{3}\s+/, '');
-                                if (th === 'Title' && td) title = td;
+                                const th = (row.querySelector('th')?.textContent || '').replace(/\s+/g, ' ').trim();
+                                const tdRaw = row.querySelector('td')?.textContent || '';
+                                if (th === 'List Price') { const p = normFcPrice(tdRaw); if (p !== 'N/A') fcPrice = p; }
+                                if (th === 'Title') { const t = tdRaw.replace(/\s+/g, ' ').trim(); if (t) title = t; }
                             }
                         }
 
@@ -449,9 +462,12 @@
                         if (!asin) asin = doc.querySelector('.a-span7 > table > tbody > tr:nth-child(1) > td:nth-child(2) > a')?.textContent.trim() || null;
                         if (!title) title = doc.querySelector('a[href*="amazon.co.uk/gp/product"]')?.textContent.trim() || '';
 
-                        // Strategy 3: Regex on raw HTML
+                        // Strategy 3: Regex on raw HTML (whitespace-tolerant)
                         if (!asin) asin = (html.match(/data-row-id="(B[A-Z0-9]{9})"/) || html.match(/results\?s=(B[A-Z0-9]{9})/))?.[1] || null;
-                        if (fcPrice === 'N/A') fcPrice = html.match(/<th>List Price<\/th>\s*<td>([^<]+)<\/td>/)?.[1]?.replace(/^[A-Z]{3}\s+/, '').trim() || 'N/A';
+                        if (fcPrice === 'N/A') {
+                            const m = html.match(/<th>\s*List Price\s*<\/th>\s*<td>([\s\S]*?)<\/td>/);
+                            if (m) fcPrice = normFcPrice(m[1]);
+                        }
 
                         resolve({ asin, fcPrice, title });
                     } catch { resolve({ asin: null, fcPrice: 'Error', title: '' }); }
