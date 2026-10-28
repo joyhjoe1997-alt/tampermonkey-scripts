@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Sideline - Multi-Tote Deletion Automation
 // @author       joyhjoe
-// @version      8.0
+// @version      8.1
 // @description  Automated tote processing for AFT Poirot V3 with multi-item price lookup
 // @match        https://aft-poirot-website-dub.dub.proxy.amazon.com/*
 // @match        https://river-dub.amazon.com/*
@@ -19,7 +19,7 @@
 // ==/UserScript==
 
 /**
- * SIDELINE v8.0 - AFT Poirot Tote Automation
+ * SIDELINE v8.1 - AFT Poirot Tote Automation
  *
  * Features:
  *   - Paste tote IDs, auto-processes them sequentially
@@ -104,7 +104,7 @@
     const FCR_BASE = 'https://qi-fcresearch-eu.corp.amazon.com';
 
     /** Current running version + where to check/download updates */
-    const VERSION = '8.0';
+    const VERSION = '8.1';
     const UPDATE_URL = 'https://github.com/joyhjoe1997-alt/tampermonkey-scripts/raw/main/sideline.user.js';
 
     // =========================================================================
@@ -388,35 +388,57 @@
         return new Promise(resolve => {
             const start = Date.now();
             let prevCount = -1;
-            let settled = false;
-            const finish = (id, items) => { clearBgInterval(id); resolve(items); };
+            let stableSince = 0;   // when the (non-zero) count last stopped changing
+            // How long a non-zero count must hold steady before we accept it even
+            // when it's short of `expected`. The page's "Number of rows" can count
+            // a row that readAllItems() doesn't parse (odd markup), so insisting on
+            // an exact match would hang until the long itemsTimeout. 2.5s of no
+            // change means the DOM has finished rendering whatever it will render.
+            const STABLE_MS = 2500;
+            const finish = (id, items) => { clearBgInterval(id); hideTaskProgress(); resolve(items); };
             const id = bgInterval(() => {
                 const clicked = clickLoadAllRows(); // no-op once expanded/absent
                 const items = readAllItems();
                 const n = items.length;
                 const loadAllGone = !findLoadAllRowsButton();
+                const elapsed = Math.round((Date.now() - start) / 1000);
 
                 setStatus('Reading tote items...', '#8e44ad');
                 setTaskProgress(
                     clicked ? 'Loading items (expanding all rows)' : 'Loading items',
                     n, expected > 0 ? expected : 0,
-                    expected > 0 ? `${n} of ${expected} rows rendered` : `${n} rows so far`
+                    (expected > 0 ? `${n} of ${expected} rows` : `${n} rows`) +
+                    (stableSince ? ` - settling (${elapsed}s)` : '')
                 );
 
-                // Known target row count: resolve the moment we reach it.
+                // Fast path: exact match with the expected count — done at once.
                 if (expected > 0 && n >= expected && loadAllGone) { finish(id, items); return; }
 
-                // Unknown target: resolve once a non-zero count repeats (stable)
-                // across two ticks and nothing is still waiting to expand.
-                if (expected <= 0 && n > 0 && n === prevCount && loadAllGone) {
-                    if (settled) { finish(id, items); return; }
-                    settled = true;
+                // Track how long the count has been stable (non-zero, unchanged).
+                if (n > 0 && n === prevCount) {
+                    if (!stableSince) stableSince = Date.now();
                 } else {
-                    settled = false;
+                    stableSince = 0;
                 }
                 prevCount = n;
 
-                if (Date.now() - start > TIMING.itemsTimeout) { finish(id, items); }
+                // Accept a stable count once nothing is still expanding — even if
+                // it's below `expected` (that row simply isn't parseable). This is
+                // what prevents the "stuck at 21/22" hang.
+                if (stableSince && loadAllGone && (Date.now() - stableSince) >= STABLE_MS) {
+                    if (expected > 0 && n < expected) {
+                        setStatus(`Read ${n} of ${expected} rows (1 not parseable) - continuing`, '#f39c12');
+                    }
+                    finish(id, items); return;
+                }
+
+                // Hard safety cap.
+                if (Date.now() - start > TIMING.itemsTimeout) {
+                    if (expected > 0 && n < expected) {
+                        setStatus(`Timed out reading rows (${n}/${expected}) - continuing`, '#f39c12');
+                    }
+                    finish(id, items);
+                }
             });
         });
     }
