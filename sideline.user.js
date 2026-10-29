@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Sideline - Multi-Tote Deletion Automation
 // @author       joyhjoe
-// @version      8.4
+// @version      8.5
 // @description  Automated tote processing for AFT Poirot V3 with multi-item price lookup
 // @match        https://aft-poirot-website-dub.dub.proxy.amazon.com/*
 // @match        https://river-dub.amazon.com/*
@@ -19,7 +19,7 @@
 // ==/UserScript==
 
 /**
- * SIDELINE v8.4 - AFT Poirot Tote Automation
+ * SIDELINE v8.5 - AFT Poirot Tote Automation
  *
  * Features:
  *   - Paste tote IDs, auto-processes them sequentially
@@ -104,7 +104,7 @@
     const FCR_BASE = 'https://qi-fcresearch-eu.corp.amazon.com';
 
     /** Current running version + where to check/download updates */
-    const VERSION = '8.4';
+    const VERSION = '8.5';
     const UPDATE_URL = 'https://github.com/joyhjoe1997-alt/tampermonkey-scripts/raw/main/sideline.user.js';
 
     // =========================================================================
@@ -2120,37 +2120,74 @@
                 if (step2CommentWaits < 20) return; // ~retry as the DOM settles
             }
 
-            const filled = [];
-            if (toolSel && setCsSelect(toolSel, 'Sideline')) filled.push('Tool=Sideline');
-            if (setNgText(container, payload.toteId || '')) filled.push('Container');
-            if (payload.asin && asinEl && setNgText(asinEl, payload.asin)) filled.push('ASIN');
-            if (setNgText(qtyEl, qtyInt)) filled.push('Qty');
-            if (setNgText(valueEl, valueInt)) filled.push('Value');
-            // Comment: FC Research history lines, built on the Poirot tab.
+            // Comment note (shown in the final toast).
             // Root Cause dropdown + its comment stay MANUAL (user decides those).
             let commentNote = '';
             if (!payload.comment) {
                 commentNote = `Comment: none built [${payload.commentDiag || 'no history'}].`;
             } else if (!commentEl) {
                 commentNote = 'Comment: field not found - paste manually.';
-            } else if (setNgText(commentEl, payload.comment)) {
-                filled.push('Comment');
-            } else {
-                commentNote = 'Comment: fill failed - paste manually.';
             }
 
-            step2Done = true;
-            // Consume the handoff now — step 2 is the last thing we auto-fill.
-            try { GM_setValue(DL_HANDOFF_KEY, ''); } catch { }
+            // Every field we auto-fill. Elements are re-picked on each pass
+            // (river-dub re-renders the form, and has hidden duplicate copies),
+            // so we always write to the live, visible element.
+            const targets = [
+                // Comment FIRST: its input event can trigger an Angular digest
+                // that resets other step-2 fields, so the rest are written after.
+                { name: 'Comment', want: payload.comment || '', get: () => findCommentField(), skip: !payload.comment },
+                { name: 'Tool=Sideline', want: 'Sideline', get: () => pick('select[ng-model="data.toolDropdownS"]'), select: true },
+                { name: 'Container', want: payload.toteId || '', get: () => pick('[ng-model="data.containerInputS"]') },
+                { name: 'ASIN', want: payload.asin || '', get: () => pick('[ng-model="data.asinInputS"]'), skip: !payload.asin },
+                { name: 'Qty', want: qtyInt, get: () => pick('[ng-model="data.qtyInputS"]') },
+                { name: 'Value', want: valueInt, get: () => pick('[ng-model="data.totalCostInputS"]') },
+            ].filter(t => !t.skip);
 
-            dlToast(
-                `\u2705 Auto-filled: ${filled.join(', ') || '(nothing)'}.\n` +
-                `Tote ${payload.toteId || '-'} | ASIN ${payload.asin || '(none)'} | ` +
-                `Qty ${qtyInt} | Value £${valueInt}.\n` +
-                (commentNote ? `\u26A0 ${commentNote}\n` : '') +
-                `Now set Root Cause + comments, then review & submit.`,
-                commentNote ? '#f39c12' : '#27ae60'
-            );
+            // Writes any target whose live value doesn't match. Returns the
+            // names that currently hold the correct value.
+            const applyAll = () => {
+                const ok = [];
+                for (const t of targets) {
+                    const el = t.get();
+                    if (!el) continue;
+                    const cur = String(el.value ?? '').trim();
+                    if (cur === String(t.want).trim()) { ok.push(t.name); continue; }
+                    if (t.select) setCsSelect(el, t.want); else setNgText(el, t.want);
+                    if (String(el.value ?? '').trim() === String(t.want).trim()) ok.push(t.name);
+                }
+                return ok;
+            };
+
+            step2Done = true;
+            console.log('[Sideline] DL step 2: filling', targets.map(t => t.name).join(', '));
+            applyAll();
+
+            // Verify loop: river-dub/Angular can clear fields right after our
+            // first write (late render or model re-init). Re-check every 300ms
+            // and re-apply anything that was wiped. Stop once all fields hold for
+            // 3 checks in a row (so we never fight the user's own edits), or 8s.
+            const vStart = Date.now();
+            let stableTicks = 0;
+            const vId = bgInterval(() => {
+                const ok = applyAll();
+                stableTicks = ok.length === targets.length ? stableTicks + 1 : 0;
+                if (stableTicks >= 3 || Date.now() - vStart > 8000) {
+                    clearBgInterval(vId);
+                    // Consume the handoff only once filling is settled.
+                    try { GM_setValue(DL_HANDOFF_KEY, ''); } catch { }
+                    const missing = targets.map(t => t.name).filter(n => !ok.includes(n));
+                    console.log('[Sideline] DL step 2 settled. ok:', ok.join(', ') || '-', '| missing:', missing.join(', ') || '-');
+                    const warn = commentNote || (missing.length ? `Not filled: ${missing.join(', ')} - please fill manually.` : '');
+                    dlToast(
+                        `\u2705 Auto-filled: ${ok.join(', ') || '(nothing)'}.\n` +
+                        `Tote ${payload.toteId || '-'} | ASIN ${payload.asin || '(none)'} | ` +
+                        `Qty ${qtyInt} | Value £${valueInt}.\n` +
+                        (warn ? `\u26A0 ${warn}\n` : '') +
+                        `Now set Root Cause + comments, then review & submit.`,
+                        warn ? '#f39c12' : '#27ae60'
+                    );
+                }
+            });
         }
 
         // Run once now (page may already be on step 1), then watch for changes.
