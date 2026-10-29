@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Sideline - Multi-Tote Deletion Automation
 // @author       joyhjoe
-// @version      8.5
+// @version      8.6
 // @description  Automated tote processing for AFT Poirot V3 with multi-item price lookup
 // @match        https://aft-poirot-website-dub.dub.proxy.amazon.com/*
 // @match        https://river-dub.amazon.com/*
@@ -19,7 +19,7 @@
 // ==/UserScript==
 
 /**
- * SIDELINE v8.5 - AFT Poirot Tote Automation
+ * SIDELINE v8.6 - AFT Poirot Tote Automation
  *
  * Features:
  *   - Paste tote IDs, auto-processes them sequentially
@@ -104,7 +104,7 @@
     const FCR_BASE = 'https://qi-fcresearch-eu.corp.amazon.com';
 
     /** Current running version + where to check/download updates */
-    const VERSION = '8.5';
+    const VERSION = '8.6';
     const UPDATE_URL = 'https://github.com/joyhjoe1997-alt/tampermonkey-scripts/raw/main/sideline.user.js';
 
     // =========================================================================
@@ -2052,6 +2052,35 @@
         // Prefers a visible element from a list (same rule as pick()).
         const preferVisible = (els) => els.find(e => e.offsetParent !== null) || els[0] || null;
 
+        // True when an element is actually rendered on screen.
+        const isShown = (e) => e.getClientRects().length > 0;
+
+        /**
+         * Finds a step-2 field by ng-model PREFIX, ignoring the band suffix.
+         * river-dub names each band's fields differently (small band =
+         * "data.containerInputS", medium likely "...M", etc.), so matching the
+         * exact "S" name only worked for the small band. Matching the prefix
+         * (e.g. "data.containerInput") covers every band; the visible copy wins.
+         */
+        const field = (prefix, tag = '') => {
+            const els = [...document.querySelectorAll(`${tag}[ng-model^="${prefix}"]`)]
+                .filter(e => !/rootcause/i.test(e.getAttribute('ng-model') || ''));
+            return els.find(isShown) || els[0] || null;
+        };
+
+        // Diagnostic: once the band is ticked, if step 2 isn't recognised, log
+        // the form's ng-model names (only when they change) so a naming
+        // mismatch is visible in the console instead of failing silently.
+        let lastModelDump = '';
+        const dumpModels = () => {
+            const models = [...new Set([...document.querySelectorAll('[ng-model]')]
+                .filter(isShown).map(e => e.getAttribute('ng-model')))].join(', ');
+            if (models && models !== lastModelDump) {
+                lastModelDump = models;
+                console.log('[Sideline] DL: step-2 form not recognised yet. Visible ng-models:', models);
+            }
+        };
+
         /**
          * Finds the "Enter the adjustment comment below" textarea robustly.
          * The exact ng-model can vary, so try, in order:
@@ -2063,9 +2092,10 @@
          * matches mentioning "root cause" are excluded.
          */
         function findCommentField() {
-            const byModel = document.querySelector(
-                '[ng-model="data.commentAreaS"],[ng-model="data.commentArea"],textarea[ng-model*="comment" i]'
-            );
+            // Any band's comment area (commentAreaS / commentAreaM / ...),
+            // never the Root Cause comment.
+            const byModel = field('data.commentArea')
+                || document.querySelector('textarea[ng-model*="comment" i]:not([ng-model*="rootcause" i])');
             if (byModel && byModel.offsetParent !== null) return byModel;
 
             const areas = [...document.querySelectorAll('textarea')].filter(t => t.offsetParent !== null);
@@ -2097,14 +2127,11 @@
 
         function tryStep2() {
             if (step2Done) return;
-            // Step 2 is identified by the container input (ng-model data.containerInputS).
-            const container = pick('[ng-model="data.containerInputS"]');
-            if (!container) return;
+            // Step 2 is identified by the container input. Matched by prefix so
+            // every band works (containerInputS / containerInputM / ...).
+            const container = field('data.containerInput');
+            if (!container) { if (bandDone) dumpModels(); return; }
 
-            const asinEl    = pick('[ng-model="data.asinInputS"]');
-            const qtyEl     = pick('[ng-model="data.qtyInputS"]');
-            const valueEl   = pick('[ng-model="data.totalCostInputS"]');
-            const toolSel   = pick('select[ng-model="data.toolDropdownS"]');
             const commentEl = findCommentField();
 
             // Total value: rounded to a whole number, no decimals (field is int-only).
@@ -2119,6 +2146,8 @@
                 step2CommentWaits = (step2CommentWaits || 0) + 1;
                 if (step2CommentWaits < 20) return; // ~retry as the DOM settles
             }
+
+            console.log('[Sideline] DL step 2 detected:', container.getAttribute('ng-model'));
 
             // Comment note (shown in the final toast).
             // Root Cause dropdown + its comment stay MANUAL (user decides those).
@@ -2136,11 +2165,11 @@
                 // Comment FIRST: its input event can trigger an Angular digest
                 // that resets other step-2 fields, so the rest are written after.
                 { name: 'Comment', want: payload.comment || '', get: () => findCommentField(), skip: !payload.comment },
-                { name: 'Tool=Sideline', want: 'Sideline', get: () => pick('select[ng-model="data.toolDropdownS"]'), select: true },
-                { name: 'Container', want: payload.toteId || '', get: () => pick('[ng-model="data.containerInputS"]') },
-                { name: 'ASIN', want: payload.asin || '', get: () => pick('[ng-model="data.asinInputS"]'), skip: !payload.asin },
-                { name: 'Qty', want: qtyInt, get: () => pick('[ng-model="data.qtyInputS"]') },
-                { name: 'Value', want: valueInt, get: () => pick('[ng-model="data.totalCostInputS"]') },
+                { name: 'Tool=Sideline', want: 'Sideline', get: () => field('data.toolDropdown', 'select'), select: true },
+                { name: 'Container', want: payload.toteId || '', get: () => field('data.containerInput') },
+                { name: 'ASIN', want: payload.asin || '', get: () => field('data.asinInput'), skip: !payload.asin },
+                { name: 'Qty', want: qtyInt, get: () => field('data.qtyInput') },
+                { name: 'Value', want: valueInt, get: () => field('data.totalCostInput') },
             ].filter(t => !t.skip);
 
             // Writes any target whose live value doesn't match. Returns the
