@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         AA Inventory History Batch Exporter
 // @namespace    http://tampermonkey.net/
-// @version      2.1
-// @description  Paste AA logins + a date/time window, pull each AA's full Inventory History in the background, and export a multi-sheet .xlsx (home summary with per-AA gap count, units & totes + one colour-coded sheet per AA).
+// @version      2.2
+// @description  Paste AA logins + a date/time window, pull each AA's full Inventory History in the background, and export a multi-sheet .xlsx (home summary with clickable login links, per-AA gap count, units & totes + one colour-coded sheet per AA).
 // @author       joyhjoe
 // @match        *://qi-fcresearch-eu.corp.amazon.com/*/results?s=*
 // @match        *://qi-fcresearch-na.corp.amazon.com/*/results?s=*
@@ -57,7 +57,7 @@
     // CONFIG + STATE
     // ═══════════════════════════════════════════════════════════════════════
 
-    const VERSION = '2.1';
+    const VERSION = '2.2';
     const STORAGE_KEY = 'aa_inv_exporter_settings_v1';
     const ORIGIN = location.origin;
 
@@ -687,7 +687,7 @@
         home.addRow(['FC', FC_SEGMENT]);
         home.addRow([]);
         const homeHeader = home.addRow([
-            'Login', 'Sheet', 'Rows', 'First scan', 'Last scan', 'Total span',
+            'Login', 'Rows', 'First scan', 'Last scan', 'Total span',
             `Gaps > ${gapCountMin} min`, 'Units processed', 'Totes processed', 'Status'
         ]);
         homeHeader.eachCell(c => { c.fill = XLSX_HEADER_FILL; c.font = XLSX_HEADER_FONT; });
@@ -701,9 +701,8 @@
                 rowCount = res.data.rows.length;
                 perAaSheets.push({ sheetName, result: res.data });
             }
-            home.addRow([
+            const row = home.addRow([
                 res.login,
-                sheetName,
                 rowCount,
                 res.data ? res.data.firstEvent : '',
                 res.data ? res.data.lastEvent : '',
@@ -713,8 +712,19 @@
                 res.data ? res.data.totesProcessed : '',
                 res.statusLabel || res.status
             ]);
+
+            // Make the Login cell an internal link to that AA's sheet. Sheet
+            // names with spaces/specials must be quoted in the target ref.
+            if (sheetName) {
+                const loginCell = row.getCell(1);
+                const ref = /[^A-Za-z0-9_]/.test(sheetName)
+                    ? `'${sheetName.replace(/'/g, "''")}'!A1`
+                    : `${sheetName}!A1`;
+                loginCell.value = { text: res.login, hyperlink: `#${ref}` };
+                loginCell.font = { color: { argb: 'FF2563EB' }, underline: true, bold: true };
+            }
         });
-        [16, 16, 8, 21, 21, 12, 14, 16, 16, 28].forEach((w, i) => { home.getColumn(i + 1).width = w; });
+        [16, 8, 21, 21, 12, 14, 16, 16, 28].forEach((w, i) => { home.getColumn(i + 1).width = w; });
 
         // One sheet per AA with the full rows + colour-coded gap column.
         perAaSheets.forEach(({ sheetName, result }) => {
