@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         AA Inventory History Batch Exporter
 // @namespace    http://tampermonkey.net/
-// @version      2.2
-// @description  Paste AA logins + a date/time window, pull each AA's full Inventory History in the background, and export a multi-sheet .xlsx (home summary with clickable login links, per-AA gap count, units & totes + one colour-coded sheet per AA).
+// @version      2.3
+// @description  Paste AA logins + a date/time window, pull each AA's full Inventory History in the background, and export a multi-sheet .xlsx (home summary with clickable login links, per-AA gap count, idle time, units & totes + one colour-coded sheet per AA).
 // @author       joyhjoe
 // @match        *://qi-fcresearch-eu.corp.amazon.com/*/results?s=*
 // @match        *://qi-fcresearch-na.corp.amazon.com/*/results?s=*
@@ -57,7 +57,7 @@
     // CONFIG + STATE
     // ═══════════════════════════════════════════════════════════════════════
 
-    const VERSION = '2.2';
+    const VERSION = '2.3';
     const STORAGE_KEY = 'aa_inv_exporter_settings_v1';
     const ORIGIN = location.origin;
 
@@ -610,6 +610,7 @@
 
         let prev = null, firstTs = null, lastTs = null;
         let gapCount = 0;              // gaps longer than the threshold
+        let idleMs = 0;                // summed duration of those gaps
         let unitsProcessed = 0;        // sum of Quantity
         let sawQty = false;
         const uniqueOldBins = new Set();
@@ -623,7 +624,7 @@
                     const gapMin = deltaMs / 60000;
                     row[GAP_COL] = formatGap(deltaMs);
                     row.__gapMin = gapMin;
-                    if (gapMin > gapThreshold) gapCount++;
+                    if (gapMin > gapThreshold) { gapCount++; idleMs += deltaMs; }
                 } else {
                     row[GAP_COL] = '';
                     row.__gapMin = null;
@@ -657,6 +658,7 @@
             totalSpan: (firstTs && lastTs) ? formatGap(lastTs - firstTs) : '',
             gapCount: gapCount,
             gapThreshold: gapThreshold,
+            idleTime: gapCount > 0 ? formatGap(idleMs) : '',
             unitsProcessed: sawQty ? unitsProcessed : '',
             totesProcessed: oldBinHeader ? uniqueOldBins.size : ''
         };
@@ -688,7 +690,7 @@
         home.addRow([]);
         const homeHeader = home.addRow([
             'Login', 'Rows', 'First scan', 'Last scan', 'Total span',
-            `Gaps > ${gapCountMin} min`, 'Units processed', 'Totes processed', 'Status'
+            `Gaps > ${gapCountMin} min`, 'Idle time', 'Units processed', 'Totes processed', 'Status'
         ]);
         homeHeader.eachCell(c => { c.fill = XLSX_HEADER_FILL; c.font = XLSX_HEADER_FONT; });
         home.getRow(1).font = { bold: true, size: 14 };
@@ -708,6 +710,7 @@
                 res.data ? res.data.lastEvent : '',
                 res.data ? res.data.totalSpan : '',
                 res.data ? res.data.gapCount : '',
+                res.data ? res.data.idleTime : '',
                 res.data ? res.data.unitsProcessed : '',
                 res.data ? res.data.totesProcessed : '',
                 res.statusLabel || res.status
@@ -724,7 +727,7 @@
                 loginCell.font = { color: { argb: 'FF2563EB' }, underline: true, bold: true };
             }
         });
-        [16, 8, 21, 21, 12, 14, 16, 16, 28].forEach((w, i) => { home.getColumn(i + 1).width = w; });
+        [16, 8, 21, 21, 12, 14, 12, 16, 16, 28].forEach((w, i) => { home.getColumn(i + 1).width = w; });
 
         // One sheet per AA with the full rows + colour-coded gap column.
         perAaSheets.forEach(({ sheetName, result }) => {
@@ -787,7 +790,7 @@
             rec.data = {
                 headers: raw ? raw.headers : [], rows: [],
                 firstEvent: '', lastEvent: '', totalSpan: '',
-                gapCount: 0, gapThreshold: gapCountMin, unitsProcessed: '', totesProcessed: ''
+                gapCount: 0, gapThreshold: gapCountMin, idleTime: '', unitsProcessed: '', totesProcessed: ''
             };
             return;
         }
