@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         AA Inventory History Batch Exporter
 // @namespace    http://tampermonkey.net/
-// @version      2.0
-// @description  Paste AA logins + a date/time window, pull each AA's full Inventory History in the background, and export a multi-sheet .xlsx (home summary + one colour-coded sheet per AA).
+// @version      2.1
+// @description  Paste AA logins + a date/time window, pull each AA's full Inventory History in the background, and export a multi-sheet .xlsx (home summary with per-AA gap count, units & totes + one colour-coded sheet per AA).
 // @author       joyhjoe
 // @match        *://qi-fcresearch-eu.corp.amazon.com/*/results?s=*
 // @match        *://qi-fcresearch-na.corp.amazon.com/*/results?s=*
@@ -57,7 +57,7 @@
     // CONFIG + STATE
     // ═══════════════════════════════════════════════════════════════════════
 
-    const VERSION = '2.0';
+    const VERSION = '2.1';
     const STORAGE_KEY = 'aa_inv_exporter_settings_v1';
     const ORIGIN = location.origin;
 
@@ -75,6 +75,14 @@
     // The computed column appended to every AA sheet.
     const GAP_COL = 'Gap (since prev)';
 
+    // Default threshold (minutes) above which a gap is counted on the Home
+    // summary. User-configurable via the panel.
+    const DEFAULT_GAP_COUNT_MIN = 10;
+
+    // Header names the summary metrics read from (matched case-insensitively).
+    const QTY_HEADER_HINTS = ['quantity', 'qty'];
+    const OLD_BIN_HEADER_HINTS = ['old bin'];
+
     // FC segment from the URL, e.g. "EMA4" in /EMA4/results?s=...
     const FC_SEGMENT = (function () {
         const m = location.pathname.match(/^\/([^/]+)\/results/i);
@@ -88,7 +96,8 @@
         startDate: '',   // MM/DD/YYYY
         endDate: '',     // MM/DD/YYYY
         startTime: '',   // HH:MM:SS (24h), optional
-        endTime: ''      // HH:MM:SS (24h), optional
+        endTime: '',     // HH:MM:SS (24h), optional
+        gapCountMin: DEFAULT_GAP_COUNT_MIN  // gaps longer than this (min) are counted on Home
     };
 
     let settings = { ...DEFAULT_SETTINGS };
@@ -310,6 +319,29 @@
             if (hit) return hit;
         }
         return headers[0] || null; // historically the first column
+    }
+
+    // Find the first header whose text contains one of the given hints
+    // (case-insensitive), or null. Prefers an exact (trimmed) match.
+    function findHeaderByHints(headers, hints) {
+        if (!headers) return null;
+        const lower = headers.map(h => h.toLowerCase().trim());
+        for (const hint of hints) {
+            const exact = lower.indexOf(hint);
+            if (exact !== -1) return headers[exact];
+        }
+        for (const hint of hints) {
+            const idx = lower.findIndex(h => h.includes(hint));
+            if (idx !== -1) return headers[idx];
+        }
+        return null;
+    }
+
+    // Parse a cell value to a number (strips commas, currency, whitespace).
+    function toNumber(v) {
+        if (v == null) return NaN;
+        const n = parseFloat(String(v).replace(/[^0-9.\-]/g, ''));
+        return isNaN(n) ? NaN : n;
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -549,9 +581,13 @@
     // timestamp, and append the "Gap (since prev)" column. Returns the enriched
     // table plus first/last event + total span for the summary. Each row also
     // carries a non-exported __gapMin (minutes) used for Excel colouring.
-    function enrichWithGaps(result, window) {
+    function enrichWithGaps(result, window, gapCountMin) {
         const { headers } = result;
         const tsHeader = findTimestampHeader(headers);
+        const qtyHeader = findHeaderByHints(headers, QTY_HEADER_HINTS);
+        const oldBinHeader = findHeaderByHints(headers, OLD_BIN_HEADER_HINTS);
+        const gapThreshold = (gapCountMin != null && !isNaN(gapCountMin))
+            ? gapCountMin : DEFAULT_GAP_COUNT_MIN;
 
         let decorated = result.rows.map(row => ({
             row,
@@ -573,14 +609,21 @@
         });
 
         let prev = null, firstTs = null, lastTs = null;
+        let gapCount = 0;              // gaps longer than the threshold
+        let unitsProcessed = 0;        // sum of Quantity
+        let sawQty = false;
+        const uniqueOldBins = new Set();
+
         decorated.forEach(({ row, ts }) => {
             if (ts) {
                 if (!firstTs) firstTs = ts;
                 lastTs = ts;
                 if (prev) {
                     const deltaMs = ts - prev;
+                    const gapMin = deltaMs / 60000;
                     row[GAP_COL] = formatGap(deltaMs);
-                    row.__gapMin = deltaMs / 60000;
+                    row.__gapMin = gapMin;
+                    if (gapMin > gapThreshold) gapCount++;
                 } else {
                     row[GAP_COL] = '';
                     row.__gapMin = null;
@@ -589,6 +632,17 @@
             } else {
                 row[GAP_COL] = '';
                 row.__gapMin = null;
+            }
+
+            // Units: sum of the Quantity column.
+            if (qtyHeader) {
+                const n = toNumber(row[qtyHeader]);
+                if (!isNaN(n)) { unitsProcessed += n; sawQty = true; }
+            }
+            // Totes: count of unique non-empty Old Bin values.
+            if (oldBinHeader) {
+                const bin = (row[oldBinHeader] || '').trim();
+                if (bin) uniqueOldBins.add(bin);
             }
         });
 
@@ -600,7 +654,11 @@
             rows: decorated.map(d => d.row),
             firstEvent: firstTs ? formatDateTime(firstTs) : '',
             lastEvent: lastTs ? formatDateTime(lastTs) : '',
-            totalSpan: (firstTs && lastTs) ? formatGap(lastTs - firstTs) : ''
+            totalSpan: (firstTs && lastTs) ? formatGap(lastTs - firstTs) : '',
+            gapCount: gapCount,
+            gapThreshold: gapThreshold,
+            unitsProcessed: sawQty ? unitsProcessed : '',
+            totesProcessed: oldBinHeader ? uniqueOldBins.size : ''
         };
     }
 
@@ -613,7 +671,7 @@
 
     // Build the workbook and trigger the download. Async: ExcelJS serialises to
     // a buffer asynchronously.
-    async function buildAndDownloadWorkbook(results, startDate, endDate, startTime, endTime, winLabel) {
+    async function buildAndDownloadWorkbook(results, startDate, endDate, startTime, endTime, winLabel, gapCountMin) {
         if (typeof ExcelJS === 'undefined') throw new Error('ExcelJS failed to load via @require.');
 
         const wb = new ExcelJS.Workbook();
@@ -628,7 +686,10 @@
         home.addRow(['Generated', formatDateTime(new Date())]);
         home.addRow(['FC', FC_SEGMENT]);
         home.addRow([]);
-        const homeHeader = home.addRow(['Login', 'Sheet', 'Rows', 'First event', 'Last event', 'Total span', 'Status']);
+        const homeHeader = home.addRow([
+            'Login', 'Sheet', 'Rows', 'First scan', 'Last scan', 'Total span',
+            `Gaps > ${gapCountMin} min`, 'Units processed', 'Totes processed', 'Status'
+        ]);
         homeHeader.eachCell(c => { c.fill = XLSX_HEADER_FILL; c.font = XLSX_HEADER_FONT; });
         home.getRow(1).font = { bold: true, size: 14 };
 
@@ -647,10 +708,13 @@
                 res.data ? res.data.firstEvent : '',
                 res.data ? res.data.lastEvent : '',
                 res.data ? res.data.totalSpan : '',
+                res.data ? res.data.gapCount : '',
+                res.data ? res.data.unitsProcessed : '',
+                res.data ? res.data.totesProcessed : '',
                 res.statusLabel || res.status
             ]);
         });
-        [16, 16, 8, 21, 21, 12, 28].forEach((w, i) => { home.getColumn(i + 1).width = w; });
+        [16, 16, 8, 21, 21, 12, 14, 16, 16, 28].forEach((w, i) => { home.getColumn(i + 1).width = w; });
 
         // One sheet per AA with the full rows + colour-coded gap column.
         perAaSheets.forEach(({ sheetName, result }) => {
@@ -706,14 +770,18 @@
     // ═══════════════════════════════════════════════════════════════════════
 
     // Apply one AA's fetch result to its record (shared by the batch + retry).
-    function applyFetchResult(rec, raw, window) {
+    function applyFetchResult(rec, raw, window, gapCountMin) {
         if (!raw || !raw.rows || raw.rows.length === 0) {
             rec.status = 'empty';
             rec.statusLabel = 'No rows in range';
-            rec.data = { headers: raw ? raw.headers : [], rows: [], firstEvent: '', lastEvent: '', totalSpan: '' };
+            rec.data = {
+                headers: raw ? raw.headers : [], rows: [],
+                firstEvent: '', lastEvent: '', totalSpan: '',
+                gapCount: 0, gapThreshold: gapCountMin, unitsProcessed: '', totesProcessed: ''
+            };
             return;
         }
-        const enriched = enrichWithGaps(raw, window);
+        const enriched = enrichWithGaps(raw, window, gapCountMin);
         rec.data = enriched;
         if (enriched.rows.length === 0) {
             rec.status = 'empty';
@@ -725,7 +793,7 @@
     }
 
     // Fetch every login with bounded concurrency, updating progress as we go.
-    async function runBatch(logins, startDate, endDate, window) {
+    async function runBatch(logins, startDate, endDate, window, gapCountMin) {
         const results = logins.map(login => ({
             login,
             status: 'pending',      // pending | running | done | empty | error
@@ -736,7 +804,7 @@
         }));
 
         // Exposed so a per-AA Retry can re-fetch one login with the same window.
-        activeRun = { results, startDate, endDate, window };
+        activeRun = { results, startDate, endDate, window, gapCountMin };
         renderProgress(results);
 
         let index = 0;
@@ -753,7 +821,7 @@
 
                 try {
                     const raw = await fetchOneAA(rec.login, startDate, endDate);
-                    applyFetchResult(rec, raw, window);
+                    applyFetchResult(rec, raw, window, gapCountMin);
                 } catch (e) {
                     rec.status = 'error';
                     rec.statusLabel = (e && e.message) ? e.message : 'Failed';
@@ -787,7 +855,7 @@
 
         try {
             const raw = await fetchOneAA(rec.login, activeRun.startDate, activeRun.endDate);
-            applyFetchResult(rec, raw, activeRun.window);
+            applyFetchResult(rec, raw, activeRun.window, activeRun.gapCountMin);
             rec.error = null;
         } catch (e) {
             rec.status = 'error';
@@ -874,7 +942,8 @@
             }
             .aa-exp-dates { display: flex; gap: 14px; flex-wrap: wrap; }
             .aa-exp-dates .aa-exp-field { flex: 1 1 calc(50% - 7px); min-width: 140px; margin-bottom: 0; }
-            .aa-exp-field input[type=text] {
+            .aa-exp-field input[type=text],
+            .aa-exp-field input[type=number] {
                 width: 100%; box-sizing: border-box; border: 2px solid #e2e8f0; border-radius: 12px;
                 padding: 13px 14px; font-size: 17px; font-weight: 600; text-align: center;
                 font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
@@ -1032,6 +1101,13 @@
                         </div>
                     </div>
 
+                    <div class="aa-exp-field" style="margin-top:22px;">
+                        <label>Count gaps longer than (minutes)</label>
+                        <input type="number" id="aa-exp-gap-count" min="0" step="1"
+                               placeholder="${DEFAULT_GAP_COUNT_MIN}" autocomplete="off"
+                               style="max-width:200px;">
+                    </div>
+
                     <div class="aa-exp-actions">
                         <button class="aa-exp-btn run" id="aa-exp-run">
                             <svg xmlns="http://www.w3.org/2000/svg" width="19" height="19" fill="none" viewBox="0 0 24 24"
@@ -1064,6 +1140,7 @@
             end: overlay.querySelector('#aa-exp-end'),
             startTime: overlay.querySelector('#aa-exp-start-time'),
             endTime: overlay.querySelector('#aa-exp-end-time'),
+            gapCount: overlay.querySelector('#aa-exp-gap-count'),
             count: overlay.querySelector('#aa-exp-count'),
             run: overlay.querySelector('#aa-exp-run'),
             cancel: overlay.querySelector('#aa-exp-cancel'),
@@ -1081,6 +1158,7 @@
         el.end.value = settings.endDate || '';
         el.startTime.value = settings.startTime || '';
         el.endTime.value = settings.endTime || '';
+        el.gapCount.value = (settings.gapCountMin != null) ? settings.gapCountMin : DEFAULT_GAP_COUNT_MIN;
         updateLoginCount();
 
         // Attach the custom pickers to the readonly fields.
@@ -1096,6 +1174,7 @@
             if (e.key === 'Escape' && overlay.classList.contains('open') && !isRunning) closePanel();
         });
         el.logins.addEventListener('input', () => { persistInputs(); updateLoginCount(); });
+        el.gapCount.addEventListener('input', persistInputs);
         el.run.addEventListener('click', onRun);
         el.cancel.addEventListener('click', onCancel);
         el.download.addEventListener('click', onReDownload);
@@ -1107,6 +1186,7 @@
         settings.endDate = el.end.value;
         settings.startTime = el.startTime.value;
         settings.endTime = el.endTime.value;
+        settings.gapCountMin = el.gapCount.value;
         saveSettings();
     }
 
@@ -1359,6 +1439,9 @@
         const startTime = rawStartT ? normalizeTimeStr(rawStartT) : '';
         const endTime = rawEndT ? normalizeTimeStr(rawEndT) : '';
 
+        const rawGap = el.gapCount.value.trim();
+        const gapCountMin = rawGap === '' ? DEFAULT_GAP_COUNT_MIN : parseFloat(rawGap);
+
         if (!logins.length) { flashField(el.logins); toast('Enter at least one AA login.'); return null; }
         if (!startDate) { flashField(el.start); toast('Pick a start date.'); return null; }
         if (!endDate) { flashField(el.end); toast('Pick an end date.'); return null; }
@@ -1367,6 +1450,11 @@
         if ((startTime && !endTime) || (!startTime && endTime)) {
             flashField(startTime ? el.endTime : el.startTime);
             toast('Enter both start and end time, or leave both blank.');
+            return null;
+        }
+        if (isNaN(gapCountMin) || gapCountMin < 0) {
+            flashField(el.gapCount);
+            toast('Gap threshold must be a number of minutes (0 or more).');
             return null;
         }
         if (parseEventTimestamp(startDate) > parseEventTimestamp(endDate)) {
@@ -1384,10 +1472,11 @@
         el.end.value = endDate;
         if (startTime) el.startTime.value = startTime;
         if (endTime) el.endTime.value = endTime;
+        el.gapCount.value = String(gapCountMin);
         persistInputs();
 
         return {
-            logins, startDate, endDate, startTime, endTime,
+            logins, startDate, endDate, startTime, endTime, gapCountMin,
             window: buildWindow(startDate, endDate, startTime, endTime)
         };
     }
@@ -1397,7 +1486,7 @@
 
         const input = collectInputs();
         if (!input) return;
-        const { logins, startDate, endDate, startTime, endTime, window } = input;
+        const { logins, startDate, endDate, startTime, endTime, window, gapCountMin } = input;
         const winLabel = windowLabel(startDate, endDate, startTime, endTime);
 
         isRunning = true;
@@ -1409,7 +1498,7 @@
 
         let results;
         try {
-            results = await runBatch(logins, startDate, endDate, window);
+            results = await runBatch(logins, startDate, endDate, window, gapCountMin);
         } catch (e) {
             isRunning = false;
             setRunningUI(false);
@@ -1421,7 +1510,7 @@
 
         if (cancelRequested) { toast('Cancelled. Partial results not exported.'); return; }
 
-        lastResults = { results, startDate, endDate, startTime, endTime, winLabel };
+        lastResults = { results, startDate, endDate, startTime, endTime, winLabel, gapCountMin };
         el.download.disabled = false;
 
         if (!results.some(r => r.status === 'done')) {
@@ -1430,7 +1519,7 @@
         }
 
         try {
-            await buildAndDownloadWorkbook(results, startDate, endDate, startTime, endTime, winLabel);
+            await buildAndDownloadWorkbook(results, startDate, endDate, startTime, endTime, winLabel, gapCountMin);
             const ok = results.filter(r => r.status === 'done').length;
             toast(`Exported ${ok} AA sheet${ok === 1 ? '' : 's'} to Excel.`);
         } catch (e) {
@@ -1450,7 +1539,7 @@
         try {
             await buildAndDownloadWorkbook(
                 lastResults.results, lastResults.startDate, lastResults.endDate,
-                lastResults.startTime, lastResults.endTime, lastResults.winLabel
+                lastResults.startTime, lastResults.endTime, lastResults.winLabel, lastResults.gapCountMin
             );
         } catch (e) {
             toast('Download failed: ' + (e.message || e));
@@ -1466,6 +1555,7 @@
         el.end.disabled = running;
         el.startTime.disabled = running;
         el.endTime.disabled = running;
+        el.gapCount.disabled = running;
         el.close.style.visibility = running ? 'hidden' : 'visible';
     }
 
