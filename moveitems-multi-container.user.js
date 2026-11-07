@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MoveItems Multi-Container Automation
 // @namespace    moveitems-container-automation
-// @version      1.5.0
+// @version      1.5.1
 // @description  Move multiple source containers to one destination, skip empty containers, continue after failures, and unstick on demand.
 // @author       paulspis
 // @match        https://aft-qt-eu.aka.amazon.com/app/moveitems*
@@ -61,7 +61,7 @@
 
     const TAB_ID = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
-    let state = loadState();
+    let state = null; // loaded in initialise(), after all helpers exist
     let panel = null;
     let actionLocked = false;
     let timeoutTimer = null;
@@ -1355,6 +1355,7 @@
 
     /* ================= INITIALISATION ================= */
     function initialise() {
+        state = loadState();
         createPanel();
 
         if (state.running && !state.paused) {
