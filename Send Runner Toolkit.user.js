@@ -2,7 +2,7 @@
 // @name         Send Runner Toolkit (Barcode + Opened + CPT + ASIN/Floor)
 // @namespace    send-runner-toolkit
 // @author       dmitrijk (edited by joyhjoe)
-// @version      10.27
+// @version      10.28
 // @updateURL     https://raw.githubusercontent.com/joyhjoe1997-alt/tampermonkey-scripts/main/Send%20Runner%20Toolkit.user.js
 // @downloadURL   https://raw.githubusercontent.com/joyhjoe1997-alt/tampermonkey-scripts/main/Send%20Runner%20Toolkit.user.js
 // @description  Send Runner helper for POPS (aft-pops-dub). LIST: hides cards in non-pickable locations (tsX, tsp, tsAFE, st, chAFE_Ovg); each card shows one compact strip - item picture, CPT from Rodeo (yellow when due within 30 min, red when overdue, urgent cards first), floor (P1/P2/P3/P4), the bin to pick, its POD and the ASIN (tap to copy); cards on the floor chosen in "My floor" come next; bins are taken from the item's POPS location list once seen, otherwise from FCResearch (pick bins with Consumer UNOWNED and Disposition SELLABLE only), floor and POD from roboscout (max 10 new bin lookups per ASIN). SCAN BAR at the bottom of the list: scan a location (P-...) and the matching item opens; the script selects exactly that location and confirms "Scan Pick Bin" with the same scan, then the associate scans the item and AUTOFINISH scans the floor's collection tote (tsXpsfpick11/22/33/44) and presses Continue. OTHER SCREENS: item picture (200 px) on every step, first bin on your floor with barcode + Print on "Select location", barcode and Printmon Print button next to bin IDs. BOXES under the top bar: Bin / SKU barcode, Trolley barcode, My floor (paKivaA01-04), Click history (10 h, with picture, ASIN, location, floor, POD and barcodes). Rodeo is read when the page opens, when the tab or the list is shown again, and for new bins. Rows tinted green when opened / red when new; that history clears at shift change (08:00 / 18:30).
@@ -39,6 +39,7 @@
 // 10.17 Pick This Location button and barcode only on cards whose bin is on the associate's floor;
 // 10.18 Pick This Location always uses a POPS location on your floor (up to 3 tried), errors name the step, cards hidden while their locations are checked.
 // 10.19 P1 floor support; isMyFloor compares floor numbers (fixes "your floor" never matching roboscout floors); isP1Bin covers all P-1-x bins; nextPageUrl » regex fixed; renderBarcode128SVG memoized; pickedLocs TTL guards non-number values; checkSince pruned each scan; bgBusy cleared on pick error; fcrImgBudget log cached in memory; leafCache set inside leafElements.
+// 10.28 merged the new original script (dmitrijk's own "10.19": "Select location" shows only the location list, scanner picture hidden, no barcode/CPT decoration on that screen); every edit from 10.19 to 10.27 below is kept.
 // 10.27 fewer roboscout lookups: no extra bins (and no ASIN lookup) for a card whose own bin is on your floor (single units only); extra bins of an ASIN stop being looked up, and queued ones are dropped, once enough bins on your floor are known; cards on screen (IntersectionObserver) are looked up before the ones below.
 // 10.26 FCResearch "bins holding this ASIN" lookups run 4 at a time instead of 2.
 // 10.25 header: author line now reads "dmitrijk (edited by joyhjoe)".
@@ -250,7 +251,7 @@
             }
             // never treat our own wrapper or badges as a candidate leaf
             if (el.classList.contains('pops-barcode-fallback-wrap')) return;
-            if (el.closest && el.closest('#pops-loc-pick, #pops-alerts, #pops-barcode-tools, #pops-auto-pic, #pops-item-pic, #pops-item-pic-bottom, #pops-scan-bar')) return;   // 8.3/8.7: our own boxes draw their own
+            if (el.closest && el.closest('#pops-loc-pick, #pops-alerts, #pops-barcode-tools, #pops-auto-pic, #pops-item-pic, #pops-item-pic-bottom, #pops-scan-bar, .page-type-accordion-selection')) return;   // 8.3/8.7: our own boxes draw their own
             if (el.closest && el.closest('button.item')) {                  // 9.2: no barcode on the list cards
                 var lw = el.nextElementSibling;
                 if (lw && lw.classList && lw.classList.contains('pops-barcode-fallback-wrap')) lw.remove();
@@ -1083,6 +1084,17 @@
                 // 10.23: shown straight away but dimmed (was hidden up to 20 s); its floor shows "P…"
                 // and its Pick button stays off until the lookups are done
                 'button.item.pops-checking { opacity:.6; }\n' +
+                // original 10.19: "Select location" screen shows only the location list (and
+                // Cancel): no title, CPT time, item line, instruction or picture.
+                // A one-location item skips this screen, so its "Scan Pick Bin"
+                // screen keeps everything (barcode, ASIN, Print).
+                '.sectionshadowNone:has(.page-type-accordion-selection) .page-type-text,\n' +
+                '.sectionshadowNone:has(.page-type-accordion-selection) .page-type-cpt-time,\n' +
+                '.sectionshadowNone:has(.page-type-accordion-selection) .page-type-item { display:none !important; }\n' +
+                'body:has(.page-type-accordion-selection) #pops-item-pic, body:has(.page-type-accordion-selection) #pops-item-pic-bottom,\n' +
+                'body:has(.page-type-accordion-selection) #pops-loc-pick { display:none !important; }\n' +
+                // original 10.19: the scanner picture ("barcode with a laser") is hidden on every screen
+                'img[src*="scanner.png"] { display:none !important; }\n' +
                 // 10.14: on the list screen only, the "Send Runner Items" and
                 // "Select Item to Pick" lines and the area name (psPOPS_AFE) are hidden
                 '.sectionshadowNone:has(send-runner-list-component) .page-type-text { display:none !important; }\n' +
@@ -2003,7 +2015,7 @@
             if (!/^P-\d+-[A-Z0-9]+$/i.test(t)) return;                      // cheap test first
             if (isOurBadge(el) || (el.closest && el.closest('.pops-barcode-fallback-wrap'))) return;
             if (el.closest && el.closest('button.item')) return;   // covered above
-            if (el.closest && el.closest('#pops-loc-pick, #pops-alerts, #pops-barcode-tools, #pops-auto-pic, #pops-item-pic, #pops-item-pic-bottom, #pops-scan-bar')) return; // 8.3/8.7: our own boxes
+            if (el.closest && el.closest('#pops-loc-pick, #pops-alerts, #pops-barcode-tools, #pops-auto-pic, #pops-item-pic, #pops-item-pic-bottom, #pops-scan-bar, .page-type-accordion-selection')) return; // 8.3/8.7: our own boxes
             var b2 = t.toUpperCase();
             var cptVal2 = cptFor(b2);
             if (!cptVal2) unknown.push(b2);
@@ -2088,7 +2100,7 @@
     function safeLoadCptData() {
         try { loadCptData(); } catch (e) { console.log(CPT_LOG, 'load error (CPT only, rest unaffected):', e); }
     }
-    try { console.log(CPT_LOG, 'CPT section loaded (v10.18) - FC ' + getFC()); } catch (e) {}
+    try { console.log(CPT_LOG, 'CPT section loaded (v10.28) - FC ' + getFC()); } catch (e) {}
     // Paint straight away from the cached map, before anything else runs.
     try { cptScan(); } catch (e) { console.log(CPT_LOG, 'first paint skipped:', e); }
     // The first Rodeo fetch waits a moment (7.1): the cached map has already
