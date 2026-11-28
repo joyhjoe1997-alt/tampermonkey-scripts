@@ -2,7 +2,7 @@
 // @name         Send Runner Toolkit (Barcode + Opened + CPT + ASIN/Floor)
 // @namespace    send-runner-toolkit
 // @author       dmitrijk (edited by joyhjoe)
-// @version      10.28
+// @version      10.29
 // @updateURL     https://raw.githubusercontent.com/joyhjoe1997-alt/tampermonkey-scripts/main/Send%20Runner%20Toolkit.user.js
 // @downloadURL   https://raw.githubusercontent.com/joyhjoe1997-alt/tampermonkey-scripts/main/Send%20Runner%20Toolkit.user.js
 // @description  Send Runner helper for POPS (aft-pops-dub). LIST: hides cards in non-pickable locations (tsX, tsp, tsAFE, st, chAFE_Ovg); each card shows one compact strip - item picture, CPT from Rodeo (yellow when due within 30 min, red when overdue, urgent cards first), floor (P1/P2/P3/P4), the bin to pick, its POD and the ASIN (tap to copy); cards on the floor chosen in "My floor" come next; bins are taken from the item's POPS location list once seen, otherwise from FCResearch (pick bins with Consumer UNOWNED and Disposition SELLABLE only), floor and POD from roboscout (max 10 new bin lookups per ASIN). SCAN BAR at the bottom of the list: scan a location (P-...) and the matching item opens; the script selects exactly that location and confirms "Scan Pick Bin" with the same scan, then the associate scans the item and AUTOFINISH scans the floor's collection tote (tsXpsfpick11/22/33/44) and presses Continue. OTHER SCREENS: item picture (200 px) on every step, first bin on your floor with barcode + Print on "Select location", barcode and Printmon Print button next to bin IDs. BOXES under the top bar: Bin / SKU barcode, Trolley barcode, My floor (paKivaA01-04), Click history (10 h, with picture, ASIN, location, floor, POD and barcodes). Rodeo is read when the page opens, when the tab or the list is shown again, and for new bins. Rows tinted green when opened / red when new; that history clears at shift change (08:00 / 18:30).
@@ -39,6 +39,7 @@
 // 10.17 Pick This Location button and barcode only on cards whose bin is on the associate's floor;
 // 10.18 Pick This Location always uses a POPS location on your floor (up to 3 tried), errors name the step, cards hidden while their locations are checked.
 // 10.19 P1 floor support; isMyFloor compares floor numbers (fixes "your floor" never matching roboscout floors); isP1Bin covers all P-1-x bins; nextPageUrl » regex fixed; renderBarcode128SVG memoized; pickedLocs TTL guards non-number values; checkSince pruned each scan; bgBusy cleared on pick error; fcrImgBudget log cached in memory; leafCache set inside leafElements.
+// 10.29 the script version is shown on the page (small grey text at the right end of the boxes row under the top bar).
 // 10.28 merged the new original script (dmitrijk's own "10.19": "Select location" shows only the location list, scanner picture hidden, no barcode/CPT decoration on that screen); every edit from 10.19 to 10.27 below is kept.
 // 10.27 fewer roboscout lookups: no extra bins (and no ASIN lookup) for a card whose own bin is on your floor (single units only); extra bins of an ASIN stop being looked up, and queued ones are dropped, once enough bins on your floor are known; cards on screen (IntersectionObserver) are looked up before the ones below.
 // 10.26 FCResearch "bins holding this ASIN" lookups run 4 at a time instead of 2.
@@ -51,6 +52,12 @@
 
 (function () {
     'use strict';
+
+    // 10.29: the installed version, as Tampermonkey reports it from the header; the number below is only a fallback
+    var SCRIPT_VERSION = (function () {
+        try { if (typeof GM_info !== 'undefined' && GM_info && GM_info.script && GM_info.script.version) return String(GM_info.script.version); } catch (e) {}
+        return '10.29';
+    })();
 
     // =========================================================================
     // SECTION 1: Onscreen Barcode Fallback
@@ -2100,7 +2107,7 @@
     function safeLoadCptData() {
         try { loadCptData(); } catch (e) { console.log(CPT_LOG, 'load error (CPT only, rest unaffected):', e); }
     }
-    try { console.log(CPT_LOG, 'CPT section loaded (v10.28) - FC ' + getFC()); } catch (e) {}
+    try { console.log(CPT_LOG, 'CPT section loaded (v' + SCRIPT_VERSION + ') - FC ' + getFC()); } catch (e) {}
     // Paint straight away from the cached map, before anything else runs.
     try { cptScan(); } catch (e) { console.log(CPT_LOG, 'first paint skipped:', e); }
     // The first Rodeo fetch waits a moment (7.1): the cached map has already
@@ -2784,6 +2791,14 @@
         wrap.appendChild(p2.panel);
         wrap.appendChild(p3.panel);
         wrap.appendChild(p4.panel);
+
+        // 10.29: version of this script, small and grey, on its own line at the right
+        var verEl = document.createElement('div');
+        verEl.id = 'pops-version';
+        verEl.textContent = 'Send Runner Toolkit v' + SCRIPT_VERSION;
+        verEl.title = 'Installed version of the Send Runner Toolkit script';
+        verEl.style.cssText = 'flex:1 1 100%;text-align:right;font:11px Arial,sans-serif;color:#888;user-select:none;';
+        wrap.appendChild(verEl);
 
         // 9.8: no more dragging - the boxes are placed in the page itself,
         // right under the POPS top bar (or at the top of the page)
